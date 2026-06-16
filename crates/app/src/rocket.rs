@@ -105,13 +105,6 @@ impl Mesh {
         }
     }
 
-    fn plane(&mut self, y: f32, half: f32, col: [f32; 3]) {
-        let a = Vec3::new(-half, y, -half);
-        let b = Vec3::new(half, y, -half);
-        let c = Vec3::new(half, y, half);
-        let d = Vec3::new(-half, y, half);
-        self.quad(a, b, c, d, Vec3::Y, col);
-    }
 }
 
 pub struct Scene {
@@ -235,25 +228,30 @@ fn hashf(p: Vec3) -> f32 {
     h
 }
 
-fn terrain_color(signed_h: f64, slope: f32, jitter: f32) -> [f32; 3] {
+fn terrain_color(signed_h: f64, slope: f32, jitter: f32, abs_lat: f64) -> [f32; 3] {
     if signed_h <= 0.0 {
         // shallow to deep sea
         let t = ((-signed_h) / 1200.0).clamp(0.0, 1.0) as f32;
         return mix3([0.07, 0.22, 0.34], [0.03, 0.10, 0.20], t);
     }
-    let t = (signed_h / 4200.0).clamp(0.0, 1.0) as f32;
+    let h = signed_h as f32;
+    // land colour by elevation (grass -> scrub)
+    let t = (h / 4200.0).clamp(0.0, 1.0);
     let grass = [0.20, 0.34, 0.15];
-    let scrub = [0.36, 0.33, 0.18];
-    let snow = [0.88, 0.90, 0.95];
-    let mut base = if t < 0.55 {
-        mix3(grass, scrub, t / 0.55)
-    } else {
-        mix3(scrub, snow, (t - 0.55) / 0.45)
-    };
+    let scrub = [0.38, 0.33, 0.18];
+    let mut base = mix3(grass, scrub, t);
     // steep faces read as bare rock
     let rock = [0.32, 0.28, 0.25];
     let steep = ((slope - 0.30) / 0.35).clamp(0.0, 1.0);
     base = mix3(base, rock, steep);
+    // Latitude-aware snow: high snow line at the equator, low near the poles,
+    // plus polar ice caps at any elevation.
+    let lat_frac = (abs_lat / std::f64::consts::FRAC_PI_2) as f32; // 0 equator .. 1 pole
+    let snow_line = 1000.0 + (1.0 - lat_frac) * 5200.0;
+    let alpine = ((h - snow_line) / 1400.0).clamp(0.0, 1.0);
+    let polar = ((lat_frac - 0.82) / 0.12).clamp(0.0, 1.0);
+    let snow = alpine.max(polar);
+    base = mix3(base, [0.90, 0.92, 0.96], snow);
     // micro brightness variation so the ground is not flat
     let b = 0.90 + 0.16 * jitter;
     [base[0] * b, base[1] * b, base[2] * b]
@@ -333,8 +331,10 @@ pub fn build_terrain() -> Mesh {
                 nrm = -nrm; // terrain faces up
             }
             let centroid = (w0 + w1 + w2) / 3.0;
+            let cdir = centroid.normalize();
             let slope = 1.0 - nrm.y;
-            let col = terrain_color(elev.height_m(centroid.normalize()), slope, hashf(a));
+            let abs_lat = cdir.y.clamp(-1.0, 1.0).asin().abs();
+            let col = terrain_color(elev.height_m(cdir), slope, hashf(a), abs_lat);
             m.tri(a, b, c, nrm, col);
         }
     }

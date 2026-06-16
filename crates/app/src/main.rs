@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use glam::{DVec3, Mat3, Mat4, Vec3};
+use glam::{DVec3, Mat4, Vec3};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
@@ -92,18 +92,6 @@ mod webx {
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct Uniforms {
-    resolution: [f32; 2],
-    scale: f32,
-    time: f32,
-    sun: [f32; 4],
-    cx: [f32; 4],
-    cy: [f32; 4],
-    cz: [f32; 4],
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct SceneUniforms {
     cam_pos: [f32; 4],
     cam_x: [f32; 4],
@@ -134,8 +122,9 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 #[derive(Clone, Copy, PartialEq)]
 enum View {
-    Surface,
-    System,
+    /// Orbital map: perspective view of the bodies + launch/orbit trajectories.
+    Map,
+    /// 3D surface: the rocket on the pad over LOD terrain.
     Rocket,
 }
 
@@ -211,9 +200,6 @@ struct World {
     mission: Mission,
     body: CentralBody,
     flight: Option<Craft>,
-    az: f32,
-    el: f32,
-    scale: f32,
     launched: bool,
     clock: f32, // mission-elapsed seconds
     warp: f32,
@@ -264,16 +250,13 @@ impl World {
         let moon_radius_m = moon_radius_mm as f64 * MM as f64;
         let moon_mu = 1.7 * moon_radius_m * moon_radius_m; // ~1.7 m/s^2 surface gravity
         World {
-            az: mission.spaceport_lon,
-            el: mission.spaceport_lat,
-            scale: 1.25,
             launched: false,
             clock: 0.0,
             warp: 8.0,
             mission,
             body,
             flight: None,
-            view: View::Surface,
+            view: View::Rocket,
             sys_az: 1.4,
             sys_el: 0.30,
             sys_dist: 120.0,
@@ -339,9 +322,8 @@ impl World {
 
     fn toggle_view(&mut self) {
         self.view = match self.view {
-            View::Surface => View::System,
-            View::System => View::Rocket,
-            View::Rocket => View::Surface,
+            View::Map => View::Rocket,
+            View::Rocket => View::Map,
         };
     }
 
@@ -353,7 +335,10 @@ impl World {
             self.rocket_el.sin(),
             self.rocket_el.cos() * self.rocket_az.sin(),
         );
-        let eye = target + dir * self.rocket_dist;
+        let mut eye = target + dir * self.rocket_dist;
+        // Keep the camera above the (locally flat) ground so it never dips into
+        // the terrain. The pad area is flattened, so a small floor suffices.
+        eye.y = eye.y.max(2.0);
         let fwd = (target - eye).normalize();
         let right = fwd.cross(Vec3::Y).normalize();
         let up = right.cross(fwd).normalize();
@@ -474,46 +459,7 @@ impl World {
         log::info!("Manual flight control engaged");
     }
 
-    /// World-from-view rotation: column 2 is the world point facing the camera.
-    fn camera_rot(&self) -> Mat3 {
-        let d = Vec3::new(
-            self.el.cos() * self.az.cos(),
-            self.el.sin(),
-            self.el.cos() * self.az.sin(),
-        );
-        let xc = Vec3::Y.cross(d).normalize();
-        let yc = d.cross(xc).normalize();
-        Mat3::from_cols(xc, yc, d)
-    }
-
-    fn uniforms(&self, res: [f32; 2], time: f32) -> Uniforms {
-        let rot = self.camera_rot();
-        let st = time * 0.03 + self.mission.spaceport_lon;
-        let sun = Vec3::new(st.cos() * 0.95, 0.28, st.sin() * 0.95).normalize();
-        Uniforms {
-            resolution: res,
-            scale: self.scale,
-            time,
-            sun: [sun.x, sun.y, sun.z, 0.0],
-            cx: [rot.x_axis.x, rot.x_axis.y, rot.x_axis.z, 0.0],
-            cy: [rot.y_axis.x, rot.y_axis.y, rot.y_axis.z, 0.0],
-            cz: [rot.z_axis.x, rot.z_axis.y, rot.z_axis.z, 0.0],
-        }
-    }
-
-    /// Project a world unit-sphere point through the orthographic camera to
-    /// clip space. Returns `None` when the point is hidden behind the planet.
-    fn project(p: Vec3, rt: Mat3, aspect: f32, scale: f32) -> Option<[f32; 2]> {
-        let v = rt * p;
-        let occluded = v.z < 0.0 && (v.x * v.x + v.y * v.y) < 1.0;
-        if occluded {
-            None
-        } else {
-            Some([v.x / (aspect * scale), v.y / scale])
-        }
-    }
-
-    /// World position + colour of the surface-view craft/rocket marker.
+    /// World position (unit-sphere) + colour of the map craft/rocket marker.
     fn surface_marker(&self) -> (Vec3, [f32; 3]) {
         if let Some(craft) = self.flight.as_ref() {
             let col = if craft.crashed {
@@ -537,36 +483,21 @@ impl World {
         }
     }
 
-    /// Draw the surface-view marker as a filled, outlined diamond (HUD pass) so
-    /// it is visible over both the lit surface and dark space.
-    fn append_surface_marker(&self, out: &mut Vec<OverlayVertex>, aspect: f32) {
-        let (pos, col) = self.surface_marker();
-        let rt = self.camera_rot().transpose();
-        if let Some(c) = Self::project(pos, rt, aspect, self.scale) {
-            push_filled_diamond(out, c, 0.026, aspect, [0.0, 0.0, 0.0]);
-            push_filled_diamond(out, c, 0.017, aspect, col);
-        }
-    }
-
-    fn build_overlay(&self, rot: Mat3, aspect: f32) -> Vec<OverlayVertex> {
-        if self.view == View::Rocket {
-            let _ = (rot, aspect);
+    /// Launch/ascent/orbit trajectories projected into the perspective map.
+    /// Mission positions are unit-sphere (magnitude encodes altitude), so we
+    /// scale by the home radius (Mm) and project with the system camera.
+    fn build_overlay(&self, aspect: f32) -> Vec<OverlayVertex> {
+        if self.view != View::Map {
             return Vec::new();
         }
-        if self.view == View::System {
-            // the system-view craft marker is drawn as a filled shape in the HUD
-            // pass (visible on bright bodies); nothing to draw as lines here.
-            let _ = aspect;
-            return Vec::new();
-        }
-        let rt = rot.transpose();
-        let scale = self.scale;
+        let cam = self.system_camera(aspect);
+        let r = self.home_radius_mm;
         let mut out: Vec<OverlayVertex> = Vec::new();
 
         let polyline = |pts: &[Vec3], color: [f32; 3], out: &mut Vec<OverlayVertex>| {
             let mut prev: Option<[f32; 2]> = None;
             for &p in pts {
-                let cur = Self::project(p, rt, aspect, scale);
+                let cur = cam.project(p * r);
                 if let (Some(a), Some(b)) = (prev, cur) {
                     out.push(OverlayVertex { pos: a, color });
                     out.push(OverlayVertex { pos: b, color });
@@ -575,10 +506,8 @@ impl World {
             }
         };
 
-        // launch-pad marker on the surface
         polyline(&self.mission.pad_ring, [0.9, 0.6, 0.2], &mut out);
 
-        // trajectories (the marker itself is drawn filled in the HUD pass)
         if let Some(craft) = self.flight.as_ref() {
             let pred = craft.predicted_orbit(&self.body);
             polyline(&pred, [0.5, 0.55, 0.25], &mut out);
@@ -605,16 +534,18 @@ impl World {
         if self.view == View::Rocket {
             return self.build_vehicle_hud(hud, res);
         }
-        if self.view == View::System {
-            return self.build_system_hud(hud, res);
-        }
+        // Map view
         if let Some(craft) = self.flight.as_ref() {
             return self.build_flight_hud(hud, craft, res);
         }
         if !self.launched {
-            return self.build_vehicle_hud(hud, res);
+            return self.build_system_hud(hud, res);
         }
+        self.build_ascent_hud(hud, res)
+    }
 
+    /// Ascent / parking-orbit telemetry, shown in the map view after launch.
+    fn build_ascent_hud(&self, hud: &Hud, res: (f32, f32)) -> Vec<OverlayVertex> {
         let mut out: Vec<OverlayVertex> = Vec::new();
         let dim = [0.55, 0.75, 0.85];
         let val = [0.92, 0.96, 1.0];
@@ -768,7 +699,7 @@ impl World {
         hud.text(&mut out, "SPACE  LAUNCH", x, y, green, res);
 
         let mut hy = res.1 - step * 3.0 - 12.0;
-        for line in ["DRAG ORBIT   SCROLL ZOOM", "V  SYSTEM VIEW", "[ ] TIME WARP"] {
+        for line in ["DRAG ORBIT   SCROLL ZOOM", "TAB  ORBITAL MAP", "[ ] TIME WARP"] {
             hud.text(&mut out, line, x, hy, dim, res);
             hy += step;
         }
@@ -821,16 +752,16 @@ impl World {
             hud.text(&mut out, label, cx, y, scol, res);
             y += step;
             row(&mut out, "TO MOON  ", &format!("{:.1} MM", to_moon), y);
+        }
 
-            // craft marker in the scene: filled diamond + dark outline so it is
-            // visible on both the dark sky and the bright moon.
-            let aspect = res.0 / res.1.max(1.0);
-            let cam = self.system_camera(aspect);
-            let p_mm = (craft.r / MM as f64).as_vec3();
-            if let Some(c) = cam.project(p_mm) {
-                push_filled_diamond(&mut out, c, 0.030, aspect, [0.0, 0.0, 0.0]);
-                push_filled_diamond(&mut out, c, 0.020, aspect, scol);
-            }
+        // Rocket/craft marker in the scene: filled diamond + dark outline so it
+        // is visible over dark sky and bright bodies alike.
+        let aspect = res.0 / res.1.max(1.0);
+        let cam = self.system_camera(aspect);
+        let (mpos, mcol) = self.surface_marker();
+        if let Some(c) = cam.project(mpos * self.home_radius_mm) {
+            push_filled_diamond(&mut out, c, 0.030, aspect, [0.0, 0.0, 0.0]);
+            push_filled_diamond(&mut out, c, 0.020, aspect, mcol);
         }
 
         let mut hy = res.1 - step * 4.0 - 12.0;
@@ -852,9 +783,6 @@ impl World {
 // ---------------------------------------------------------------------------
 
 struct Gpu {
-    pipeline: wgpu::RenderPipeline,
-    uniform_buf: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
     scene_pipeline: wgpu::RenderPipeline,
     scene_uniform_buf: wgpu::Buffer,
     scene_bind_group: wgpu::BindGroup,
@@ -874,18 +802,6 @@ struct Gpu {
 
 impl Gpu {
     fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Gpu {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("planet"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("planet.wgsl").into()),
-        });
-
-        let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("uniforms"),
-            size: std::mem::size_of::<Uniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         let planet_img = image::load_from_memory(include_bytes!("../assets/planet.png"))
             .expect("decode planet.png")
             .to_rgba8();
@@ -967,59 +883,7 @@ impl Gpu {
             ],
         });
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("bind-group"),
-            layout: &bind_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&planet_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&planet_sampler),
-                },
-            ],
-        });
-
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("layout"),
-            bind_group_layouts: &[Some(&bind_layout)],
-            immediate_size: 0,
-        });
-
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("pipeline"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        // System view: same bind-group shape (uniform + planet texture +
-        // sampler), different uniform struct and shader.
+        // Map view: same bind-group shape (uniform + planet texture + sampler).
         let scene_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("scene"),
             source: wgpu::ShaderSource::Wgsl(include_str!("scene.wgsl").into()),
@@ -1048,9 +912,14 @@ impl Gpu {
                 },
             ],
         });
+        let scene_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("scene-layout"),
+            bind_group_layouts: &[Some(&bind_layout)],
+            immediate_size: 0,
+        });
         let scene_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("scene-pipeline"),
-            layout: Some(&layout),
+            layout: Some(&scene_layout),
             vertex: wgpu::VertexState {
                 module: &scene_shader,
                 entry_point: Some("vs"),
@@ -1307,9 +1176,6 @@ impl Gpu {
         queue.write_buffer(&mesh_vbuf, 0, bytemuck::cast_slice(&scene_mesh.verts));
 
         Gpu {
-            pipeline,
-            uniform_buf,
-            bind_group,
             scene_pipeline,
             scene_uniform_buf,
             scene_bind_group,
@@ -1340,11 +1206,7 @@ impl Gpu {
     ) -> (usize, usize) {
         let res = [w as f32, h.max(1) as f32];
         match world.view {
-            View::Surface => {
-                let uniforms = world.uniforms(res, time);
-                queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
-            }
-            View::System => {
+            View::Map => {
                 let su = world.scene_uniforms(res, time);
                 queue.write_buffer(&self.scene_uniform_buf, 0, bytemuck::bytes_of(&su));
             }
@@ -1357,15 +1219,12 @@ impl Gpu {
         }
 
         let aspect = res[0] / res[1];
-        let verts = world.build_overlay(world.camera_rot(), aspect);
+        let verts = world.build_overlay(aspect);
         let n = verts.len().min(OVERLAY_CAP as usize);
         if n > 0 {
             queue.write_buffer(&self.overlay_buf, 0, bytemuck::cast_slice(&verts[..n]));
         }
-        let mut hud_verts = world.build_hud(hud, (res[0], res[1]));
-        if world.view == View::Surface {
-            world.append_surface_marker(&mut hud_verts, aspect);
-        }
+        let hud_verts = world.build_hud(hud, (res[0], res[1]));
         let hn = hud_verts.len().min(HUD_CAP as usize);
         if hn > 0 {
             queue.write_buffer(&self.hud_buf, 0, bytemuck::cast_slice(&hud_verts[..hn]));
@@ -1373,21 +1232,13 @@ impl Gpu {
         (n, hn)
     }
 
-    /// Fullscreen raymarch pass (Surface / System) plus the 2D overlay + HUD.
-    /// The rocket view does not use this; it draws meshes then `draw_overlay`.
+    /// Map view: fullscreen multi-body raymarch + 2D overlay/HUD. The rocket
+    /// view does not use this; it draws meshes then `draw_overlay`.
     fn draw(&self, pass: &mut wgpu::RenderPass, view: View, n_overlay: usize, n_hud: usize) {
-        match view {
-            View::Surface => {
-                pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, &self.bind_group, &[]);
-                pass.draw(0..3, 0..1);
-            }
-            View::System => {
-                pass.set_pipeline(&self.scene_pipeline);
-                pass.set_bind_group(0, &self.scene_bind_group, &[]);
-                pass.draw(0..3, 0..1);
-            }
-            View::Rocket => {}
+        if view == View::Map {
+            pass.set_pipeline(&self.scene_pipeline);
+            pass.set_bind_group(0, &self.scene_bind_group, &[]);
+            pass.draw(0..3, 0..1);
         }
         self.draw_overlay(pass, n_overlay, n_hud);
     }
@@ -1721,30 +1572,31 @@ fn make_shot_device() -> (wgpu::Device, wgpu::Queue) {
 #[cfg(not(target_arch = "wasm32"))]
 fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
     let mut world = World::new();
-    // sun phase that puts a terminator across the surface disk
-    let surface_time = |w: &World| (w.az + 1.66 - w.mission.spaceport_lon) / 0.03;
-    let frame_surface = |w: &mut World| {
-        w.view = View::Surface;
-        w.az = w.mission.spaceport_lon + 1.15;
-        w.el = w.mission.spaceport_lat + 0.25;
-        w.scale = 1.35;
+    // Frame the map view on the home planet (where the launch/orbit is drawn).
+    let frame_map = |w: &mut World| {
+        w.view = View::Map;
+        w.sys_focus = Vec3::ZERO;
+        w.sys_az = 1.4;
+        w.sys_el = 0.32;
+        w.sys_dist = w.home_radius_mm * 3.2;
     };
     let time = match scenario {
-        "rocket" => {
+        "rocket" | "pad" => {
             world.view = View::Rocket;
             world.rocket_az = 4.97; // face inland (land), coast to the sides
             world.rocket_el = 0.12;
             0.0
         }
         "system" => {
-            world.view = View::System;
+            world.view = View::Map;
+            world.sys_target = Focus::Pair;
+            world.apply_focus();
             world.sys_az = 1.4;
             world.sys_el = 0.30;
-            world.sys_dist = 120.0;
             6.0
         }
         "moon" => {
-            world.view = View::System;
+            world.view = View::Map;
             world.sys_focus = world.moon_center_mm;
             world.sys_az = 1.2;
             world.sys_el = 0.25;
@@ -1759,19 +1611,14 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.flight = Some(craft);
             6.0
         }
-        "pad" => {
-            frame_surface(&mut world);
-            world.launched = false;
-            surface_time(&world)
-        }
         "ascent" => {
-            frame_surface(&mut world);
+            frame_map(&mut world);
             world.launched = true;
             world.clock = world.mission.meco_t * 0.5; // mid powered ascent
-            surface_time(&world)
+            6.0
         }
         "flight" => {
-            frame_surface(&mut world);
+            frame_map(&mut world);
             world.launched = true;
             world.clock = world.mission.meco_t + 10.0;
             let (r, v) = world.mission.orbit_state_at(world.clock);
@@ -1779,14 +1626,14 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             craft.throttle = 0.6;
             craft.mode = Mode::Retrograde;
             world.flight = Some(craft);
-            surface_time(&world)
+            6.0
         }
         _ => {
-            // surface / launch view: craft coasting in the parking orbit.
-            frame_surface(&mut world);
+            // map view: craft coasting in the parking orbit.
+            frame_map(&mut world);
             world.launched = true;
             world.clock = world.mission.meco_t + 240.0;
-            surface_time(&world)
+            6.0
         }
     };
     (world, time)
@@ -2016,11 +1863,7 @@ impl ApplicationHandler<UserEvent> for App {
                     let dx = (x - state.last_cursor.0) as f32;
                     let dy = (y - state.last_cursor.1) as f32;
                     match state.world.view {
-                        View::Surface => {
-                            state.world.az += dx * 0.005;
-                            state.world.el = (state.world.el + dy * 0.005).clamp(-1.5, 1.5);
-                        }
-                        View::System => {
+                        View::Map => {
                             state.world.sys_az += dx * 0.005;
                             state.world.sys_el = (state.world.sys_el + dy * 0.005).clamp(-1.5, 1.5);
                         }
@@ -2039,11 +1882,7 @@ impl ApplicationHandler<UserEvent> for App {
                     MouseScrollDelta::PixelDelta(p) => (p.y as f32) / 60.0,
                 };
                 match state.world.view {
-                    View::Surface => {
-                        state.world.scale =
-                            (state.world.scale * (1.0 - dy * 0.12)).clamp(0.12, 3.0);
-                    }
-                    View::System => {
+                    View::Map => {
                         state.world.sys_dist =
                             (state.world.sys_dist * (1.0 - dy * 0.12)).clamp(2.0, 40000.0);
                     }
@@ -2071,7 +1910,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     match code {
                         KeyCode::Tab | KeyCode::KeyV => state.world.toggle_view(),
-                        KeyCode::KeyC if state.world.view == View::System => {
+                        KeyCode::KeyC if state.world.view == View::Map => {
                             state.world.cycle_focus()
                         }
                         KeyCode::KeyF => state.world.toggle_flight(),
