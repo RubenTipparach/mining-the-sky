@@ -1,0 +1,10 @@
+# Trunk build config for the WebGPU client.
+# `--public-url` is supplied by CI for GitHub Pages project-site pathing.
+
+[build]
+target = "index.html"
+release = false
+
+[serve]
+address = "127.0.0.1"
+port = 8080

@@ -23,6 +23,45 @@ See **[docs/DESIGN.md](docs/DESIGN.md)** for the full design document covering:
 - The to-scale Kepler-47 system definition
 - Roadmap and open questions
 
+## Crates
+
+- `crates/worldgen` - deterministic procedural home world: 3D-noise elevation,
+  rivers/deltas via flow accumulation, coastal-delta major cities, river-corridor
+  minor cities, a great-circle MST road network, night-light emission, and an
+  auto-sited equatorial launch complex. Includes a CPU PNG preview renderer.
+- `crates/app` - the real-time client (wgpu / WebGPU) that runs natively and in
+  the browser via WebAssembly. Currently renders a live procedural planet
+  (day/night terminator, atmospheric limb, city-light sparkle) as the seed of
+  the Caelum-style renderer.
+
+## Build and run
+
+```sh
+# Generate planet/city/road/night-light PNG previews into ./out
+cargo run -p worldgen --bin preview --release -- 47
+
+# Run the real-time WebGPU client natively
+cargo run -p app --release
+
+# Build the browser (WASM) client locally
+cd crates/app && trunk serve     # then open the printed localhost URL
+```
+
+A few generated previews (seed 47):
+
+| Cities + roads | Day | Night (city lights) |
+| --- | --- | --- |
+| ![](docs/images/cities_roads.png) | ![](docs/images/globe_day.png) | ![](docs/images/globe_night.png) |
+
+## Live demo (GitHub Pages)
+
+`.github/workflows/pages.yml` builds the WASM client with Trunk and deploys it to
+GitHub Pages on every push to `main` (same approach as Caelum's web build). To
+enable it once: repo Settings -> Pages -> Source: "GitHub Actions". The demo
+needs a WebGPU-capable browser.
+
 ## Status
 
-Early design. No code yet - see the roadmap in the design doc (M0-M5).
+Vertical slice in progress (design doc roadmap M0-M2): worldgen + a live planet
+in native and browser. Next: feed real worldgen data to the GPU, then rocket
+staging and launch-to-orbit.

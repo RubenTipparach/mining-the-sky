@@ -33,9 +33,6 @@ fn main() {
         world.launch.lon.to_degrees(),
     );
 
-    let r = &worldgen::render::render_globe;
-    let _ = r; // (silence if unused in some configs)
-
     worldgen::render::write_height_map(&world, "out/heightmap.png");
     worldgen::render::write_day_map(&world, "out/day_albedo.png");
     worldgen::render::write_night_map(&world, "out/night_lights.png");

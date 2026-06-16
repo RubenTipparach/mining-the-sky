@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+    <title>Mining the Sky</title>
+    <link data-trunk rel="rust" data-bin="app" data-wasm-opt="z" />
+    <style>
+      html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+      canvas { display: block; width: 100vw; height: 100vh; }
+      #hud {
+        position: fixed; left: 10px; top: 8px; color: #9fd6ff;
+        font: 12px/1.4 ui-monospace, monospace; opacity: 0.7; pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="hud">Mining the Sky — WebGPU planet preview (requires a WebGPU-capable browser)</div>
+  </body>
+</html>
