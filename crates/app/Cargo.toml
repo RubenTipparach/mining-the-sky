@@ -17,6 +17,9 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 glam = "0.30"
 sim = { path = "../sim" }
 terrain = { path = "../terrain" }
+egui = "0.34"
+egui-wgpu = "0.34"
+egui-winit = { version = "0.34", default-features = false }
 log = "0.4"
 cfg-if = "1"
 

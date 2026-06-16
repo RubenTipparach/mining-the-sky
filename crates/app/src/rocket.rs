@@ -290,27 +290,6 @@ pub fn build_terrain() -> Mesh {
         Vec3::new(d.dot(east) as f32, d.dot(up) as f32, d.dot(north) as f32)
     };
 
-    // DEBUG: global highest-elevation point (to prove terrain has height).
-    {
-        let mut best = (0.0f64, 0.0f64, f64::MIN);
-        let mut la = -80.0;
-        while la <= 80.0 {
-            let mut lo = -180.0;
-            while lo <= 180.0 {
-                let llat = (la as f64).to_radians();
-                let llon = (lo as f64).to_radians();
-                let d = DVec3::new(llat.cos() * llon.cos(), llat.sin(), llat.cos() * llon.sin());
-                let h = elev.height_m(d.normalize());
-                if h > best.2 {
-                    best = (la, lo, h);
-                }
-                lo += 3.0;
-            }
-            la += 3.0;
-        }
-        eprintln!("[terrain] global max elevation {:.0} m at lat {:.1} lon {:.1}", best.2, best.0, best.1);
-    }
-
     // Finer LOD: select as if the camera sits ~60 m over the pad.
     let cam = origin + up * 60.0;
     let lod = select(&planet, cam, 1.4, 18);

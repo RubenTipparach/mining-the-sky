@@ -26,6 +26,7 @@ mod flight;
 mod hud;
 mod mission;
 mod rocket;
+mod ui;
 mod universe;
 use flight::{Craft, GravBody, Mode};
 use hud::Hud;
@@ -234,6 +235,8 @@ struct World {
     nav: Vec<usize>,
     /// Index (into `universe.bodies`) of the focused body.
     focus: usize,
+    /// egui body-browser search text.
+    ui_search: String,
 }
 
 impl World {
@@ -283,6 +286,7 @@ impl World {
             universe: Universe { bodies: Vec::new() },
             nav: Vec::new(),
             focus: 0,
+            ui_search: String::new(),
         };
         // Generate the full Kepler-47 system; the landable moon is injected as
         // home's first moon so the map and the flight sim agree.
@@ -308,26 +312,6 @@ impl World {
 
     fn focus_label(&self) -> &str {
         self.focus_body().name.as_str()
-    }
-
-    /// Screen layout of the body menu (top-right): (x, y0, row height) in px.
-    fn map_menu_layout(res: (f32, f32)) -> (f32, f32, f32) {
-        (res.0 - 170.0, 40.0, hud::LINE_H * 1.35)
-    }
-
-    /// Map a click on the body menu to a body index, if any.
-    fn map_menu_pick(&self, res: (f32, f32), cx: f32, cy: f32) -> Option<usize> {
-        let (mx, my0, mdy) = Self::map_menu_layout(res);
-        if cx < mx - 8.0 || cx > mx + 160.0 {
-            return None;
-        }
-        for (i, &bi) in self.nav.iter().enumerate() {
-            let yy = my0 + i as f32 * mdy;
-            if cy >= yy - 2.0 && cy <= yy + hud::LINE_H + 2.0 {
-                return Some(bi);
-            }
-        }
-        None
     }
 
     /// Pick the nearest body to a screen position (any body, incl. moons /
@@ -932,24 +916,12 @@ impl World {
             }
         }
 
-        // body menu (top-right): the navigable bodies (stars + planets). Press
-        // 1-9 for the first nine or click any entry to jump.
-        let (mx, my0, mdy) = Self::map_menu_layout(res);
-        hud.text(&mut out, "BODIES", mx, my0 - step * 1.4, amber, res);
-        for (i, &bi) in self.nav.iter().enumerate() {
-            let b = &self.universe.bodies[bi];
-            let yy = my0 + i as f32 * mdy;
-            let col = if bi == self.focus { [1.0, 0.9, 0.4] } else { dim };
-            let tag = if i < 9 { format!("{}", i + 1) } else { "-".into() };
-            hud.text(&mut out, &format!("{}  {}", tag, b.name), mx, yy, col, res);
-        }
-
-        let mut hy = res.1 - step * 4.0 - 12.0;
+        // (The body list lives in the egui "SYSTEM BODIES" panel now.)
+        let mut hy = res.1 - step * 3.0 - 12.0;
         for line in [
-            "1-9 / CLICK  JUMP TO BODY",
+            "CLICK BODY / PANEL  FOCUS",
             "DRAG ORBIT   SCROLL ZOOM",
-            "C CYCLE   TAB VIEW",
-            "[ ] WARP   F MANUAL",
+            "TAB VIEW   F MANUAL",
         ] {
             hud.text(&mut out, line, x, hy, dim, res);
             hy += step;
@@ -1572,6 +1544,9 @@ struct State {
     last_t: f32,
     dragging: bool,
     last_cursor: (f64, f64),
+    egui_ctx: egui::Context,
+    egui_state: egui_winit::State,
+    egui_renderer: egui_wgpu::Renderer,
 }
 
 impl State {
@@ -1632,6 +1607,19 @@ impl State {
 
         let gpu = Gpu::new(&device, &queue, format);
 
+        // egui: context + winit input glue + wgpu renderer
+        let egui_ctx = egui::Context::default();
+        let egui_state = egui_winit::State::new(
+            egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            &*window,
+            None,
+            None,
+            None,
+        );
+        let egui_renderer =
+            egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
+
         State {
             window,
             surface,
@@ -1645,6 +1633,9 @@ impl State {
             last_t: 0.0,
             dragging: false,
             last_cursor: (0.0, 0.0),
+            egui_ctx,
+            egui_state,
+            egui_renderer,
         }
     }
 
@@ -1690,6 +1681,27 @@ impl State {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("enc") });
+
+        // --- egui: run the UI and prepare its draw data ---
+        let raw_input = self.egui_state.take_egui_input(&self.window);
+        self.egui_ctx.begin_pass(raw_input);
+        ui::build(&self.egui_ctx, &mut self.world);
+        let full = self.egui_ctx.end_pass();
+        self.egui_state
+            .handle_platform_output(&self.window, full.platform_output);
+        let ppp = self.egui_ctx.pixels_per_point();
+        let prims = self.egui_ctx.tessellate(full.shapes, ppp);
+        for (id, delta) in &full.textures_delta.set {
+            self.egui_renderer
+                .update_texture(&self.device, &self.queue, *id, delta);
+        }
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.config.width, self.config.height],
+            pixels_per_point: ppp,
+        };
+        self.egui_renderer
+            .update_buffers(&self.device, &self.queue, &mut encoder, &prims, &screen);
+
         if self.world.view == View::Rocket {
             let depth = create_depth(&self.device, self.config.width, self.config.height);
             {
@@ -1705,8 +1717,15 @@ impl State {
             let mut pass = render_pass(&mut encoder, &view);
             self.gpu.draw(&mut pass, self.world.view, n, hn);
         }
+        {
+            let mut pass = overlay_pass(&mut encoder, &view).forget_lifetime();
+            self.egui_renderer.render(&mut pass, &prims, &screen);
+        }
         self.queue.submit(Some(encoder.finish()));
         frame.present();
+        for id in &full.textures_delta.free {
+            self.egui_renderer.free_texture(id);
+        }
     }
 }
 
@@ -1905,6 +1924,41 @@ fn render_shot(
         let mut pass = render_pass(&mut encoder, &target_view);
         gpu.draw(&mut pass, world.view, n, hn);
     }
+
+    // egui overlay (so the body browser is verifiable headlessly)
+    if world.view == View::Map {
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(width as f32, height as f32),
+            )),
+            ..Default::default()
+        };
+        let mut w = world;
+        ctx.set_pixels_per_point(1.0);
+        // frame 1 warms up fonts/layout (and builds the font atlas); frame 2
+        // emits the real shapes. Upload textures from both.
+        ctx.begin_pass(raw.clone());
+        ui::build(&ctx, &mut w);
+        let warm = ctx.end_pass();
+        ctx.begin_pass(raw);
+        ui::build(&ctx, &mut w);
+        let full = ctx.end_pass();
+        let prims = ctx.tessellate(full.shapes, 1.0);
+        let mut renderer =
+            egui_wgpu::Renderer::new(device, format, egui_wgpu::RendererOptions::default());
+        for (id, delta) in warm.textures_delta.set.iter().chain(full.textures_delta.set.iter()) {
+            renderer.update_texture(device, queue, *id, delta);
+        }
+        let screen = egui_wgpu::ScreenDescriptor { size_in_pixels: [width, height], pixels_per_point: 1.0 };
+        renderer.update_buffers(device, queue, &mut encoder, &prims, &screen);
+        {
+            let mut pass = overlay_pass(&mut encoder, &target_view).forget_lifetime();
+            renderer.render(&mut pass, &prims, &screen);
+        }
+    }
+
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
             texture: &target,
@@ -2034,6 +2088,24 @@ impl ApplicationHandler<UserEvent> for App {
         let Some(state) = self.state.as_mut() else {
             return;
         };
+
+        // Let egui see the event first; if it consumed a pointer/keyboard input
+        // (i.e. the user is interacting with the UI), don't also drive the game.
+        let egui_resp = state.egui_state.on_window_event(&state.window, &event);
+        if egui_resp.repaint {
+            state.window.request_redraw();
+        }
+        if egui_resp.consumed
+            && matches!(
+                event,
+                WindowEvent::MouseInput { .. }
+                    | WindowEvent::MouseWheel { .. }
+                    | WindowEvent::KeyboardInput { .. }
+            )
+        {
+            return;
+        }
+
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -2046,15 +2118,11 @@ impl ApplicationHandler<UserEvent> for App {
                     // In the map, a click on the body menu jumps focus (and does
                     // not start an orbit drag).
                     if pressed && state.world.view == View::Map {
+                        // click a body in the scene to focus it (the egui panel
+                        // handles its own clicks before we get here).
                         let res = (state.config.width as f32, state.config.height as f32);
                         let (cx, cy) = (state.last_cursor.0 as f32, state.last_cursor.1 as f32);
-                        // a click on the menu, or on any body in the scene, jumps
-                        // focus (and does not start an orbit drag).
-                        if let Some(b) = state
-                            .world
-                            .map_menu_pick(res, cx, cy)
-                            .or_else(|| state.world.pick_body(res, cx, cy))
-                        {
+                        if let Some(b) = state.world.pick_body(res, cx, cy) {
                             state.world.set_focus(b);
                             return;
                         }

@@ -59,3 +59,12 @@ So: do NOT claim GPU output is unverifiable. CPU-side generation (worldgen, sim,
 LOD quadtree/mesh geometry, rocket stack math) is verifiable directly; shaded
 GPU output is verifiable via lavapipe + `shot`. The one thing that still needs a
 real browser is confirming the wasm/WebGPU path renders in-browser.
+
+### Always screenshot as you go
+
+Treat a rendered PNG as the unit of done for anything visual. At each visual
+change: render a `shot`/preview PNG, `Read` it to actually look at the result
+(don't assume), and surface it to the user. Keep a representative shot under
+`docs/images/` and reference it from the README/PR. New rendering features should
+add a `shot` scenario (or a CPU preview bin) so they stay verifiable headlessly.
+This screenshot-driven loop is how this project is built - keep doing it.
