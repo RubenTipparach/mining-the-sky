@@ -1,13 +1,18 @@
 // Live planet rendered from the baked worldgen texture (RGB = albedo,
 // A = city-light emission). Orthographic raymarch of a sphere with day/night
-// terminator, atmospheric limb, ocean glint, and dark-side city lights. This
-// is the GPU counterpart to the worldgen CPU preview.
+// terminator, atmospheric limb, ocean glint, and dark-side city lights. The
+// camera is a free orbit camera: `c*` are the columns of the world-from-view
+// rotation, so view-space normals are lit and sampled in world space and the
+// terminator stays fixed on the planet as you orbit around it.
 
 struct Uniforms {
     resolution: vec2<f32>,
+    scale: f32,   // view-plane half-extent: smaller = zoomed in
     time: f32,
-    _pad: f32,
-    sun: vec4<f32>,
+    sun: vec4<f32>, // world-space sun direction in xyz
+    cx: vec4<f32>,  // world-from-view rotation, column 0 (view right)
+    cy: vec4<f32>,  // column 1 (view up)
+    cz: vec4<f32>,  // column 2 (toward the viewer)
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -32,33 +37,6 @@ fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
     return out;
 }
 
-fn hash3(p: vec3<f32>) -> f32 {
-    let q = fract(p * 0.3183099 + vec3<f32>(0.1, 0.2, 0.3));
-    let r = q + vec3<f32>(dot(q, q.yzx + 19.19));
-    return fract((r.x + r.y) * r.z);
-}
-
-fn vnoise(p: vec3<f32>) -> f32 {
-    let i = floor(p);
-    let f = fract(p);
-    let w = f * f * (3.0 - 2.0 * f);
-    let c000 = hash3(i + vec3<f32>(0.0, 0.0, 0.0));
-    let c100 = hash3(i + vec3<f32>(1.0, 0.0, 0.0));
-    let c010 = hash3(i + vec3<f32>(0.0, 1.0, 0.0));
-    let c110 = hash3(i + vec3<f32>(1.0, 1.0, 0.0));
-    let c001 = hash3(i + vec3<f32>(0.0, 0.0, 1.0));
-    let c101 = hash3(i + vec3<f32>(1.0, 0.0, 1.0));
-    let c011 = hash3(i + vec3<f32>(0.0, 1.0, 1.0));
-    let c111 = hash3(i + vec3<f32>(1.0, 1.0, 1.0));
-    let x00 = mix(c000, c100, w.x);
-    let x10 = mix(c010, c110, w.x);
-    let x01 = mix(c001, c101, w.x);
-    let x11 = mix(c011, c111, w.x);
-    let y0 = mix(x00, x10, w.y);
-    let y1 = mix(x01, x11, w.y);
-    return mix(y0, y1, w.z);
-}
-
 const PI: f32 = 3.14159265;
 
 @fragment
@@ -66,22 +44,19 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let aspect = u.resolution.x / max(u.resolution.y, 1.0);
     var uv = in.uv;
     uv.x = uv.x * aspect;
-    uv = uv * 1.25; // margin so the disk + atmosphere fit
+    uv = uv * u.scale;
 
     let sun = normalize(u.sun.xyz);
+    let rot = mat3x3<f32>(u.cx.xyz, u.cy.xyz, u.cz.xyz);
+    let viewer = u.cz.xyz; // world direction toward the camera
     let r2 = dot(uv, uv);
-
-    // slow rotation of the planet about its axis
-    let ang = u.time * 0.04;
-    let ca = cos(ang);
-    let sa = sin(ang);
 
     var col = vec3<f32>(0.0);
 
     if (r2 <= 1.0) {
         let nz = sqrt(1.0 - r2);
         let n = vec3<f32>(uv.x, uv.y, nz); // view-space normal
-        let pdir = normalize(vec3<f32>(ca * n.x + sa * n.z, n.y, -sa * n.x + ca * n.z));
+        let pdir = rot * n;                // world-space normal
 
         // sample the baked world (equirectangular)
         let lon = atan2(pdir.z, pdir.x);
@@ -91,15 +66,15 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         let albedo = texel.rgb;
         let emission = texel.a;
 
-        let ndl = dot(n, sun);
+        let ndl = dot(pdir, sun);
         let day = smoothstep(-0.06, 0.16, ndl);
         let diffuse = day * (0.12 + 0.88 * max(ndl, 0.0));
         col = albedo * vec3<f32>(1.05, 1.02, 0.95) * diffuse;
 
         // ocean glint where albedo is blue-dominant
         let oceanish = clamp((albedo.b - max(albedo.r, albedo.g)) * 4.0, 0.0, 1.0);
-        let half = normalize(sun + vec3<f32>(0.0, 0.0, 1.0));
-        let spec = pow(max(dot(n, half), 0.0), 60.0) * day * oceanish;
+        let half = normalize(sun + viewer);
+        let spec = pow(max(dot(pdir, half), 0.0), 60.0) * day * oceanish;
         col = col + vec3<f32>(0.8, 0.8, 0.72) * spec;
 
         // city lights on the dark side
@@ -113,17 +88,18 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         let r = sqrt(r2);
         if (r < 1.06) {
             let ln = normalize(vec3<f32>(uv.x, uv.y, 0.0));
-            let ndl = max(dot(ln, sun), 0.0);
+            // approximate the world normal at the limb for the glow's day side
+            let pdir = rot * ln;
+            let ndl = max(dot(pdir, sun), 0.0);
             let d = (r - 1.0) / 0.06;
             let glow = pow(clamp(1.0 - d, 0.0, 1.0), 2.0);
             col = vec3<f32>(0.3, 0.5, 1.0) * glow * (ndl * 0.9 + 0.05);
-        } else {
-            let s = vnoise(vec3<f32>(in.uv * 800.0, 1.0));
-            col = vec3<f32>(step(0.985, s));
         }
     }
 
-    col = vec3<f32>(1.0) - exp(-col * 1.1);
-    col = pow(col, vec3<f32>(1.0 / 2.2));
+    // Exposure/tonemap only. The render target is sRGB, so it applies the
+    // gamma encode on store - do NOT also gamma-correct here (that double-
+    // encodes and washes the image out).
+    col = vec3<f32>(1.0) - exp(-col * 1.2);
     return vec4<f32>(col, 1.0);
 }

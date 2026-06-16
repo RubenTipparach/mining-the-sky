@@ -36,8 +36,13 @@ See **[docs/DESIGN.md](docs/DESIGN.md)** for the full design document covering:
   orbit from the seed-47 spaceport and plots the trajectory.
 - `crates/app` - the real-time client (wgpu / WebGPU) that runs natively and in
   the browser via WebAssembly. Renders the baked worldgen planet (real
-  coastlines, day/night terminator, atmospheric limb, dark-side city lights) as
-  the seed of the Caelum-style renderer.
+  coastlines, day/night terminator, atmospheric limb, dark-side city lights)
+  with a free orbit camera, a pre-launch vehicle assembly readout, the staged
+  launch-to-orbit drawn live on the globe, a bitmap-font telemetry HUD, and a
+  manual free-flight mode under multi-body gravity (change orbit, land on the
+  home world, or transfer to and land on the moon). A perspective "system view"
+  frames the home world and its moon. Includes a headless `shot` mode that
+  renders a frame to a PNG (no display needed).
 
 ## Build and run
 
@@ -52,7 +57,18 @@ cargo run -p worldgen --bin bake --release -- 47
 cargo run -p sim --bin launch --release
 
 # Run the real-time WebGPU client natively
+#   drag = orbit camera, scroll = zoom, Space = launch, F = manual flight,
+#   1-4 = thrust mode, W/S = throttle, V = system view, [ ] = time warp
 cargo run -p app --release
+
+# Render frames to PNGs headlessly (no window needed) for visual validation
+cargo run -p app --release -- shot all                    # every feature -> ./out
+cargo run -p app --release -- shot pad    out/pad.png     # pre-launch vehicle assembly
+cargo run -p app --release -- shot ascent out/ascent.png  # mid powered ascent
+cargo run -p app --release -- shot        out/client.png  # parking orbit
+cargo run -p app --release -- shot flight out/flight.png  # manual free-flight HUD
+cargo run -p app --release -- shot system out/system.png  # home world + moon
+cargo run -p app --release -- shot moon   out/moon.png    # landed on the moon
 
 # Build the browser (WASM) client locally
 cd crates/app && trunk serve     # then open the printed localhost URL
@@ -68,6 +84,27 @@ Launch-to-orbit (Pioneer I from the seed-47 spaceport, 205 km circular orbit):
 
 ![](docs/images/launch.png)
 
+Pre-launch vehicle assembly (build and stage): the staged stack with per-stage
+mass and delta-v, liftoff TWR, total delta-v, payload, and target orbit.
+
+![](docs/images/vehicle.png)
+
+The real-time client (headless `shot`): Pioneer I in its parking orbit over the
+day/night terminator, dark-side city lights, atmospheric limb, and the live
+telemetry HUD.
+
+![](docs/images/client.png)
+
+System view (`V`): a perspective camera framing the home world and its moon, the
+seed of the multi-body 3D renderer.
+
+![](docs/images/system.png)
+
+Landed on the moon: manual free-flight under multi-body gravity transfers the
+craft from home orbit and touches down on the moon.
+
+![](docs/images/moon.png)
+
 ## Live demo (GitHub Pages)
 
 `.github/workflows/pages.yml` builds the WASM client with Trunk and deploys it to
@@ -77,8 +114,22 @@ needs a WebGPU-capable browser.
 
 ## Status
 
-Initial vertical slice working (design doc roadmap M0-M2): procedural planet
-with coastal-delta cities, roads, and night lights; a live native/browser
-WebGPU view of the baked world; and a staged rocket that launches from the
-spaceport into a stable orbit. Next: render the rocket + orbit in the real-time
-client, then the economy loop (fundraise, launch parts, assemble in orbit).
+Vertical-slice prototype complete (design doc roadmap M0-M2). End to end in the
+live native/browser WebGPU client:
+
+- Procedural home world: coastal-delta cities, river-corridor towns, a
+  great-circle road network, dark-side city lights, and an auto-sited spaceport.
+- Build and stage: a pre-launch vehicle assembly readout (per-stage mass and
+  delta-v, TWR, payload, target orbit).
+- Launch to orbit: the staged ascent flown live and drawn to scale on the globe,
+  with a telemetry HUD.
+- Manual free-flight under live multi-body physics (gravity + atmospheric drag +
+  thrust): change orbit, deorbit, and land anywhere on the home world or, via a
+  transfer, on the moon.
+- A perspective system view framing the home world and its moon.
+- A headless `shot` renderer for verification and the images above.
+
+Next (the longer arc from the design doc): a guided transfer planner / maneuver
+nodes; true 3D-perspective terrain and LOD (toward walkable surfaces); then the
+economy loop - fundraise, launch parts (robonauts, refineries), assemble a
+factory in orbit, and fabricate advanced craft to push farther out.

@@ -14,6 +14,8 @@ wgpu = "29"
 winit = "0.30"
 bytemuck = { version = "1", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+glam = "0.30"
+sim = { path = "../sim" }
 log = "0.4"
 cfg-if = "1"
 
