@@ -7,7 +7,9 @@
 
 pub mod cubesphere;
 pub mod elevation;
+pub mod octree;
 pub mod quadtree;
+pub mod raster;
 pub mod render;
 pub mod surfacenets;
 

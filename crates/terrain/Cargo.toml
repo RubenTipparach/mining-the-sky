@@ -21,3 +21,7 @@ path = "src/bin/lod.rs"
 [[bin]]
 name = "dc"
 path = "src/bin/dc.rs"
+
+[[bin]]
+name = "octree"
+path = "src/bin/octree.rs"
