@@ -29,16 +29,27 @@ See **[docs/DESIGN.md](docs/DESIGN.md)** for the full design document covering:
   rivers/deltas via flow accumulation, coastal-delta major cities, river-corridor
   minor cities, a great-circle MST road network, night-light emission, and an
   auto-sited equatorial launch complex. Includes a CPU PNG preview renderer.
+- `crates/sim` - orbital mechanics and launch-to-orbit: analytic two-body
+  ("on-rails") state/elements, a central body + atmosphere, staged launch
+  vehicles, an RK4 powered-ascent integrator with a programmed gravity turn and
+  staging, and analytic circularization at apoapsis. Reaches a stable ~200 km
+  orbit from the seed-47 spaceport and plots the trajectory.
 - `crates/app` - the real-time client (wgpu / WebGPU) that runs natively and in
-  the browser via WebAssembly. Currently renders a live procedural planet
-  (day/night terminator, atmospheric limb, city-light sparkle) as the seed of
-  the Caelum-style renderer.
+  the browser via WebAssembly. Renders the baked worldgen planet (real
+  coastlines, day/night terminator, atmospheric limb, dark-side city lights) as
+  the seed of the Caelum-style renderer.
 
 ## Build and run
 
 ```sh
 # Generate planet/city/road/night-light PNG previews into ./out
 cargo run -p worldgen --bin preview --release -- 47
+
+# Bake the world into the texture the client samples
+cargo run -p worldgen --bin bake --release -- 47
+
+# Stack a rocket, launch from the spaceport, reach orbit (writes out/launch.png)
+cargo run -p sim --bin launch --release
 
 # Run the real-time WebGPU client natively
 cargo run -p app --release
@@ -53,6 +64,10 @@ A few generated previews (seed 47):
 | --- | --- | --- |
 | ![](docs/images/cities_roads.png) | ![](docs/images/globe_day.png) | ![](docs/images/globe_night.png) |
 
+Launch-to-orbit (Pioneer I from the seed-47 spaceport, 205 km circular orbit):
+
+![](docs/images/launch.png)
+
 ## Live demo (GitHub Pages)
 
 `.github/workflows/pages.yml` builds the WASM client with Trunk and deploys it to
@@ -62,6 +77,8 @@ needs a WebGPU-capable browser.
 
 ## Status
 
-Vertical slice in progress (design doc roadmap M0-M2): worldgen + a live planet
-in native and browser. Next: feed real worldgen data to the GPU, then rocket
-staging and launch-to-orbit.
+Initial vertical slice working (design doc roadmap M0-M2): procedural planet
+with coastal-delta cities, roads, and night lights; a live native/browser
+WebGPU view of the baked world; and a staged rocket that launches from the
+spaceport into a stable orbit. Next: render the rocket + orbit in the real-time
+client, then the economy loop (fundraise, launch parts, assemble in orbit).
