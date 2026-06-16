@@ -310,23 +310,10 @@ impl World {
 
     fn build_overlay(&self, rot: Mat3, aspect: f32) -> Vec<OverlayVertex> {
         if self.view == View::System {
-            // draw only the craft marker, projected through the perspective camera
-            let mut out: Vec<OverlayVertex> = Vec::new();
-            if let Some(craft) = self.flight.as_ref() {
-                let cam = self.system_camera(aspect);
-                let p_mm = (craft.r / MM as f64).as_vec3();
-                if let Some(c) = cam.project(p_mm) {
-                    let col = if craft.crashed {
-                        [1.0, 0.25, 0.2]
-                    } else if craft.landed {
-                        [0.4, 1.0, 0.5]
-                    } else {
-                        [1.0, 0.85, 0.25]
-                    };
-                    push_marker(&mut out, c, aspect, col);
-                }
-            }
-            return out;
+            // the system-view craft marker is drawn as a filled shape in the HUD
+            // pass (visible on bright bodies); nothing to draw as lines here.
+            let _ = aspect;
+            return Vec::new();
         }
         let rt = rot.transpose();
         let scale = self.scale;
@@ -604,6 +591,16 @@ impl World {
             hud.text(&mut out, label, cx, y, scol, res);
             y += step;
             row(&mut out, "TO MOON  ", &format!("{:.1} MM", to_moon), y);
+
+            // craft marker in the scene: filled diamond + dark outline so it is
+            // visible on both the dark sky and the bright moon.
+            let aspect = res.0 / res.1.max(1.0);
+            let cam = self.system_camera(aspect);
+            let p_mm = (craft.r / MM as f64).as_vec3();
+            if let Some(c) = cam.project(p_mm) {
+                push_filled_diamond(&mut out, c, 0.030, aspect, [0.0, 0.0, 0.0]);
+                push_filled_diamond(&mut out, c, 0.020, aspect, scol);
+            }
         }
 
         let mut hy = res.1 - step * 3.0 - 12.0;
@@ -982,6 +979,19 @@ impl Gpu {
     }
 }
 
+/// Push a filled diamond (two triangles) at clip point `c` with half-height
+/// `hy`, for the HUD/triangle pipeline. Square in pixels via the aspect ratio.
+fn push_filled_diamond(out: &mut Vec<OverlayVertex>, c: [f32; 2], hy: f32, aspect: f32, color: [f32; 3]) {
+    let hx = hy / aspect;
+    let top = [c[0], c[1] + hy];
+    let right = [c[0] + hx, c[1]];
+    let bot = [c[0], c[1] - hy];
+    let left = [c[0] - hx, c[1]];
+    for p in [top, right, bot, top, bot, left] {
+        out.push(OverlayVertex { pos: p, color });
+    }
+}
+
 /// Push a small screen-space diamond marker (line list) at clip point `c`.
 fn push_marker(out: &mut Vec<OverlayVertex>, c: [f32; 2], aspect: f32, color: [f32; 3]) {
     let off = 0.022f32;
@@ -1155,11 +1165,23 @@ impl State {
 }
 
 // ---------------------------------------------------------------------------
-// Headless screenshot (native only): render one framed shot to a PNG.
+// Headless screenshot (native only): render framed shots to PNGs for visual
+// validation of every feature.
 // ---------------------------------------------------------------------------
 
+/// (scenario, default output path) for `app shot all`.
 #[cfg(not(target_arch = "wasm32"))]
-fn screenshot(path: &str, width: u32, height: u32, scenario: &str) {
+const SHOT_SCENARIOS: &[(&str, &str)] = &[
+    ("pad", "out/pad.png"),
+    ("ascent", "out/ascent.png"),
+    ("surface", "out/client.png"),
+    ("flight", "out/flight.png"),
+    ("system", "out/system.png"),
+    ("moon", "out/moon.png"),
+];
+
+#[cfg(not(target_arch = "wasm32"))]
+fn make_shot_device() -> (wgpu::Device, wgpu::Queue) {
     let instance =
         wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -1168,7 +1190,7 @@ fn screenshot(path: &str, width: u32, height: u32, scenario: &str) {
         force_fallback_adapter: false,
     }))
     .expect("no adapter");
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("shot-device"),
         required_features: wgpu::Features::empty(),
         required_limits: wgpu::Limits::default(),
@@ -1176,16 +1198,23 @@ fn screenshot(path: &str, width: u32, height: u32, scenario: &str) {
         experimental_features: wgpu::ExperimentalFeatures::disabled(),
         trace: wgpu::Trace::Off,
     }))
-    .expect("device");
+    .expect("device")
+}
 
-    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
-    let gpu = Gpu::new(&device, &queue, format);
-    let hud = Hud::new();
-
+/// Build the world + sun time for a named validation scenario.
+#[cfg(not(target_arch = "wasm32"))]
+fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
     let mut world = World::new();
+    // sun phase that puts a terminator across the surface disk
+    let surface_time = |w: &World| (w.az + 1.66 - w.mission.spaceport_lon) / 0.03;
+    let frame_surface = |w: &mut World| {
+        w.view = View::Surface;
+        w.az = w.mission.spaceport_lon + 1.15;
+        w.el = w.mission.spaceport_lat + 0.25;
+        w.scale = 1.35;
+    };
     let time = match scenario {
         "system" => {
-            // wide system shot: home world and moon framed side by side.
             world.view = View::System;
             world.sys_az = 1.4;
             world.sys_el = 0.30;
@@ -1193,7 +1222,6 @@ fn screenshot(path: &str, width: u32, height: u32, scenario: &str) {
             6.0
         }
         "moon" => {
-            // close-up of the moon with a landed craft marker on its near side.
             world.view = View::System;
             world.sys_focus = world.moon_center_mm;
             world.sys_az = 1.2;
@@ -1202,37 +1230,77 @@ fn screenshot(path: &str, width: u32, height: u32, scenario: &str) {
             let cam = world.system_camera(width as f32 / height as f32);
             let to_cam = (cam.pos * MM).as_dvec3() - world.moon_center_m;
             let up = to_cam.normalize();
-            let mut craft = Craft::maneuvering(
-                world.moon_center_m + up * world.moon_radius_m,
-                DVec3::ZERO,
-            );
+            let mut craft =
+                Craft::maneuvering(world.moon_center_m + up * world.moon_radius_m, DVec3::ZERO);
             craft.landed = true;
             craft.landed_on = "MOON";
             world.flight = Some(craft);
             6.0
         }
         "pad" => {
-            // pre-launch: the vehicle assembly panel, planet framed at the limb.
-            world.view = View::Surface;
+            frame_surface(&mut world);
             world.launched = false;
-            world.az = world.mission.spaceport_lon + 1.15;
-            world.el = world.mission.spaceport_lat + 0.25;
-            world.scale = 1.35;
-            (world.az + 1.66 - world.mission.spaceport_lon) / 0.03
+            surface_time(&world)
+        }
+        "ascent" => {
+            frame_surface(&mut world);
+            world.launched = true;
+            world.clock = world.mission.meco_t * 0.5; // mid powered ascent
+            surface_time(&world)
+        }
+        "flight" => {
+            frame_surface(&mut world);
+            world.launched = true;
+            world.clock = world.mission.meco_t + 10.0;
+            let (r, v) = world.mission.orbit_state_at(world.clock);
+            let mut craft = Craft::maneuvering(r, v);
+            craft.throttle = 0.6;
+            craft.mode = Mode::Retrograde;
+            world.flight = Some(craft);
+            surface_time(&world)
         }
         _ => {
-            // surface / launch view: launched, craft coasting in its parking
-            // orbit, the spaceport at the limb so the ascent arc + orbit ring
-            // read clearly, sun ~95 deg off-view so the dark side shows.
-            world.view = View::Surface;
+            // surface / launch view: craft coasting in the parking orbit.
+            frame_surface(&mut world);
             world.launched = true;
             world.clock = world.mission.meco_t + 240.0;
-            world.az = world.mission.spaceport_lon + 1.15;
-            world.el = world.mission.spaceport_lat + 0.25;
-            world.scale = 1.35;
-            (world.az + 1.66 - world.mission.spaceport_lon) / 0.03
+            surface_time(&world)
         }
     };
+    (world, time)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn screenshot_all(width: u32, height: u32) {
+    let (device, queue) = make_shot_device();
+    let gpu = Gpu::new(&device, &queue, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let hud = Hud::new();
+    for (scenario, path) in SHOT_SCENARIOS {
+        render_shot(&device, &queue, &gpu, &hud, scenario, path, width, height);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn screenshot(path: &str, width: u32, height: u32, scenario: &str) {
+    let (device, queue) = make_shot_device();
+    let gpu = Gpu::new(&device, &queue, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let hud = Hud::new();
+    render_shot(&device, &queue, &gpu, &hud, scenario, path, width, height);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn render_shot(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    gpu: &Gpu,
+    hud: &Hud,
+    scenario: &str,
+    path: &str,
+    width: u32,
+    height: u32,
+) {
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let (world, time) = setup_world(scenario, width, height);
 
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("shot-target"),
@@ -1250,7 +1318,7 @@ fn screenshot(path: &str, width: u32, height: u32, scenario: &str) {
     });
     let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
-    let (n, hn) = gpu.prepare(&queue, &world, &hud, width, height, time);
+    let (n, hn) = gpu.prepare(queue, &world, hud, width, height, time);
 
     // 256-byte aligned row pitch for the readback copy.
     let unpadded = width * 4;
@@ -1493,18 +1561,27 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 fn main() {
-    // Native: `app shot [out.png]` renders one headless frame and exits.
+    // Native: `app shot [scenario] [out.png]` renders headless frame(s) and
+    // exits. `app shot all` validates every feature into ./out.
     #[cfg(not(target_arch = "wasm32"))]
     {
         let args: Vec<String> = std::env::args().collect();
         if args.iter().any(|a| a == "shot" || a == "--shot") {
             env_logger::init();
+            if args.iter().any(|a| a == "all") {
+                screenshot_all(1280, 800);
+                return;
+            }
             let scenario = if args.iter().any(|a| a == "moon") {
                 "moon"
             } else if args.iter().any(|a| a == "system") {
                 "system"
             } else if args.iter().any(|a| a == "pad") {
                 "pad"
+            } else if args.iter().any(|a| a == "ascent") {
+                "ascent"
+            } else if args.iter().any(|a| a == "flight") {
+                "flight"
             } else {
                 "surface"
             };
@@ -1512,6 +1589,8 @@ fn main() {
                 "moon" => "out/moon.png",
                 "system" => "out/system.png",
                 "pad" => "out/pad.png",
+                "ascent" => "out/ascent.png",
+                "flight" => "out/flight.png",
                 _ => "out/client.png",
             };
             let path = args
