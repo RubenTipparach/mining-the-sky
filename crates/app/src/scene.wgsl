@@ -18,6 +18,7 @@ struct Scene {
     res: vec4<f32>,      // x,y = resolution
     planets: array<vec4<f32>, 16>,    // xyz centre, w radius (Mm)
     planet_col: array<vec4<f32>, 16>, // rgb colour
+    moons: array<vec4<f32>, 8>,       // nearest moons: xyz centre, w radius
 };
 
 
@@ -129,8 +130,8 @@ fn shade_home(p: vec3<f32>, rd: vec3<f32>) -> vec3<f32> {
     return col;
 }
 
-fn shade_moon(p: vec3<f32>) -> vec3<f32> {
-    let n = normalize(p - s.moon.xyz);
+fn shade_moon_at(p: vec3<f32>, center: vec3<f32>) -> vec3<f32> {
+    let n = normalize(p - center);
     let sun = normalize(s.sun.xyz - p);
     // grey regolith with darker maria from noise
     let maria = vnoise(n * 6.0) * 0.5 + vnoise(n * 18.0) * 0.25;
@@ -157,7 +158,18 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let th = hit_sphere(ro, rd, s.home.xyz, s.home.w);
     if (th > 0.0 && th < best) { best = th; col = shade_home(ro + rd * th, rd); hit = true; }
     let tm = hit_sphere(ro, rd, s.moon.xyz, s.moon.w);
-    if (tm > 0.0 && tm < best) { best = tm; col = shade_moon(ro + rd * tm); hit = true; }
+    if (s.moon.w > 0.0 && tm > 0.0 && tm < best) { best = tm; col = shade_moon_at(ro + rd * tm, s.moon.xyz); hit = true; }
+    // nearest moons as lit spheres (so they read as real bodies up close)
+    let mcount = i32(s.res.z);
+    for (var k = 0; k < mcount; k = k + 1) {
+        let mb = s.moons[k];
+        let tmo = hit_sphere(ro, rd, mb.xyz, mb.w);
+        if (tmo > 0.0 && tmo < best) {
+            best = tmo;
+            col = shade_moon_at(ro + rd * tmo, mb.xyz);
+            hit = true;
+        }
+    }
     // binary stars
     let ta = hit_sphere(ro, rd, s.sunbody.xyz, s.sunbody.w);
     if (ta > 0.0 && ta < best) { best = ta; col = shade_star(ro + rd * ta, s.sunbody.xyz, rd, vec3<f32>(1.6, 1.3, 0.8)); hit = true; }

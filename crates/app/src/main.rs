@@ -104,9 +104,10 @@ struct SceneUniforms {
     sunbody: [f32; 4],  // star A: xyz centre, w radius (Mm)
     sunbody2: [f32; 4], // star B (red): xyz centre, w radius (Mm)
     params: [f32; 4],   // x=tan(fov/2), y=aspect, z=time, w=planet count
-    res: [f32; 4],
+    res: [f32; 4],      // x,y=resolution, z=moon count
     planets: [[f32; 4]; 16],    // xyz centre, w radius (Mm)
     planet_col: [[f32; 4]; 16], // rgb colour
+    moons: [[f32; 4]; 8],       // nearest moons: xyz centre, w radius (Mm)
 }
 
 #[repr(C)]
@@ -501,6 +502,23 @@ impl World {
             n += 1;
         }
 
+        // nearest moons to the camera, ray-marched as lit spheres up close
+        let mut moons = [[0.0f32; 4]; 8];
+        let mut cand: Vec<(f64, usize)> = u
+            .bodies
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.kind == Kind::Moon)
+            .map(|(i, _)| ((u.position(i, t) - cam.pos).length(), i))
+            .collect();
+        cand.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        let mut mc = 0usize;
+        for &(_, i) in cand.iter().take(8) {
+            let p = rel(u.position(i, t));
+            moons[mc] = [p.x, p.y, p.z, u.bodies[i].radius as f32];
+            mc += 1;
+        }
+
         SceneUniforms {
             cam_pos: [0.0, 0.0, 0.0, 0.0], // camera at origin (floating origin)
             cam_x: [cam.right.x, cam.right.y, cam.right.z, 0.0],
@@ -512,9 +530,10 @@ impl World {
             sunbody: [star_a.x, star_a.y, star_a.z, u.bodies[0].radius as f32],
             sunbody2: [star_b.x, star_b.y, star_b.z, u.bodies[1].radius as f32],
             params: [cam.fovscale, aspect, time, n as f32],
-            res: [res[0], res[1], 0.0, 0.0],
+            res: [res[0], res[1], mc as f32, 0.0],
             planets,
             planet_col,
+            moons,
         }
     }
 
@@ -1764,6 +1783,22 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.sys_dist = 60.0;
             6.0
         }
+        "moons" => {
+            // focus a moon up close so it ray-marches as a real sphere, with its
+            // gas giant looming behind.
+            world.view = View::Map;
+            let midx = world
+                .universe
+                .bodies
+                .iter()
+                .position(|b| b.kind == Kind::Moon)
+                .unwrap_or(0);
+            world.set_focus(midx);
+            world.sys_dist = world.universe.bodies[midx].radius * 6.0;
+            world.sys_az = 1.1;
+            world.sys_el = 0.20;
+            6.0
+        }
         "ascent" => {
             frame_map(&mut world);
             world.launched = true;
@@ -2167,7 +2202,9 @@ fn main() {
                 screenshot_all(1280, 800);
                 return;
             }
-            let scenario = if args.iter().any(|a| a == "moon") {
+            let scenario = if args.iter().any(|a| a == "moons") {
+                "moons"
+            } else if args.iter().any(|a| a == "moon") {
                 "moon"
             } else if args.iter().any(|a| a == "rocket") {
                 "rocket"
@@ -2183,6 +2220,7 @@ fn main() {
                 "surface"
             };
             let default = match scenario {
+                "moons" => "out/moons.png",
                 "moon" => "out/moon.png",
                 "rocket" => "out/rocket.png",
                 "system" => "out/system.png",
