@@ -1,0 +1,7 @@
+/target
+/out
+**/*.rs.bk
+Cargo.lock.orig
+# wasm build output
+/dist
+/crates/app/dist
