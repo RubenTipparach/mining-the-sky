@@ -26,6 +26,7 @@ mod flight;
 mod hud;
 mod mission;
 mod rocket;
+mod universe;
 use flight::{Craft, GravBody, Mode};
 use hud::Hud;
 use mission::Mission;
@@ -104,8 +105,8 @@ struct SceneUniforms {
     sunbody2: [f32; 4], // star B (red): xyz centre, w radius (Mm)
     params: [f32; 4],   // x=tan(fov/2), y=aspect, z=time, w=planet count
     res: [f32; 4],
-    planets: [[f32; 4]; 8],    // xyz centre, w radius (Mm)
-    planet_col: [[f32; 4]; 8], // rgb colour
+    planets: [[f32; 4]; 16],    // xyz centre, w radius (Mm)
+    planet_col: [[f32; 4]; 16], // rgb colour
 }
 
 #[repr(C)]
@@ -132,95 +133,9 @@ enum View {
     Rocket,
 }
 
-/// A body shown in the orbital map. Distances are schematic (compressed) so the
-/// whole binary system stays f32-precise and readable. The home planet sits at
-/// the local origin (so the launch sim frame is untouched) and orbits the
-/// binary barycenter, which is therefore one home-orbit-radius away.
-#[derive(Clone)]
-struct MapBody {
-    name: &'static str,
-    pos: Vec3,
-    radius: f32,
-    color: [f32; 3],
-    star: bool,
-    /// Orbit ring: center + radius (Mm). `near_ring` rings (moons) show at a
-    /// moderate zoom; the rest (planets) show only at system zoom.
-    orbit_center: Vec3,
-    orbit_r: f32,
-    near_ring: bool,
-}
 
-/// Binary barycenter (Mm). Home is at the origin on the 360 Mm orbit.
-const BARY: Vec3 = Vec3::new(-360.0, 0.0, 0.0);
-
-/// Inspired by Kepler-47 (a transiting circumbinary multiplanet system): a
-/// Sun-like primary + a dim red-dwarf secondary, with a roster of circumbinary
-/// planets (home is a temperate terrestrial; the gas giant has the moon
-/// colony target). Schematic orbit radii (Mm), angles, display radii, colours.
-const PLANETS: &[(&str, f32, f32, f32, [f32; 3])] = &[
-    ("EMBER", 150.0, 2.4, 3.0, [0.72, 0.42, 0.30]),   // hot rocky
-    ("CINDER", 245.0, 5.1, 4.2, [0.58, 0.52, 0.46]),  // rocky
-    ("VERDAN", 360.0, 0.0, 6.2, [0.30, 0.55, 0.45]),  // home (terrestrial)
-    ("TYCHO", 520.0, 1.7, 14.0, [0.82, 0.71, 0.50]),  // gas giant
-    ("HALCYON", 705.0, 3.9, 11.0, [0.58, 0.74, 0.86]),// ice giant
-    ("BOREAS", 905.0, 5.6, 8.0, [0.70, 0.80, 0.92]),  // ice giant
-];
-
-fn build_map_bodies(home_radius_mm: f32, moon_center_mm: Vec3, moon_radius_mm: f32) -> Vec<MapBody> {
-    let mut v = Vec::new();
-    // close binary: bright primary + dim red secondary, near the barycentre
-    v.push(MapBody {
-        name: "KEPLER STAR A",
-        pos: BARY + Vec3::new(0.0, 0.0, 26.0),
-        radius: 16.0,
-        color: [1.6, 1.3, 0.8],
-        star: true,
-        orbit_center: BARY,
-        orbit_r: 0.0,
-        near_ring: false,
-    });
-    v.push(MapBody {
-        name: "STAR B (RED)",
-        pos: BARY - Vec3::new(0.0, 0.0, 26.0),
-        radius: 9.0,
-        color: [1.3, 0.5, 0.35],
-        star: true,
-        orbit_center: BARY,
-        orbit_r: 0.0,
-        near_ring: false,
-    });
-    // circumbinary planets
-    for &(name, orbit_r, angle, radius, color) in PLANETS {
-        let home = name == "VERDAN";
-        let pos = if home {
-            Vec3::ZERO
-        } else {
-            BARY + Vec3::new(angle.cos(), 0.0, angle.sin()) * orbit_r
-        };
-        v.push(MapBody {
-            name,
-            pos,
-            radius: if home { home_radius_mm } else { radius },
-            color,
-            star: false,
-            orbit_center: BARY,
-            orbit_r,
-            near_ring: false,
-        });
-    }
-    // the home moon
-    v.push(MapBody {
-        name: "MOON",
-        pos: moon_center_mm,
-        radius: moon_radius_mm,
-        color: [0.55, 0.55, 0.58],
-        star: false,
-        orbit_center: Vec3::ZERO,
-        orbit_r: moon_center_mm.length(),
-        near_ring: true,
-    });
-    v
-}
+use universe::{Body, Kind, Universe};
+use universe::BARY;
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -311,7 +226,9 @@ struct World {
     rocket_dist: f32,
     rocket_focus_y: f32,
 
-    map_bodies: Vec<MapBody>,
+    universe: Universe,
+    /// Indices into `universe.bodies` of the navigable bodies (stars + planets).
+    nav: Vec<usize>,
     focus_idx: usize,
 }
 
@@ -358,32 +275,52 @@ impl World {
             rocket_el: 0.12,
             rocket_dist: rocket_frame.1,
             rocket_focus_y: rocket_frame.0,
-            map_bodies: Vec::new(),
+            universe: Universe { bodies: Vec::new() },
+            nav: Vec::new(),
             focus_idx: 0,
         };
-        w.map_bodies = build_map_bodies(w.home_radius_mm, w.moon_center_mm, w.moon_radius_mm);
-        // default focus: the home world (VERDAN)
-        w.focus_idx = w.map_bodies.iter().position(|b| b.name == "VERDAN").unwrap_or(0);
+        // Generate the full Kepler-47 system; the landable moon is injected as
+        // home's first moon so the map and the flight sim agree.
+        w.universe = universe::generate(47, w.home_radius_mm, w.moon_center_mm, w.moon_radius_mm);
+        w.nav = w
+            .universe
+            .bodies
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| matches!(b.kind, Kind::StarA | Kind::StarB | Kind::Planet))
+            .map(|(i, _)| i)
+            .collect();
+        // default focus: the home world
+        w.focus_idx = w
+            .nav
+            .iter()
+            .position(|&i| w.universe.bodies[i].is_home)
+            .unwrap_or(0);
         w.apply_focus();
         w
     }
 
-    fn focus_label(&self) -> &'static str {
-        self.map_bodies.get(self.focus_idx).map(|b| b.name).unwrap_or("")
+    /// The currently focused body.
+    fn focus_body(&self) -> &Body {
+        &self.universe.bodies[self.nav[self.focus_idx]]
+    }
+
+    fn focus_label(&self) -> &str {
+        self.focus_body().name.as_str()
     }
 
     /// Screen layout of the body menu (top-right): (x, y0, row height) in px.
     fn map_menu_layout(res: (f32, f32)) -> (f32, f32, f32) {
-        (res.0 - 168.0, 40.0, hud::LINE_H * 1.4)
+        (res.0 - 170.0, 40.0, hud::LINE_H * 1.35)
     }
 
-    /// Map a click position to a body menu index, if any.
+    /// Map a click position to a body menu entry (index into `nav`), if any.
     fn map_menu_pick(&self, res: (f32, f32), cx: f32, cy: f32) -> Option<usize> {
         let (mx, my0, mdy) = Self::map_menu_layout(res);
         if cx < mx - 8.0 || cx > mx + 160.0 {
             return None;
         }
-        for i in 0..self.map_bodies.len() {
+        for i in 0..self.nav.len() {
             let yy = my0 + i as f32 * mdy;
             if cy >= yy - 2.0 && cy <= yy + hud::LINE_H + 2.0 {
                 return Some(i);
@@ -394,11 +331,11 @@ impl World {
 
     /// Cycle the orbital-map focus and reframe the camera onto it.
     fn cycle_focus(&mut self) {
-        self.set_focus((self.focus_idx + 1) % self.map_bodies.len());
+        self.set_focus((self.focus_idx + 1) % self.nav.len());
     }
 
     fn set_focus(&mut self, idx: usize) {
-        if idx < self.map_bodies.len() {
+        if idx < self.nav.len() {
             self.focus_idx = idx;
             self.apply_focus();
         }
@@ -406,10 +343,12 @@ impl World {
 
     /// Point the orbital camera at the current focus body and frame it.
     fn apply_focus(&mut self) {
-        if let Some(b) = self.map_bodies.get(self.focus_idx) {
-            self.sys_focus = b.pos;
-            self.sys_dist = (b.radius * 4.0).max(2.0);
-        }
+        let (pos, radius) = {
+            let b = self.focus_body();
+            (b.pos, b.radius)
+        };
+        self.sys_focus = pos;
+        self.sys_dist = (radius * 4.0).max(2.0);
     }
 
     fn grav_bodies(&self) -> Vec<GravBody> {
@@ -514,16 +453,15 @@ impl World {
         let star_b = BARY - Vec3::new(0.0, 0.0, 26.0);
 
         // circumbinary planets (excluding the textured home world)
-        let mut planets = [[0.0f32; 4]; 8];
-        let mut planet_col = [[0.0f32; 4]; 8];
+        let mut planets = [[0.0f32; 4]; 16];
+        let mut planet_col = [[0.0f32; 4]; 16];
         let mut n = 0usize;
-        for &(name, orbit_r, angle, radius, color) in PLANETS {
-            if name == "VERDAN" || n >= 8 {
+        for b in &self.universe.bodies {
+            if b.kind != Kind::Planet || b.is_home || n >= 16 {
                 continue;
             }
-            let p = BARY + Vec3::new(angle.cos(), 0.0, angle.sin()) * orbit_r;
-            planets[n] = [p.x, p.y, p.z, radius];
-            planet_col[n] = [color[0], color[1], color[2], 1.0];
+            planets[n] = [b.pos.x, b.pos.y, b.pos.z, b.radius];
+            planet_col[n] = [b.color[0], b.color[1], b.color[2], 1.0];
             n += 1;
         }
 
@@ -666,15 +604,22 @@ impl World {
                     prev = cur;
                 }
             };
-        for b in &self.map_bodies {
-            if b.orbit_r <= 0.0 {
-                continue;
-            }
-            // moon rings appear at moderate zoom; planet rings at system zoom
-            let show = if b.near_ring { self.sys_dist > 12.0 } else { self.sys_dist > 160.0 };
-            if show {
-                let col = if b.near_ring { [0.35, 0.5, 0.75] } else { [0.40, 0.40, 0.55] };
-                circle(b.orbit_center, b.orbit_r, col, &mut out);
+        // Planet orbit rings appear at system zoom; the focused planet's moon
+        // rings appear when zoomed in near it.
+        let focus = self.focus_body();
+        for b in &self.universe.bodies {
+            match b.kind {
+                Kind::Planet if self.sys_dist > 140.0 && b.orbit_r > 0.0 => {
+                    circle(b.orbit_center, b.orbit_r, [0.38, 0.38, 0.52], &mut out);
+                }
+                Kind::Moon if self.sys_dist < 120.0 && b.orbit_r > 0.0 => {
+                    // only the moons of the focused planet, to avoid clutter
+                    let near_focus = (b.orbit_center - focus.pos).length() < 1.0;
+                    if near_focus {
+                        circle(b.orbit_center, b.orbit_r, [0.35, 0.5, 0.75], &mut out);
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -915,32 +860,39 @@ impl World {
             push_filled_diamond(&mut out, c, 0.020, aspect, mcol);
         }
 
-        // tiny locator dots so distant planets/moon read at a glance
-        for (i, b) in self.map_bodies.iter().enumerate() {
-            if b.star || i == self.focus_idx {
-                continue;
-            }
+        // locator dots for every small body (moons, asteroids, comets) so the
+        // full system reads even though only stars/planets are ray-marched.
+        for b in &self.universe.bodies {
+            let sz = match b.kind {
+                Kind::Moon => 0.009,
+                Kind::AsteroidMajor | Kind::Comet => 0.007,
+                Kind::AsteroidMinor => 0.005,
+                _ => continue,
+            };
             if let Some(c) = cam.project(b.pos) {
-                push_filled_diamond(&mut out, c, 0.014, aspect, [0.0, 0.0, 0.0]);
-                push_filled_diamond(&mut out, c, 0.008, aspect, b.color);
+                push_filled_diamond(&mut out, c, sz + 0.004, aspect, [0.0, 0.0, 0.0]);
+                push_filled_diamond(&mut out, c, sz, aspect, b.color);
             }
         }
 
-        // body menu (top-right): click an entry or press its number to jump.
+        // body menu (top-right): the navigable bodies (stars + planets). Press
+        // 1-9 for the first nine or click any entry to jump.
         let (mx, my0, mdy) = Self::map_menu_layout(res);
         hud.text(&mut out, "BODIES", mx, my0 - step * 1.4, amber, res);
-        for (i, b) in self.map_bodies.iter().enumerate() {
+        for (i, &bi) in self.nav.iter().enumerate() {
+            let b = &self.universe.bodies[bi];
             let yy = my0 + i as f32 * mdy;
             let col = if i == self.focus_idx { [1.0, 0.9, 0.4] } else { dim };
-            hud.text(&mut out, &format!("{}  {}", i + 1, b.name), mx, yy, col, res);
+            let tag = if i < 9 { format!("{}", i + 1) } else { "-".into() };
+            hud.text(&mut out, &format!("{}  {}", tag, b.name), mx, yy, col, res);
         }
 
         let mut hy = res.1 - step * 4.0 - 12.0;
         for line in [
-            "1-5 / CLICK  JUMP TO BODY",
+            "1-9 / CLICK  JUMP TO BODY",
             "DRAG ORBIT   SCROLL ZOOM",
-            "TAB VIEW   F MANUAL",
-            "[ ] TIME WARP",
+            "C CYCLE   TAB VIEW",
+            "[ ] WARP   F MANUAL",
         ] {
             hud.text(&mut out, line, x, hy, dim, res);
             hy += step;
@@ -2162,6 +2114,18 @@ fn main() {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let args: Vec<String> = std::env::args().collect();
+        if args.iter().any(|a| a == "catalog") {
+            let w = World::new();
+            let md = w.universe.catalog_markdown();
+            let path = "docs/system_catalog.md";
+            if let Some(p) = std::path::Path::new(path).parent() {
+                let _ = std::fs::create_dir_all(p);
+            }
+            std::fs::write(path, &md).expect("write catalog");
+            println!("{md}");
+            println!("wrote {path}");
+            return;
+        }
         if args.iter().any(|a| a == "shot" || a == "--shot") {
             env_logger::init();
             if args.iter().any(|a| a == "all") {

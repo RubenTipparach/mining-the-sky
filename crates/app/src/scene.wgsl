@@ -16,8 +16,8 @@ struct Scene {
     sunbody2: vec4<f32>, // star B: xyz centre, w radius (Mm)
     params: vec4<f32>,   // x=tan(fov/2), y=aspect, z=time, w=planet count
     res: vec4<f32>,      // x,y = resolution
-    planets: array<vec4<f32>, 8>,    // xyz centre, w radius (Mm)
-    planet_col: array<vec4<f32>, 8>, // rgb colour
+    planets: array<vec4<f32>, 16>,    // xyz centre, w radius (Mm)
+    planet_col: array<vec4<f32>, 16>, // rgb colour
 };
 
 const BARY: vec3<f32> = vec3<f32>(-360.0, 0.0, 0.0);
