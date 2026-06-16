@@ -12,6 +12,7 @@ struct Scene {
     sun: vec4<f32>,     // xyz world sun direction
     home: vec4<f32>,    // xyz centre, w radius (Mm)
     moon: vec4<f32>,    // xyz centre, w radius (Mm)
+    sunbody: vec4<f32>, // xyz centre, w radius (Mm)
     params: vec4<f32>,  // x = tan(fov/2), y = aspect, z = time, w unused
     res: vec4<f32>,     // x,y = resolution
 };
@@ -80,9 +81,18 @@ fn hit_sphere(ro: vec3<f32>, rd: vec3<f32>, center: vec3<f32>, radius: f32) -> f
     return t;
 }
 
+fn shade_sun(p: vec3<f32>, rd: vec3<f32>) -> vec3<f32> {
+    let n = normalize(p - s.sunbody.xyz);
+    // limb darkening + granulation; emissive and bright (bloom via tonemap)
+    let limb = pow(clamp(dot(n, -rd), 0.0, 1.0), 0.45);
+    let gran = 0.85 + 0.15 * vnoise(n * 40.0);
+    let core = vec3<f32>(1.6, 1.25, 0.7) * (0.6 + 0.7 * limb) * gran;
+    return core;
+}
+
 fn shade_home(p: vec3<f32>, rd: vec3<f32>) -> vec3<f32> {
     let n = normalize(p - s.home.xyz);
-    let sun = normalize(s.sun.xyz);
+    let sun = normalize(s.sunbody.xyz - p);
 
     let lon = atan2(n.z, n.x);
     let lat = asin(clamp(n.y, -1.0, 1.0));
@@ -109,7 +119,7 @@ fn shade_home(p: vec3<f32>, rd: vec3<f32>) -> vec3<f32> {
 
 fn shade_moon(p: vec3<f32>) -> vec3<f32> {
     let n = normalize(p - s.moon.xyz);
-    let sun = normalize(s.sun.xyz);
+    let sun = normalize(s.sunbody.xyz - p);
     // grey regolith with darker maria from noise
     let maria = vnoise(n * 6.0) * 0.5 + vnoise(n * 18.0) * 0.25;
     let base = mix(0.32, 0.62, smoothstep(0.35, 0.75, maria));
@@ -130,25 +140,26 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 
     let th = hit_sphere(ro, rd, s.home.xyz, s.home.w);
     let tm = hit_sphere(ro, rd, s.moon.xyz, s.moon.w);
+    let tsun = hit_sphere(ro, rd, s.sunbody.xyz, s.sunbody.w);
 
     var col = vec3<f32>(0.0);
     var hit = false;
 
-    // choose the nearest positive hit
-    let hh = th > 0.0;
-    let mh = tm > 0.0;
-    if (hh && (!mh || th <= tm)) {
-        col = shade_home(ro + rd * th, rd);
-        hit = true;
-    } else if (mh) {
-        col = shade_moon(ro + rd * tm);
-        hit = true;
-    }
+    // choose the nearest positive hit among home, moon, sun
+    var best = 1e30;
+    if (th > 0.0 && th < best) { best = th; col = shade_home(ro + rd * th, rd); hit = true; }
+    if (tm > 0.0 && tm < best) { best = tm; col = shade_moon(ro + rd * tm); hit = true; }
+    if (tsun > 0.0 && tsun < best) { best = tsun; col = shade_sun(ro + rd * tsun, rd); hit = true; }
 
     if (!hit) {
         // faint starfield, plus a thin atmospheric halo around the home limb
         let star = step(0.9975, hash3(floor(rd * 1400.0)));
         col = vec3<f32>(star) * 0.7;
+
+        // sun corona/glow when looking near the Sun
+        let to_sun = normalize(s.sunbody.xyz - ro);
+        let sa = max(dot(rd, to_sun), 0.0);
+        col = col + vec3<f32>(1.4, 1.1, 0.7) * (pow(sa, 220.0) * 1.5 + pow(sa, 12.0) * 0.10);
 
         let oc = s.home.xyz - ro;
         let tca = dot(oc, rd);

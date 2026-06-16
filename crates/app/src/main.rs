@@ -100,6 +100,7 @@ struct SceneUniforms {
     sun: [f32; 4],
     home: [f32; 4],
     moon: [f32; 4],
+    sunbody: [f32; 4], // xyz centre, w radius (Mm)
     params: [f32; 4],
     res: [f32; 4],
 }
@@ -128,13 +129,28 @@ enum View {
     Rocket,
 }
 
-/// What the orbital (system) view is centred on.
+/// Bodies the orbital map can center on. Home is the local sim origin; the Sun
+/// and the other planets are placed schematically (compressed distances) so the
+/// whole system stays f32-precise and readable.
 #[derive(Clone, Copy, PartialEq)]
 enum Focus {
+    Sun,
+    Inner,
     Home,
     Moon,
-    Pair,
+    Outer,
 }
+
+const FOCI: [Focus; 5] = [Focus::Sun, Focus::Inner, Focus::Home, Focus::Moon, Focus::Outer];
+
+/// Sun position (Mm): the home planet sits at the origin and orbits the Sun, so
+/// the Sun is one home-orbit-radius away.
+const SUN_POS: Vec3 = Vec3::new(-360.0, 0.0, 0.0);
+const SUN_R: f32 = 20.0;
+/// Orbit radii (Mm) of the schematic planets about the Sun (home = 360).
+const ORBIT_INNER: f32 = 210.0;
+const ORBIT_HOME: f32 = 360.0;
+const ORBIT_OUTER: f32 = 620.0;
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -249,7 +265,7 @@ impl World {
         );
         let moon_radius_m = moon_radius_mm as f64 * MM as f64;
         let moon_mu = 1.7 * moon_radius_m * moon_radius_m; // ~1.7 m/s^2 surface gravity
-        World {
+        let mut w = World {
             launched: false,
             clock: 0.0,
             warp: 8.0,
@@ -271,44 +287,78 @@ impl World {
             rocket_el: 0.12,
             rocket_dist: rocket_frame.1,
             rocket_focus_y: rocket_frame.0,
-            sys_target: Focus::Pair,
+            sys_target: Focus::Home,
+        };
+        w.apply_focus();
+        w
+    }
+
+    /// Schematic planet position on its circular orbit about the Sun.
+    fn planet_pos(orbit_r: f32, angle: f32) -> Vec3 {
+        SUN_POS + Vec3::new(angle.cos(), 0.0, angle.sin()) * orbit_r
+    }
+
+    /// Center (Mm) and display radius (Mm) of a focus body.
+    fn body(&self, f: Focus) -> (Vec3, f32) {
+        match f {
+            Focus::Sun => (SUN_POS, SUN_R),
+            Focus::Inner => (Self::planet_pos(ORBIT_INNER, 2.3), 3.6),
+            Focus::Home => (Vec3::ZERO, self.home_radius_mm),
+            Focus::Moon => (self.moon_center_mm, self.moon_radius_mm),
+            Focus::Outer => (Self::planet_pos(ORBIT_OUTER, 4.05), 9.0),
         }
     }
 
-    /// Cycle the orbital-view focus and reframe the camera onto it.
-    fn cycle_focus(&mut self) {
-        self.sys_target = match self.sys_target {
-            Focus::Home => Focus::Moon,
-            Focus::Moon => Focus::Pair,
-            Focus::Pair => Focus::Home,
-        };
-        self.apply_focus();
-    }
-
-    /// Point the orbital camera at the current focus body (or pair) and frame it.
-    fn apply_focus(&mut self) {
-        match self.sys_target {
-            Focus::Home => {
-                self.sys_focus = Vec3::ZERO;
-                self.sys_dist = self.home_radius_mm * 4.0;
-            }
-            Focus::Moon => {
-                self.sys_focus = self.moon_center_mm;
-                self.sys_dist = self.moon_radius_mm * 6.0;
-            }
-            Focus::Pair => {
-                self.sys_focus = self.moon_center_mm * 0.5;
-                self.sys_dist = self.moon_center_mm.length() * 1.25 + self.home_radius_mm;
-            }
+    fn focus_name(f: Focus) -> &'static str {
+        match f {
+            Focus::Sun => "SUN",
+            Focus::Inner => "INNER",
+            Focus::Home => "HOME",
+            Focus::Moon => "MOON",
+            Focus::Outer => "OUTER",
         }
     }
 
     fn focus_label(&self) -> &'static str {
-        match self.sys_target {
-            Focus::Home => "HOME",
-            Focus::Moon => "MOON",
-            Focus::Pair => "HOME + MOON",
+        Self::focus_name(self.sys_target)
+    }
+
+    /// Screen layout of the body menu (top-right): (x, y0, row height) in px.
+    fn map_menu_layout(res: (f32, f32)) -> (f32, f32, f32) {
+        (res.0 - 150.0, 40.0, hud::LINE_H * 1.5)
+    }
+
+    /// Map a click position to a body menu entry, if any.
+    fn map_menu_pick(&self, res: (f32, f32), cx: f32, cy: f32) -> Option<Focus> {
+        let (mx, my0, mdy) = Self::map_menu_layout(res);
+        if cx < mx - 8.0 || cx > mx + 140.0 {
+            return None;
         }
+        for (i, f) in FOCI.iter().enumerate() {
+            let yy = my0 + i as f32 * mdy;
+            if cy >= yy - 2.0 && cy <= yy + hud::LINE_H + 2.0 {
+                return Some(*f);
+            }
+        }
+        None
+    }
+
+    /// Cycle the orbital-map focus and reframe the camera onto it.
+    fn cycle_focus(&mut self) {
+        let i = FOCI.iter().position(|f| *f == self.sys_target).unwrap_or(2);
+        self.set_focus(FOCI[(i + 1) % FOCI.len()]);
+    }
+
+    fn set_focus(&mut self, f: Focus) {
+        self.sys_target = f;
+        self.apply_focus();
+    }
+
+    /// Point the orbital camera at the current focus body and frame it.
+    fn apply_focus(&mut self) {
+        let (pos, radius) = self.body(self.sys_target);
+        self.sys_focus = pos;
+        self.sys_dist = (radius * 4.0).max(2.0);
     }
 
     fn grav_bodies(&self) -> Vec<GravBody> {
@@ -405,8 +455,9 @@ impl World {
         let aspect = res[0] / res[1].max(1.0);
         let cam = self.system_camera(aspect);
 
-        let st = time * 0.05 + 0.8;
-        let sun = Vec3::new(st.cos(), 0.25, st.sin()).normalize();
+        // Light comes from the Sun's actual position (direction from origin).
+        let sun = SUN_POS.normalize();
+        let _ = time;
 
         SceneUniforms {
             cam_pos: [cam.pos.x, cam.pos.y, cam.pos.z, 0.0],
@@ -421,6 +472,7 @@ impl World {
                 self.moon_center_mm.z,
                 self.moon_radius_mm,
             ],
+            sunbody: [SUN_POS.x, SUN_POS.y, SUN_POS.z, SUN_R],
             params: [cam.fovscale, aspect, time, 0.0],
             res: [res[0], res[1], 0.0, 0.0],
         }
@@ -525,6 +577,31 @@ impl World {
                 .map(|(_, p)| *p)
                 .collect();
             polyline(&flown, [0.45, 0.9, 1.0], &mut out);
+        }
+
+        // Orbit rings, revealed as you zoom out: the moon's orbit first, then
+        // the planet orbits about the Sun.
+        let circle =
+            |center: Vec3, radius: f32, color: [f32; 3], out: &mut Vec<OverlayVertex>| {
+                let mut prev: Option<[f32; 2]> = None;
+                for k in 0..=120 {
+                    let a = k as f32 / 120.0 * std::f32::consts::TAU;
+                    let p = center + Vec3::new(a.cos(), 0.0, a.sin()) * radius;
+                    let cur = cam.project(p);
+                    if let (Some(u), Some(v)) = (prev, cur) {
+                        out.push(OverlayVertex { pos: u, color });
+                        out.push(OverlayVertex { pos: v, color });
+                    }
+                    prev = cur;
+                }
+            };
+        if self.sys_dist > 12.0 {
+            circle(Vec3::ZERO, self.moon_center_mm.length(), [0.35, 0.5, 0.75], &mut out);
+        }
+        if self.sys_dist > 160.0 {
+            for orad in [ORBIT_INNER, ORBIT_HOME, ORBIT_OUTER] {
+                circle(SUN_POS, orad, [0.40, 0.40, 0.55], &mut out);
+            }
         }
 
         out
@@ -764,9 +841,27 @@ impl World {
             push_filled_diamond(&mut out, c, 0.020, aspect, mcol);
         }
 
+        // schematic planets as diamonds so they read at a distance
+        for f in [Focus::Inner, Focus::Outer] {
+            let (pos, _) = self.body(f);
+            if let Some(c) = cam.project(pos) {
+                push_filled_diamond(&mut out, c, 0.016, aspect, [0.0, 0.0, 0.0]);
+                push_filled_diamond(&mut out, c, 0.010, aspect, [0.75, 0.78, 0.85]);
+            }
+        }
+
+        // body menu (top-right): click an entry or press its number to jump.
+        let (mx, my0, mdy) = Self::map_menu_layout(res);
+        hud.text(&mut out, "BODIES", mx, my0 - step * 1.4, amber, res);
+        for (i, f) in FOCI.iter().enumerate() {
+            let yy = my0 + i as f32 * mdy;
+            let col = if *f == self.sys_target { [1.0, 0.9, 0.4] } else { dim };
+            hud.text(&mut out, &format!("{}  {}", i + 1, Self::focus_name(*f)), mx, yy, col, res);
+        }
+
         let mut hy = res.1 - step * 4.0 - 12.0;
         for line in [
-            "C  CENTER ON BODY / PAIR",
+            "1-5 / CLICK  JUMP TO BODY",
             "DRAG ORBIT   SCROLL ZOOM",
             "TAB VIEW   F MANUAL",
             "[ ] TIME WARP",
@@ -1588,11 +1683,13 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             0.0
         }
         "system" => {
+            // wide system shot: the Sun + planet orbits
             world.view = View::Map;
-            world.sys_target = Focus::Pair;
-            world.apply_focus();
+            world.sys_target = Focus::Sun;
+            world.sys_focus = SUN_POS;
+            world.sys_dist = 950.0;
             world.sys_az = 1.4;
-            world.sys_el = 0.30;
+            world.sys_el = 0.55;
             6.0
         }
         "moon" => {
@@ -1854,7 +1951,21 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::MouseInput { state: btn_state, button, .. } => {
                 if button == MouseButton::Left {
-                    state.dragging = btn_state == ElementState::Pressed;
+                    let pressed = btn_state == ElementState::Pressed;
+                    // In the map, a click on the body menu jumps focus (and does
+                    // not start an orbit drag).
+                    if pressed && state.world.view == View::Map {
+                        let res = (state.config.width as f32, state.config.height as f32);
+                        if let Some(f) = state.world.map_menu_pick(
+                            res,
+                            state.last_cursor.0 as f32,
+                            state.last_cursor.1 as f32,
+                        ) {
+                            state.world.set_focus(f);
+                            return;
+                        }
+                    }
+                    state.dragging = pressed;
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -1923,24 +2034,30 @@ impl ApplicationHandler<UserEvent> for App {
                         KeyCode::BracketLeft => {
                             state.world.warp = (state.world.warp * 0.5).max(1.0);
                         }
-                        KeyCode::Digit1 => {
-                            if let Some(c) = state.world.flight.as_mut() {
-                                c.mode = Mode::Prograde;
-                            }
-                        }
-                        KeyCode::Digit2 => {
-                            if let Some(c) = state.world.flight.as_mut() {
-                                c.mode = Mode::Retrograde;
-                            }
-                        }
-                        KeyCode::Digit3 => {
-                            if let Some(c) = state.world.flight.as_mut() {
-                                c.mode = Mode::RadialOut;
-                            }
-                        }
-                        KeyCode::Digit4 => {
-                            if let Some(c) = state.world.flight.as_mut() {
-                                c.mode = Mode::RadialIn;
+                        KeyCode::Digit1
+                        | KeyCode::Digit2
+                        | KeyCode::Digit3
+                        | KeyCode::Digit4
+                        | KeyCode::Digit5 => {
+                            let idx = match code {
+                                KeyCode::Digit1 => 0,
+                                KeyCode::Digit2 => 1,
+                                KeyCode::Digit3 => 2,
+                                KeyCode::Digit4 => 3,
+                                _ => 4,
+                            };
+                            // In the map (no manual flight), number keys jump to
+                            // a body; in flight they select the thrust mode.
+                            if state.world.view == View::Map && state.world.flight.is_none() {
+                                state.world.set_focus(FOCI[idx]);
+                            } else if let Some(c) = state.world.flight.as_mut() {
+                                c.mode = match idx {
+                                    0 => Mode::Prograde,
+                                    1 => Mode::Retrograde,
+                                    2 => Mode::RadialOut,
+                                    3 => Mode::RadialIn,
+                                    _ => c.mode,
+                                };
                             }
                         }
                         _ => {}
