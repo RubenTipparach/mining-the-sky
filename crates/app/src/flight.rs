@@ -44,6 +44,18 @@ pub struct Craft {
     pub mode: Mode,
     pub landed: bool,
     pub crashed: bool,
+    /// Which body the craft last touched ("HOME" / "MOON" / "").
+    pub landed_on: &'static str,
+}
+
+/// An extra point-mass gravity source (e.g. the moon), positioned in the same
+/// metres-from-home-centre frame the craft uses. Treated as non-rotating.
+#[derive(Clone, Copy)]
+pub struct GravBody {
+    pub center: DVec3,
+    pub mu: f64,
+    pub radius: f64,
+    pub name: &'static str,
 }
 
 impl Craft {
@@ -62,6 +74,7 @@ impl Craft {
             mode: Mode::Prograde,
             landed: false,
             crashed: false,
+            landed_on: "",
         }
     }
 
@@ -82,9 +95,25 @@ impl Craft {
         }
     }
 
-    fn accel(&self, body: &CentralBody, r: DVec3, v: DVec3, tdir: DVec3, thrust_n: f64, mass: f64) -> DVec3 {
+    fn accel(
+        &self,
+        body: &CentralBody,
+        bodies: &[GravBody],
+        r: DVec3,
+        v: DVec3,
+        tdir: DVec3,
+        thrust_n: f64,
+        mass: f64,
+    ) -> DVec3 {
         let rmag = r.length();
-        let g = -body.mu / (rmag * rmag * rmag) * r;
+        let mut g = -body.mu / (rmag * rmag * rmag) * r;
+        // extra point-mass sources (e.g. the moon)
+        for b in bodies {
+            let d = r - b.center;
+            let dl = d.length().max(1.0);
+            g += -b.mu / (dl * dl * dl) * d;
+        }
+        // atmospheric drag from the home world only
         let v_atm = body.omega() * DVec3::Y.cross(r);
         let v_rel = v - v_atm;
         let vr = v_rel.length();
@@ -99,8 +128,9 @@ impl Craft {
     }
 
     /// Advance the craft by `dt_sim` seconds of mission time using fixed
-    /// substeps. No-op once landed-and-idle or crashed.
-    pub fn integrate(&mut self, body: &CentralBody, dt_sim: f64) {
+    /// substeps, under home gravity + any extra bodies. No-op once
+    /// landed-and-idle or crashed.
+    pub fn integrate(&mut self, body: &CentralBody, bodies: &[GravBody], dt_sim: f64) {
         if self.crashed || dt_sim <= 0.0 {
             return;
         }
@@ -117,10 +147,10 @@ impl Craft {
 
             let r = self.r;
             let v = self.v;
-            let a1 = self.accel(body, r, v, tdir, thrust_n, mass);
-            let a2 = self.accel(body, r + v * (h * 0.5), v + a1 * (h * 0.5), tdir, thrust_n, mass);
-            let a3 = self.accel(body, r + (v + a1 * (h * 0.5)) * (h * 0.5), v + a2 * (h * 0.5), tdir, thrust_n, mass);
-            let a4 = self.accel(body, r + (v + a2 * (h * 0.5)) * h, v + a3 * h, tdir, thrust_n, mass);
+            let a1 = self.accel(body, bodies, r, v, tdir, thrust_n, mass);
+            let a2 = self.accel(body, bodies, r + v * (h * 0.5), v + a1 * (h * 0.5), tdir, thrust_n, mass);
+            let a3 = self.accel(body, bodies, r + (v + a1 * (h * 0.5)) * (h * 0.5), v + a2 * (h * 0.5), tdir, thrust_n, mass);
+            let a4 = self.accel(body, bodies, r + (v + a2 * (h * 0.5)) * h, v + a3 * h, tdir, thrust_n, mass);
             self.r = r + (v + (a1 + a2 + a3) * (h / 6.0)) * h;
             self.v = v + (a1 + 2.0 * a2 + 2.0 * a3 + a4) * (h / 6.0);
 
@@ -128,27 +158,49 @@ impl Craft {
                 self.prop = (self.prop - thrust_n / (self.isp * G0) * h).max(0.0);
             }
 
-            // surface contact
-            let alt = self.r.length() - body.radius;
-            if alt <= 0.0 {
-                let up = self.r.normalize_or_zero();
-                let v_surf = body.omega() * DVec3::Y.cross(self.r);
-                let rel = (self.v - v_surf).length();
-                self.r = up * body.radius;
-                self.v = v_surf;
-                if rel > LAND_SPEED {
-                    self.crashed = true;
-                } else {
-                    self.landed = true;
-                }
-                if self.crashed {
-                    return;
-                }
-                // landed but still touching: let it sit this substep
-            } else {
-                self.landed = false;
+            if self.resolve_contact(body, bodies) {
+                return; // crashed
             }
         }
+    }
+
+    /// Resolve surface contact against the home world and any extra body.
+    /// Returns true if this ended in a crash.
+    fn resolve_contact(&mut self, body: &CentralBody, bodies: &[GravBody]) -> bool {
+        // home world (rotating)
+        if self.r.length() - body.radius <= 0.0 {
+            let up = self.r.normalize_or_zero();
+            let v_surf = body.omega() * DVec3::Y.cross(self.r);
+            let rel = (self.v - v_surf).length();
+            self.r = up * body.radius;
+            self.v = v_surf;
+            self.landed_on = "HOME";
+            if rel > LAND_SPEED {
+                self.crashed = true;
+                return true;
+            }
+            self.landed = true;
+            return false;
+        }
+        // extra bodies (non-rotating)
+        for b in bodies {
+            let d = self.r - b.center;
+            if d.length() - b.radius <= 0.0 {
+                let up = d.normalize_or_zero();
+                let rel = self.v.length();
+                self.r = b.center + up * b.radius;
+                self.v = DVec3::ZERO;
+                self.landed_on = b.name;
+                if rel > LAND_SPEED {
+                    self.crashed = true;
+                    return true;
+                }
+                self.landed = true;
+                return false;
+            }
+        }
+        self.landed = false;
+        false
     }
 
     pub fn altitude(&self, body: &CentralBody) -> f64 {
@@ -225,7 +277,7 @@ mod tests {
         let body = CentralBody::home();
         let mut c = circular(&body, 300_000.0); // above the atmosphere, no drag
         for _ in 0..60 {
-            c.integrate(&body, 10.0); // 600 s total
+            c.integrate(&body, &[], 10.0); // 600 s total
         }
         let alt = c.altitude(&body);
         assert!(
@@ -243,7 +295,7 @@ mod tests {
         c.mode = Mode::Retrograde;
         c.throttle = 1.0;
         for _ in 0..20 {
-            c.integrate(&body, 1.0); // 20 s retro burn
+            c.integrate(&body, &[], 1.0); // 20 s retro burn
         }
         let after = orbit_from_state(c.r, c.v, body.mu).rp;
         assert!(after < before - 1_000.0, "periapsis {} -> {}", before, after);
@@ -259,11 +311,44 @@ mod tests {
         let mut c = Craft::maneuvering(r, v_surf - up * 2.0); // 2 m/s down
         c.throttle = 0.0;
         for _ in 0..40 {
-            c.integrate(&body, 0.5);
+            c.integrate(&body, &[], 0.5);
             if c.landed || c.crashed {
                 break;
             }
         }
         assert!(c.landed && !c.crashed, "expected LANDED, got {}", c.status());
+        assert_eq!(c.landed_on, "HOME");
+    }
+
+    #[test]
+    fn slow_descent_lands_on_the_moon() {
+        let body = CentralBody::home();
+        // a moon far from the home world so home gravity is negligible here
+        let moon = GravBody {
+            center: DVec3::new(88.0e6, 0.0, 8.0e6),
+            mu: 4.9e12, // ~1.7 m/s^2 surface gravity at r=1.674e6
+            radius: 1.674e6,
+            name: "MOON",
+        };
+        // start just above the moon's surface, drifting gently toward it
+        let up = DVec3::new(0.0, 1.0, 0.0);
+        let r = moon.center + up * (moon.radius + 2.0);
+        let mut c = Craft::maneuvering(r, -up * 1.5); // 1.5 m/s toward the surface
+        c.throttle = 0.0;
+        for _ in 0..60 {
+            c.integrate(&body, &[moon], 0.5);
+            if c.landed || c.crashed {
+                break;
+            }
+        }
+        assert!(c.landed && !c.crashed, "expected LANDED, got {}", c.status());
+        assert_eq!(c.landed_on, "MOON");
+        let surf = (c.r - moon.center).length();
+        assert!(
+            (surf - moon.radius).abs() < 5.0,
+            "craft not on moon surface: {} vs {}",
+            surf,
+            moon.radius
+        );
     }
 }

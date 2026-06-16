@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use glam::{Mat3, Vec3};
+use glam::{DVec3, Mat3, Vec3};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
@@ -25,7 +25,7 @@ use winit::window::{Window, WindowId};
 mod flight;
 mod hud;
 mod mission;
-use flight::{Craft, Mode};
+use flight::{Craft, GravBody, Mode};
 use hud::Hud;
 use mission::Mission;
 use sim::body::CentralBody;
@@ -75,6 +75,30 @@ enum View {
     System,
 }
 
+/// A perspective camera for the system view (all positions in Mm).
+struct SystemCamera {
+    pos: Vec3,
+    right: Vec3,
+    up: Vec3,
+    forward: Vec3,
+    fovscale: f32,
+    aspect: f32,
+}
+
+impl SystemCamera {
+    /// Project a world point (Mm) to clip space, or `None` if behind the camera.
+    fn project(&self, p: Vec3) -> Option<[f32; 2]> {
+        let rel = p - self.pos;
+        let fd = rel.dot(self.forward);
+        if fd <= 0.0 {
+            return None;
+        }
+        let x = rel.dot(self.right) / fd;
+        let y = rel.dot(self.up) / fd;
+        Some([x / (self.aspect * self.fovscale), y / self.fovscale])
+    }
+}
+
 // ---------------------------------------------------------------------------
 // World: simulation, camera, and flight state (no GPU objects). Also owns the
 // per-frame geometry/uniform builders so both render paths share them.
@@ -95,10 +119,16 @@ struct World {
     view: View,
     sys_az: f32,
     sys_el: f32,
-    sys_dist: f32, // camera distance from the home world centre (Mm)
+    sys_dist: f32, // camera distance from the focus point (Mm)
+    sys_focus: Vec3,
     home_radius_mm: f32,
     moon_center_mm: Vec3,
     moon_radius_mm: f32,
+
+    // moon physics (metres, the frame the flight model integrates in)
+    moon_center_m: DVec3,
+    moon_mu: f64,
+    moon_radius_m: f64,
 }
 
 impl World {
@@ -111,6 +141,13 @@ impl World {
         // shot; it will move to a real orbit once the system view is to-scale.
         let moon_radius_mm = home_radius_mm * 0.27;
         let moon_center_mm = Vec3::new(88.0, 0.0, 8.0);
+        let moon_center_m = DVec3::new(
+            moon_center_mm.x as f64 * MM as f64,
+            moon_center_mm.y as f64 * MM as f64,
+            moon_center_mm.z as f64 * MM as f64,
+        );
+        let moon_radius_m = moon_radius_mm as f64 * MM as f64;
+        let moon_mu = 1.7 * moon_radius_m * moon_radius_m; // ~1.7 m/s^2 surface gravity
         World {
             az: mission.spaceport_lon,
             el: mission.spaceport_lat,
@@ -125,10 +162,23 @@ impl World {
             sys_az: 1.4,
             sys_el: 0.30,
             sys_dist: 120.0,
+            sys_focus: moon_center_mm * 0.5,
             home_radius_mm,
             moon_center_mm,
             moon_radius_mm,
+            moon_center_m,
+            moon_mu,
+            moon_radius_m,
         }
+    }
+
+    fn grav_bodies(&self) -> Vec<GravBody> {
+        vec![GravBody {
+            center: self.moon_center_m,
+            mu: self.moon_mu,
+            radius: self.moon_radius_m,
+            name: "MOON",
+        }]
     }
 
     fn toggle_view(&mut self) {
@@ -138,31 +188,41 @@ impl World {
         };
     }
 
-    /// Perspective camera + body uniforms for the system view.
-    fn scene_uniforms(&self, res: [f32; 2], time: f32) -> SceneUniforms {
+    /// System-view perspective camera: position + basis + tan(fov/2), all in Mm.
+    fn system_camera(&self, aspect: f32) -> SystemCamera {
         let dir = Vec3::new(
             self.sys_el.cos() * self.sys_az.cos(),
             self.sys_el.sin(),
             self.sys_el.cos() * self.sys_az.sin(),
         );
-        // orbit the midpoint between the home world (origin) and the moon so
-        // both bodies stay framed.
-        let focus = self.moon_center_mm * 0.5;
-        let cam_pos = focus + dir * self.sys_dist;
-        let forward = (focus - cam_pos).normalize();
+        let cam_pos = self.sys_focus + dir * self.sys_dist;
+        let forward = (self.sys_focus - cam_pos).normalize();
         let right = forward.cross(Vec3::Y).normalize();
         let up = right.cross(forward).normalize();
+        let fov: f32 = 42.0_f32.to_radians();
+        SystemCamera {
+            pos: cam_pos,
+            right,
+            up,
+            forward,
+            fovscale: (fov * 0.5).tan(),
+            aspect,
+        }
+    }
+
+    /// Perspective camera + body uniforms for the system view.
+    fn scene_uniforms(&self, res: [f32; 2], time: f32) -> SceneUniforms {
+        let aspect = res[0] / res[1].max(1.0);
+        let cam = self.system_camera(aspect);
 
         let st = time * 0.05 + 0.8;
         let sun = Vec3::new(st.cos(), 0.25, st.sin()).normalize();
 
-        let fov: f32 = 42.0_f32.to_radians();
-        let aspect = res[0] / res[1].max(1.0);
         SceneUniforms {
-            cam_pos: [cam_pos.x, cam_pos.y, cam_pos.z, 0.0],
-            cam_x: [right.x, right.y, right.z, 0.0],
-            cam_y: [up.x, up.y, up.z, 0.0],
-            cam_z: [forward.x, forward.y, forward.z, 0.0],
+            cam_pos: [cam.pos.x, cam.pos.y, cam.pos.z, 0.0],
+            cam_x: [cam.right.x, cam.right.y, cam.right.z, 0.0],
+            cam_y: [cam.up.x, cam.up.y, cam.up.z, 0.0],
+            cam_z: [cam.forward.x, cam.forward.y, cam.forward.z, 0.0],
             sun: [sun.x, sun.y, sun.z, 0.0],
             home: [0.0, 0.0, 0.0, self.home_radius_mm],
             moon: [
@@ -171,16 +231,17 @@ impl World {
                 self.moon_center_mm.z,
                 self.moon_radius_mm,
             ],
-            params: [(fov * 0.5).tan(), aspect, time, 0.0],
+            params: [cam.fovscale, aspect, time, 0.0],
             res: [res[0], res[1], 0.0, 0.0],
         }
     }
 
     /// Advance simulation by a real frame dt (seconds).
     fn advance(&mut self, frame_dt: f32) {
+        let bodies = self.grav_bodies();
         if let Some(craft) = self.flight.as_mut() {
             let dt_sim = frame_dt * self.warp.min(8.0);
-            craft.integrate(&self.body, dt_sim as f64);
+            craft.integrate(&self.body, &bodies, dt_sim as f64);
         } else if self.launched {
             self.clock += frame_dt * self.warp;
         }
@@ -249,7 +310,23 @@ impl World {
 
     fn build_overlay(&self, rot: Mat3, aspect: f32) -> Vec<OverlayVertex> {
         if self.view == View::System {
-            return Vec::new(); // system view draws no surface-frame overlay
+            // draw only the craft marker, projected through the perspective camera
+            let mut out: Vec<OverlayVertex> = Vec::new();
+            if let Some(craft) = self.flight.as_ref() {
+                let cam = self.system_camera(aspect);
+                let p_mm = (craft.r / MM as f64).as_vec3();
+                if let Some(c) = cam.project(p_mm) {
+                    let col = if craft.crashed {
+                        [1.0, 0.25, 0.2]
+                    } else if craft.landed {
+                        [0.4, 1.0, 0.5]
+                    } else {
+                        [1.0, 0.85, 0.25]
+                    };
+                    push_marker(&mut out, c, aspect, col);
+                }
+            }
+            return out;
         }
         let rt = rot.transpose();
         let scale = self.scale;
@@ -308,16 +385,7 @@ impl World {
         };
 
         if let Some(c) = Self::project(marker_pos, rt, aspect, scale) {
-            let off = 0.022f32;
-            let ox = off / aspect;
-            let top = [c[0], c[1] + off];
-            let right = [c[0] + ox, c[1]];
-            let bot = [c[0], c[1] - off];
-            let left = [c[0] - ox, c[1]];
-            for (a, b) in [(top, right), (right, bot), (bot, left), (left, top)] {
-                out.push(OverlayVertex { pos: a, color: marker_col });
-                out.push(OverlayVertex { pos: b, color: marker_col });
-            }
+            push_marker(&mut out, c, aspect, marker_col);
         }
 
         out
@@ -466,8 +534,27 @@ impl World {
         y += step;
         row(&mut out, "CAM DIST ", &format!("{:.0} MM", self.sys_dist), y);
 
+        if let Some(craft) = self.flight.as_ref() {
+            y += step * 1.5;
+            let to_moon = (craft.r - self.moon_center_m).length() / MM as f64;
+            let scol = match craft.status() {
+                "CRASHED" => [1.0, 0.3, 0.25],
+                "LANDED" => [0.4, 1.0, 0.5],
+                _ => [1.0, 0.8, 0.3],
+            };
+            let cx = hud.text(&mut out, "CRAFT    ", x, y, dim, res);
+            let label = if craft.landed && craft.landed_on == "MOON" {
+                "ON MOON"
+            } else {
+                craft.status()
+            };
+            hud.text(&mut out, label, cx, y, scol, res);
+            y += step;
+            row(&mut out, "TO MOON  ", &format!("{:.1} MM", to_moon), y);
+        }
+
         let mut hy = res.1 - step * 3.0 - 12.0;
-        for line in ["V  BACK TO SURFACE", "DRAG ORBIT   SCROLL ZOOM", ""] {
+        for line in ["V  BACK TO SURFACE", "F  MANUAL CONTROL", "DRAG ORBIT   SCROLL ZOOM"] {
             hud.text(&mut out, line, x, hy, dim, res);
             hy += step;
         }
@@ -842,6 +929,20 @@ impl Gpu {
     }
 }
 
+/// Push a small screen-space diamond marker (line list) at clip point `c`.
+fn push_marker(out: &mut Vec<OverlayVertex>, c: [f32; 2], aspect: f32, color: [f32; 3]) {
+    let off = 0.022f32;
+    let ox = off / aspect;
+    let top = [c[0], c[1] + off];
+    let right = [c[0] + ox, c[1]];
+    let bot = [c[0], c[1] - off];
+    let left = [c[0] - ox, c[1]];
+    for (a, b) in [(top, right), (right, bot), (bot, left), (left, top)] {
+        out.push(OverlayVertex { pos: a, color });
+        out.push(OverlayVertex { pos: b, color });
+    }
+}
+
 fn render_pass<'a>(
     encoder: &'a mut wgpu::CommandEncoder,
     view: &'a wgpu::TextureView,
@@ -1005,7 +1106,7 @@ impl State {
 // ---------------------------------------------------------------------------
 
 #[cfg(not(target_arch = "wasm32"))]
-fn screenshot(path: &str, width: u32, height: u32, view: View) {
+fn screenshot(path: &str, width: u32, height: u32, scenario: &str) {
     let instance =
         wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -1029,25 +1130,45 @@ fn screenshot(path: &str, width: u32, height: u32, view: View) {
     let hud = Hud::new();
 
     let mut world = World::new();
-    world.view = view;
-    let time = match view {
-        View::Surface => {
-            // launched, craft coasting in its parking orbit, the spaceport at the
-            // limb so the ascent arc + orbit ring read clearly, sun ~95 deg
-            // off-view so the dark side (city lights) shows.
+    let time = match scenario {
+        "system" => {
+            // wide system shot: home world and moon framed side by side.
+            world.view = View::System;
+            world.sys_az = 1.4;
+            world.sys_el = 0.30;
+            world.sys_dist = 120.0;
+            6.0
+        }
+        "moon" => {
+            // close-up of the moon with a landed craft marker on its near side.
+            world.view = View::System;
+            world.sys_focus = world.moon_center_mm;
+            world.sys_az = 1.2;
+            world.sys_el = 0.25;
+            world.sys_dist = 4.5;
+            let cam = world.system_camera(width as f32 / height as f32);
+            let to_cam = (cam.pos * MM).as_dvec3() - world.moon_center_m;
+            let up = to_cam.normalize();
+            let mut craft = Craft::maneuvering(
+                world.moon_center_m + up * world.moon_radius_m,
+                DVec3::ZERO,
+            );
+            craft.landed = true;
+            craft.landed_on = "MOON";
+            world.flight = Some(craft);
+            6.0
+        }
+        _ => {
+            // surface / launch view: launched, craft coasting in its parking
+            // orbit, the spaceport at the limb so the ascent arc + orbit ring
+            // read clearly, sun ~95 deg off-view so the dark side shows.
+            world.view = View::Surface;
             world.launched = true;
             world.clock = world.mission.meco_t + 240.0;
             world.az = world.mission.spaceport_lon + 1.15;
             world.el = world.mission.spaceport_lat + 0.25;
             world.scale = 1.35;
             (world.az + 1.66 - world.mission.spaceport_lon) / 0.03
-        }
-        View::System => {
-            // wide system shot: home world and moon framed side by side.
-            world.sys_az = 1.4;
-            world.sys_el = 0.30;
-            world.sys_dist = 120.0;
-            6.0
         }
     };
 
@@ -1084,7 +1205,7 @@ fn screenshot(path: &str, width: u32, height: u32, view: View) {
         device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("shot-enc") });
     {
         let mut pass = render_pass(&mut encoder, &target_view);
-        gpu.draw(&mut pass, view, n, hn);
+        gpu.draw(&mut pass, world.view, n, hn);
     }
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
@@ -1316,14 +1437,17 @@ fn main() {
         let args: Vec<String> = std::env::args().collect();
         if args.iter().any(|a| a == "shot" || a == "--shot") {
             env_logger::init();
-            let view = if args.iter().any(|a| a == "system") {
-                View::System
+            let scenario = if args.iter().any(|a| a == "moon") {
+                "moon"
+            } else if args.iter().any(|a| a == "system") {
+                "system"
             } else {
-                View::Surface
+                "surface"
             };
-            let default = match view {
-                View::Surface => "out/client.png",
-                View::System => "out/system.png",
+            let default = match scenario {
+                "moon" => "out/moon.png",
+                "system" => "out/system.png",
+                _ => "out/client.png",
             };
             let path = args
                 .iter()
@@ -1331,7 +1455,7 @@ fn main() {
                 .find(|a| a.ends_with(".png"))
                 .cloned()
                 .unwrap_or_else(|| default.to_string());
-            screenshot(&path, 1280, 800, view);
+            screenshot(&path, 1280, 800, scenario);
             return;
         }
     }
