@@ -44,6 +44,20 @@ struct Uniforms {
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct SceneUniforms {
+    cam_pos: [f32; 4],
+    cam_x: [f32; 4],
+    cam_y: [f32; 4],
+    cam_z: [f32; 4],
+    sun: [f32; 4],
+    home: [f32; 4],
+    moon: [f32; 4],
+    params: [f32; 4],
+    res: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct OverlayVertex {
     pos: [f32; 2],
     color: [f32; 3],
@@ -51,6 +65,15 @@ struct OverlayVertex {
 
 const OVERLAY_CAP: u64 = 8192;
 const HUD_CAP: u64 = 40000;
+
+/// Render-space length unit for the system view: 1000 km.
+const MM: f32 = 1.0e6;
+
+#[derive(Clone, Copy, PartialEq)]
+enum View {
+    Surface,
+    System,
+}
 
 // ---------------------------------------------------------------------------
 // World: simulation, camera, and flight state (no GPU objects). Also owns the
@@ -67,11 +90,27 @@ struct World {
     launched: bool,
     clock: f32, // mission-elapsed seconds
     warp: f32,
+
+    // system view: a perspective camera framing the home world + its moon.
+    view: View,
+    sys_az: f32,
+    sys_el: f32,
+    sys_dist: f32, // camera distance from the home world centre (Mm)
+    home_radius_mm: f32,
+    moon_center_mm: Vec3,
+    moon_radius_mm: f32,
 }
 
 impl World {
     fn new() -> World {
         let mission = Mission::pioneer_from_spaceport();
+        let body = CentralBody::home();
+        let home_radius_mm = (body.radius as f32) / MM;
+        // A fictional moon: ~0.27 home radii, parked off to one side. Distance is
+        // compressed from the real ~60 radii so both bodies frame nicely in one
+        // shot; it will move to a real orbit once the system view is to-scale.
+        let moon_radius_mm = home_radius_mm * 0.27;
+        let moon_center_mm = Vec3::new(88.0, 0.0, 8.0);
         World {
             az: mission.spaceport_lon,
             el: mission.spaceport_lat,
@@ -80,8 +119,60 @@ impl World {
             clock: 0.0,
             warp: 8.0,
             mission,
-            body: CentralBody::home(),
+            body,
             flight: None,
+            view: View::Surface,
+            sys_az: 1.4,
+            sys_el: 0.30,
+            sys_dist: 120.0,
+            home_radius_mm,
+            moon_center_mm,
+            moon_radius_mm,
+        }
+    }
+
+    fn toggle_view(&mut self) {
+        self.view = match self.view {
+            View::Surface => View::System,
+            View::System => View::Surface,
+        };
+    }
+
+    /// Perspective camera + body uniforms for the system view.
+    fn scene_uniforms(&self, res: [f32; 2], time: f32) -> SceneUniforms {
+        let dir = Vec3::new(
+            self.sys_el.cos() * self.sys_az.cos(),
+            self.sys_el.sin(),
+            self.sys_el.cos() * self.sys_az.sin(),
+        );
+        // orbit the midpoint between the home world (origin) and the moon so
+        // both bodies stay framed.
+        let focus = self.moon_center_mm * 0.5;
+        let cam_pos = focus + dir * self.sys_dist;
+        let forward = (focus - cam_pos).normalize();
+        let right = forward.cross(Vec3::Y).normalize();
+        let up = right.cross(forward).normalize();
+
+        let st = time * 0.05 + 0.8;
+        let sun = Vec3::new(st.cos(), 0.25, st.sin()).normalize();
+
+        let fov: f32 = 42.0_f32.to_radians();
+        let aspect = res[0] / res[1].max(1.0);
+        SceneUniforms {
+            cam_pos: [cam_pos.x, cam_pos.y, cam_pos.z, 0.0],
+            cam_x: [right.x, right.y, right.z, 0.0],
+            cam_y: [up.x, up.y, up.z, 0.0],
+            cam_z: [forward.x, forward.y, forward.z, 0.0],
+            sun: [sun.x, sun.y, sun.z, 0.0],
+            home: [0.0, 0.0, 0.0, self.home_radius_mm],
+            moon: [
+                self.moon_center_mm.x,
+                self.moon_center_mm.y,
+                self.moon_center_mm.z,
+                self.moon_radius_mm,
+            ],
+            params: [(fov * 0.5).tan(), aspect, time, 0.0],
+            res: [res[0], res[1], 0.0, 0.0],
         }
     }
 
@@ -157,6 +248,9 @@ impl World {
     }
 
     fn build_overlay(&self, rot: Mat3, aspect: f32) -> Vec<OverlayVertex> {
+        if self.view == View::System {
+            return Vec::new(); // system view draws no surface-frame overlay
+        }
         let rt = rot.transpose();
         let scale = self.scale;
         let mut out: Vec<OverlayVertex> = Vec::new();
@@ -230,6 +324,9 @@ impl World {
     }
 
     fn build_hud(&self, hud: &Hud, res: (f32, f32)) -> Vec<OverlayVertex> {
+        if self.view == View::System {
+            return self.build_system_hud(hud, res);
+        }
         if let Some(craft) = self.flight.as_ref() {
             return self.build_flight_hud(hud, craft, res);
         }
@@ -343,6 +440,39 @@ impl World {
         }
         out
     }
+
+    fn build_system_hud(&self, hud: &Hud, res: (f32, f32)) -> Vec<OverlayVertex> {
+        let mut out: Vec<OverlayVertex> = Vec::new();
+        let dim = [0.55, 0.75, 0.85];
+        let val = [0.92, 0.96, 1.0];
+        let amber = [1.0, 0.78, 0.30];
+        let x = 16.0;
+        let step = hud::LINE_H;
+        let row = |out: &mut Vec<OverlayVertex>, label: &str, value: &str, y: f32| {
+            let cx = hud.text(out, label, x, y, dim, res);
+            hud.text(out, value, cx, y, val, res);
+        };
+
+        let mut y = 16.0;
+        hud.text(&mut out, "SYSTEM MAP", x, y, amber, res);
+        y += step * 1.5;
+
+        let moon_dist = self.moon_center_mm.length();
+        row(&mut out, "HOME     ", &format!("R {:.0} KM", self.home_radius_mm * 1000.0), y);
+        y += step;
+        row(&mut out, "MOON     ", &format!("R {:.0} KM", self.moon_radius_mm * 1000.0), y);
+        y += step;
+        row(&mut out, "RANGE    ", &format!("{:.0} MM", moon_dist), y);
+        y += step;
+        row(&mut out, "CAM DIST ", &format!("{:.0} MM", self.sys_dist), y);
+
+        let mut hy = res.1 - step * 3.0 - 12.0;
+        for line in ["V  BACK TO SURFACE", "DRAG ORBIT   SCROLL ZOOM", ""] {
+            hud.text(&mut out, line, x, hy, dim, res);
+            hy += step;
+        }
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -353,6 +483,9 @@ struct Gpu {
     pipeline: wgpu::RenderPipeline,
     uniform_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    scene_pipeline: wgpu::RenderPipeline,
+    scene_uniform_buf: wgpu::Buffer,
+    scene_bind_group: wgpu::BindGroup,
     overlay_pipeline: wgpu::RenderPipeline,
     overlay_buf: wgpu::Buffer,
     hud_pipeline: wgpu::RenderPipeline,
@@ -505,6 +638,62 @@ impl Gpu {
             cache: None,
         });
 
+        // System view: same bind-group shape (uniform + planet texture +
+        // sampler), different uniform struct and shader.
+        let scene_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("scene"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("scene.wgsl").into()),
+        });
+        let scene_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("scene-uniforms"),
+            size: std::mem::size_of::<SceneUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let scene_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scene-bind-group"),
+            layout: &bind_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: scene_uniform_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&planet_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&planet_sampler),
+                },
+            ],
+        });
+        let scene_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("scene-pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &scene_shader,
+                entry_point: Some("vs"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &scene_shader,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         let overlay_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("overlay"),
             source: wgpu::ShaderSource::Wgsl(include_str!("overlay.wgsl").into()),
@@ -582,6 +771,9 @@ impl Gpu {
             pipeline,
             uniform_buf,
             bind_group,
+            scene_pipeline,
+            scene_uniform_buf,
+            scene_bind_group,
             overlay_pipeline,
             overlay_buf,
             hud_pipeline,
@@ -600,8 +792,16 @@ impl Gpu {
         time: f32,
     ) -> (usize, usize) {
         let res = [w as f32, h.max(1) as f32];
-        let uniforms = world.uniforms(res, time);
-        queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
+        match world.view {
+            View::Surface => {
+                let uniforms = world.uniforms(res, time);
+                queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
+            }
+            View::System => {
+                let su = world.scene_uniforms(res, time);
+                queue.write_buffer(&self.scene_uniform_buf, 0, bytemuck::bytes_of(&su));
+            }
+        }
 
         let aspect = res[0] / res[1];
         let verts = world.build_overlay(world.camera_rot(), aspect);
@@ -617,9 +817,17 @@ impl Gpu {
         (n, hn)
     }
 
-    fn draw(&self, pass: &mut wgpu::RenderPass, n_overlay: usize, n_hud: usize) {
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.bind_group, &[]);
+    fn draw(&self, pass: &mut wgpu::RenderPass, view: View, n_overlay: usize, n_hud: usize) {
+        match view {
+            View::Surface => {
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+            }
+            View::System => {
+                pass.set_pipeline(&self.scene_pipeline);
+                pass.set_bind_group(0, &self.scene_bind_group, &[]);
+            }
+        }
         pass.draw(0..3, 0..1);
         if n_overlay > 0 {
             pass.set_pipeline(&self.overlay_pipeline);
@@ -785,7 +993,7 @@ impl State {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("enc") });
         {
             let mut pass = render_pass(&mut encoder, &view);
-            self.gpu.draw(&mut pass, n, hn);
+            self.gpu.draw(&mut pass, self.world.view, n, hn);
         }
         self.queue.submit(Some(encoder.finish()));
         frame.present();
@@ -797,7 +1005,7 @@ impl State {
 // ---------------------------------------------------------------------------
 
 #[cfg(not(target_arch = "wasm32"))]
-fn screenshot(path: &str, width: u32, height: u32) {
+fn screenshot(path: &str, width: u32, height: u32, view: View) {
     let instance =
         wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -820,18 +1028,28 @@ fn screenshot(path: &str, width: u32, height: u32) {
     let gpu = Gpu::new(&device, &queue, format);
     let hud = Hud::new();
 
-    // A framed scene: launched, craft coasting in its parking orbit, the
-    // spaceport rotated to the limb so the ascent arc + orbit ring read clearly,
-    // and the sun ~90 degrees off-view so the night side (city lights) shows.
     let mut world = World::new();
-    world.launched = true;
-    world.clock = world.mission.meco_t + 240.0;
-    world.az = world.mission.spaceport_lon + 1.15;
-    world.el = world.mission.spaceport_lat + 0.25;
-    world.scale = 1.35;
-    // Sun ~95 deg off the view azimuth so a terminator crosses the disk and the
-    // dark-side city lights show. (sun azimuth = time*0.03 + spaceport_lon.)
-    let time = (world.az + 1.66 - world.mission.spaceport_lon) / 0.03;
+    world.view = view;
+    let time = match view {
+        View::Surface => {
+            // launched, craft coasting in its parking orbit, the spaceport at the
+            // limb so the ascent arc + orbit ring read clearly, sun ~95 deg
+            // off-view so the dark side (city lights) shows.
+            world.launched = true;
+            world.clock = world.mission.meco_t + 240.0;
+            world.az = world.mission.spaceport_lon + 1.15;
+            world.el = world.mission.spaceport_lat + 0.25;
+            world.scale = 1.35;
+            (world.az + 1.66 - world.mission.spaceport_lon) / 0.03
+        }
+        View::System => {
+            // wide system shot: home world and moon framed side by side.
+            world.sys_az = 1.4;
+            world.sys_el = 0.30;
+            world.sys_dist = 120.0;
+            6.0
+        }
+    };
 
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("shot-target"),
@@ -847,7 +1065,7 @@ fn screenshot(path: &str, width: u32, height: u32) {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
-    let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+    let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
     let (n, hn) = gpu.prepare(&queue, &world, &hud, width, height, time);
 
@@ -865,8 +1083,8 @@ fn screenshot(path: &str, width: u32, height: u32) {
     let mut encoder =
         device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("shot-enc") });
     {
-        let mut pass = render_pass(&mut encoder, &view);
-        gpu.draw(&mut pass, n, hn);
+        let mut pass = render_pass(&mut encoder, &target_view);
+        gpu.draw(&mut pass, view, n, hn);
     }
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
@@ -970,7 +1188,7 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         let UserEvent::Ready(state) = event;
         log::info!(
-            "Controls: drag orbit, scroll zoom, Space launch, F manual flight, [ ] warp"
+            "Controls: drag orbit, scroll zoom, Space launch, F manual flight, V system view, [ ] warp"
         );
         state.window.request_redraw();
         self.state = Some(state);
@@ -1001,8 +1219,16 @@ impl ApplicationHandler<UserEvent> for App {
                 if state.dragging {
                     let dx = (x - state.last_cursor.0) as f32;
                     let dy = (y - state.last_cursor.1) as f32;
-                    state.world.az -= dx * 0.005;
-                    state.world.el = (state.world.el + dy * 0.005).clamp(-1.5, 1.5);
+                    match state.world.view {
+                        View::Surface => {
+                            state.world.az -= dx * 0.005;
+                            state.world.el = (state.world.el + dy * 0.005).clamp(-1.5, 1.5);
+                        }
+                        View::System => {
+                            state.world.sys_az -= dx * 0.005;
+                            state.world.sys_el = (state.world.sys_el + dy * 0.005).clamp(-1.5, 1.5);
+                        }
+                    }
                 }
                 state.last_cursor = (x, y);
             }
@@ -1011,7 +1237,16 @@ impl ApplicationHandler<UserEvent> for App {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => (p.y as f32) / 60.0,
                 };
-                state.world.scale = (state.world.scale * (1.0 - dy * 0.12)).clamp(0.12, 3.0);
+                match state.world.view {
+                    View::Surface => {
+                        state.world.scale =
+                            (state.world.scale * (1.0 - dy * 0.12)).clamp(0.12, 3.0);
+                    }
+                    View::System => {
+                        state.world.sys_dist =
+                            (state.world.sys_dist * (1.0 - dy * 0.12)).clamp(15.0, 600.0);
+                    }
+                }
             }
             WindowEvent::KeyboardInput { event: key_event, .. } => {
                 if key_event.state == ElementState::Pressed {
@@ -1030,6 +1265,7 @@ impl ApplicationHandler<UserEvent> for App {
                         return;
                     }
                     match code {
+                        KeyCode::KeyV => state.world.toggle_view(),
                         KeyCode::KeyF => state.world.toggle_flight(),
                         KeyCode::Space if state.world.flight.is_none() => {
                             state.world.toggle_launch()
@@ -1080,13 +1316,22 @@ fn main() {
         let args: Vec<String> = std::env::args().collect();
         if args.iter().any(|a| a == "shot" || a == "--shot") {
             env_logger::init();
+            let view = if args.iter().any(|a| a == "system") {
+                View::System
+            } else {
+                View::Surface
+            };
+            let default = match view {
+                View::Surface => "out/client.png",
+                View::System => "out/system.png",
+            };
             let path = args
                 .iter()
                 .skip(1)
                 .find(|a| a.ends_with(".png"))
                 .cloned()
-                .unwrap_or_else(|| "out/client.png".to_string());
-            screenshot(&path, 1280, 800);
+                .unwrap_or_else(|| default.to_string());
+            screenshot(&path, 1280, 800, view);
             return;
         }
     }
