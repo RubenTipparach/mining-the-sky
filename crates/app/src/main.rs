@@ -23,13 +23,11 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 mod flight;
-mod hud;
 mod mission;
 mod rocket;
 mod ui;
 mod universe;
 use flight::{Craft, GravBody, Mode};
-use hud::Hud;
 use mission::Mission;
 use sim::body::CentralBody;
 
@@ -664,231 +662,13 @@ impl World {
         out
     }
 
-    fn build_hud(&self, hud: &Hud, res: (f32, f32)) -> Vec<OverlayVertex> {
-        if self.view == View::Rocket {
-            return self.build_vehicle_hud(hud, res);
-        }
-        // Map view
-        if let Some(craft) = self.flight.as_ref() {
-            return self.build_flight_hud(hud, craft, res);
-        }
-        if !self.launched {
-            return self.build_system_hud(hud, res);
-        }
-        self.build_ascent_hud(hud, res)
-    }
-
-    /// Ascent / parking-orbit telemetry, shown in the map view after launch.
-    fn build_ascent_hud(&self, hud: &Hud, res: (f32, f32)) -> Vec<OverlayVertex> {
+    /// In-scene overlay geometry for the map view: the home-world craft marker
+    /// and locator dots for every small body. All text panels live in egui now
+    /// (see `ui::build`), so this emits only diamonds/markers, never glyphs.
+    fn build_hud(&self, res: (f32, f32)) -> Vec<OverlayVertex> {
         let mut out: Vec<OverlayVertex> = Vec::new();
-        let dim = [0.55, 0.75, 0.85];
-        let val = [0.92, 0.96, 1.0];
-        let amber = [1.0, 0.78, 0.30];
-        let x = 16.0;
-        let step = hud::LINE_H;
-        let row = |out: &mut Vec<OverlayVertex>, label: &str, value: &str, y: f32| {
-            let cx = hud.text(out, label, x, y, dim, res);
-            hud.text(out, value, cx, y, val, res);
-        };
-
-        let tel = self.mission.telemetry(self.launched, self.clock);
-        let mut y = 16.0;
-        hud.text(&mut out, self.mission.vehicle, x, y, amber, res);
-        y += step * 1.5;
-
-        let phase_col = match tel.phase {
-            "ASCENT" => [1.0, 0.55, 0.15],
-            "ORBIT" => [0.5, 0.9, 1.0],
-            _ => [0.5, 1.0, 0.5],
-        };
-        let cx = hud.text(&mut out, "PHASE    ", x, y, dim, res);
-        hud.text(&mut out, tel.phase, cx, y, phase_col, res);
-        y += step;
-
-        row(&mut out, "MET      ", &format!("T+{:.0}S", self.clock.max(0.0)), y);
-        y += step;
-        row(&mut out, "ALT      ", &format!("{:.1} KM", tel.alt_km), y);
-        y += step;
-        row(&mut out, "VEL      ", &format!("{:.0} M/S", tel.speed), y);
-        y += step;
-        if let Some((peri, apo)) = tel.orbit {
-            row(&mut out, "ORBIT    ", &format!("{:.0} X {:.0} KM", peri, apo), y);
-        } else {
-            row(&mut out, "RANGE    ", &format!("{:.0} KM", tel.downrange_km), y);
-        }
-        y += step;
-        row(
-            &mut out,
-            "STAGE    ",
-            &format!("{}/{}", tel.stage + 1, self.mission.stage_count),
-            y,
-        );
-        y += step;
-        row(&mut out, "WARP     ", &format!("{:.0}X", self.warp), y);
-
-        let mut hy = res.1 - step * 4.0 - 12.0;
-        for line in [
-            "SPACE LAUNCH/RESET",
-            "F  TAKE MANUAL CONTROL",
-            "DRAG ORBIT   SCROLL ZOOM",
-            "[ ] TIME WARP",
-        ] {
-            hud.text(&mut out, line, x, hy, dim, res);
-            hy += step;
-        }
-        out
-    }
-
-    fn build_flight_hud(&self, hud: &Hud, craft: &Craft, res: (f32, f32)) -> Vec<OverlayVertex> {
-        let mut out: Vec<OverlayVertex> = Vec::new();
-        let dim = [0.55, 0.75, 0.85];
-        let val = [0.92, 0.96, 1.0];
-        let amber = [1.0, 0.78, 0.30];
-        let x = 16.0;
-        let step = hud::LINE_H;
-        let row = |out: &mut Vec<OverlayVertex>, label: &str, value: &str, y: f32| {
-            let cx = hud.text(out, label, x, y, dim, res);
-            hud.text(out, value, cx, y, val, res);
-        };
-
-        let mut y = 16.0;
-        hud.text(&mut out, "MANUAL FLIGHT", x, y, amber, res);
-        y += step * 1.5;
-
-        let status = craft.status();
-        let scol = match status {
-            "CRASHED" => [1.0, 0.3, 0.25],
-            "LANDED" => [0.4, 1.0, 0.5],
-            _ => [1.0, 0.8, 0.3],
-        };
-        let cx = hud.text(&mut out, "STATUS   ", x, y, dim, res);
-        hud.text(&mut out, status, cx, y, scol, res);
-        y += step;
-
-        row(&mut out, "ALT      ", &format!("{:.1} KM", craft.altitude(&self.body) / 1000.0), y);
-        y += step;
-        row(&mut out, "VEL      ", &format!("{:.0} M/S", craft.speed()), y);
-        y += step;
-        row(&mut out, "VSPD     ", &format!("{:.0} M/S", craft.vertical_speed()), y);
-        y += step;
-        row(&mut out, "THROTTLE ", &format!("{:.0}", craft.throttle * 100.0), y);
-        y += step;
-        row(&mut out, "PROP     ", &format!("{:.0}", craft.prop_frac() * 100.0), y);
-        y += step;
-        row(&mut out, "MODE     ", craft.mode.label(), y);
-
-        let mut hy = res.1 - step * 4.0 - 12.0;
-        for line in [
-            "W / S  THROTTLE",
-            "1 PRO  2 RETRO  3 OUT  4 IN",
-            "F  RELEASE CONTROL",
-            "[ ] TIME WARP",
-        ] {
-            hud.text(&mut out, line, x, hy, dim, res);
-            hy += step;
-        }
-        out
-    }
-
-    fn build_vehicle_hud(&self, hud: &Hud, res: (f32, f32)) -> Vec<OverlayVertex> {
-        let mut out: Vec<OverlayVertex> = Vec::new();
-        let dim = [0.55, 0.75, 0.85];
-        let val = [0.92, 0.96, 1.0];
-        let amber = [1.0, 0.78, 0.30];
-        let green = [0.5, 1.0, 0.5];
-        let x = 16.0;
-        let step = hud::LINE_H;
-        let row = |out: &mut Vec<OverlayVertex>, label: &str, value: &str, y: f32, c: [f32; 3]| {
-            let cx = hud.text(out, label, x, y, dim, res);
-            hud.text(out, value, cx, y, c, res);
-        };
-
-        let m = &self.mission;
-        let mut y = 16.0;
-        hud.text(&mut out, "VEHICLE ASSEMBLY", x, y, amber, res);
-        y += step * 1.3;
-        hud.text(&mut out, m.vehicle, x, y, val, res);
-        y += step * 1.3;
-
-        // stages, top of the stack first
-        for (i, (name, wet_t, dv)) in m.stack.iter().enumerate().rev() {
-            let label = format!("S{} {}", i + 1, name);
-            let value = format!("{:.0} T  {:.0} M/S", wet_t, dv);
-            // pad the label column to align values
-            let padded = format!("{:<11}", label);
-            row(&mut out, &padded, &value, y, val);
-            y += step;
-        }
-        y += step * 0.5;
-        row(&mut out, "MASS     ", &format!("{:.0} T", m.liftoff_mass_t), y, val);
-        y += step;
-        row(&mut out, "TWR      ", &format!("{:.2}", m.liftoff_twr), y, val);
-        y += step;
-        row(&mut out, "DELTA-V  ", &format!("{:.0} M/S", m.total_dv), y, val);
-        y += step;
-        row(&mut out, "PAYLOAD  ", &format!("{:.0} T", m.payload_t), y, val);
-        y += step;
-        row(&mut out, "TARGET   ", &format!("{:.0} KM ORBIT", m.target_orbit_km()), y, val);
-        y += step * 1.3;
-        hud.text(&mut out, "SPACE  LAUNCH", x, y, green, res);
-
-        let mut hy = res.1 - step * 3.0 - 12.0;
-        for line in ["DRAG ORBIT   SCROLL ZOOM", "TAB  ORBITAL MAP", "[ ] TIME WARP"] {
-            hud.text(&mut out, line, x, hy, dim, res);
-            hy += step;
-        }
-        out
-    }
-
-    fn build_system_hud(&self, hud: &Hud, res: (f32, f32)) -> Vec<OverlayVertex> {
-        let mut out: Vec<OverlayVertex> = Vec::new();
-        let dim = [0.55, 0.75, 0.85];
-        let val = [0.92, 0.96, 1.0];
-        let amber = [1.0, 0.78, 0.30];
-        let x = 16.0;
-        let step = hud::LINE_H;
-        let row = |out: &mut Vec<OverlayVertex>, label: &str, value: &str, y: f32| {
-            let cx = hud.text(out, label, x, y, dim, res);
-            hud.text(out, value, cx, y, val, res);
-        };
-
-        let mut y = 16.0;
-        hud.text(&mut out, "ORBITAL MAP", x, y, amber, res);
-        y += step * 1.5;
-
-        let cx = hud.text(&mut out, "CENTER   ", x, y, dim, res);
-        hud.text(&mut out, self.focus_label(), cx, y, [0.6, 0.9, 1.0], res);
-        y += step;
-
-        let moon_dist = self.moon_center_mm.length();
-        row(&mut out, "HOME     ", &format!("R {:.0} KM", self.home_radius_mm * 1000.0), y);
-        y += step;
-        row(&mut out, "MOON     ", &format!("R {:.0} KM", self.moon_radius_mm * 1000.0), y);
-        y += step;
-        row(&mut out, "RANGE    ", &format!("{:.0} MM", moon_dist), y);
-        y += step;
-        row(&mut out, "CAM DIST ", &format!("{:.0} MM", self.sys_dist), y);
-        y += step;
-        let days = self.sys_time / 86_400.0;
-        row(&mut out, "TIME     ", &format!("{:.0}X  T+{:.1}D", self.warp, days), y);
-
-        if let Some(craft) = self.flight.as_ref() {
-            y += step * 1.5;
-            let to_moon = (craft.r - self.moon_center_m).length() / MM as f64;
-            let scol = match craft.status() {
-                "CRASHED" => [1.0, 0.3, 0.25],
-                "LANDED" => [0.4, 1.0, 0.5],
-                _ => [1.0, 0.8, 0.3],
-            };
-            let cx = hud.text(&mut out, "CRAFT    ", x, y, dim, res);
-            let label = if craft.landed && craft.landed_on == "MOON" {
-                "ON MOON"
-            } else {
-                craft.status()
-            };
-            hud.text(&mut out, label, cx, y, scol, res);
-            y += step;
-            row(&mut out, "TO MOON  ", &format!("{:.1} MM", to_moon), y);
+        if self.view != View::Map {
+            return out;
         }
 
         // Rocket/craft marker, placed at the home world's orbital position.
@@ -914,17 +694,6 @@ impl World {
                 push_filled_diamond(&mut out, c, sz + 0.004, aspect, [0.0, 0.0, 0.0]);
                 push_filled_diamond(&mut out, c, sz, aspect, b.color);
             }
-        }
-
-        // (The body list lives in the egui "SYSTEM BODIES" panel now.)
-        let mut hy = res.1 - step * 3.0 - 12.0;
-        for line in [
-            "CLICK BODY / PANEL  FOCUS",
-            "DRAG ORBIT   SCROLL ZOOM",
-            "TAB VIEW   F MANUAL",
-        ] {
-            hud.text(&mut out, line, x, hy, dim, res);
-            hy += step;
         }
         out
     }
@@ -1351,7 +1120,6 @@ impl Gpu {
         &self,
         queue: &wgpu::Queue,
         world: &World,
-        hud: &Hud,
         w: u32,
         h: u32,
         time: f32,
@@ -1376,7 +1144,7 @@ impl Gpu {
         if n > 0 {
             queue.write_buffer(&self.overlay_buf, 0, bytemuck::cast_slice(&verts[..n]));
         }
-        let hud_verts = world.build_hud(hud, (res[0], res[1]));
+        let hud_verts = world.build_hud((res[0], res[1]));
         let hn = hud_verts.len().min(HUD_CAP as usize);
         if hn > 0 {
             queue.write_buffer(&self.hud_buf, 0, bytemuck::cast_slice(&hud_verts[..hn]));
@@ -1538,7 +1306,6 @@ struct State {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     gpu: Gpu,
-    hud: Hud,
     world: World,
     start: instant_now::Instant,
     last_t: f32,
@@ -1627,7 +1394,6 @@ impl State {
             queue,
             config,
             gpu,
-            hud: Hud::new(),
             world: World::new(),
             start: instant_now::Instant::now(),
             last_t: 0.0,
@@ -1665,7 +1431,7 @@ impl State {
 
         let (n, hn) = self
             .gpu
-            .prepare(&self.queue, &self.world, &self.hud, self.config.width, self.config.height, t);
+            .prepare(&self.queue, &self.world, self.config.width, self.config.height, t);
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
@@ -1850,9 +1616,8 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
 fn screenshot_all(width: u32, height: u32) {
     let (device, queue) = make_shot_device();
     let gpu = Gpu::new(&device, &queue, wgpu::TextureFormat::Rgba8UnormSrgb);
-    let hud = Hud::new();
     for (scenario, path) in SHOT_SCENARIOS {
-        render_shot(&device, &queue, &gpu, &hud, scenario, path, width, height);
+        render_shot(&device, &queue, &gpu, scenario, path, width, height);
     }
 }
 
@@ -1860,8 +1625,7 @@ fn screenshot_all(width: u32, height: u32) {
 fn screenshot(path: &str, width: u32, height: u32, scenario: &str) {
     let (device, queue) = make_shot_device();
     let gpu = Gpu::new(&device, &queue, wgpu::TextureFormat::Rgba8UnormSrgb);
-    let hud = Hud::new();
-    render_shot(&device, &queue, &gpu, &hud, scenario, path, width, height);
+    render_shot(&device, &queue, &gpu, scenario, path, width, height);
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1869,7 +1633,6 @@ fn render_shot(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     gpu: &Gpu,
-    hud: &Hud,
     scenario: &str,
     path: &str,
     width: u32,
@@ -1894,7 +1657,7 @@ fn render_shot(
     });
     let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
-    let (n, hn) = gpu.prepare(queue, &world, hud, width, height, time);
+    let (n, hn) = gpu.prepare(queue, &world, width, height, time);
 
     // 256-byte aligned row pitch for the readback copy.
     let unpadded = width * 4;
@@ -1925,8 +1688,8 @@ fn render_shot(
         gpu.draw(&mut pass, world.view, n, hn);
     }
 
-    // egui overlay (so the body browser is verifiable headlessly)
-    if world.view == View::Map {
+    // egui overlay (so the panels are verifiable headlessly), in every view.
+    {
         let ctx = egui::Context::default();
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
