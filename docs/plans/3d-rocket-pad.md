@@ -34,9 +34,11 @@ and everything 3D.
 
 ## Phases (each ends in a verified `shot rocket` PNG)
 
-1. Static stack on the pad - rocket + pad + ground + lighting in rocket view,
-   orbit camera, per-stage HUD (name, dry/prop mass, thrust, TWR, Isp, stage
-   dv). Core deliverable.
+1. DONE - Static stack on the pad: 3D Pioneer I (booster + upper + payload +
+   nose, fins, engine nozzles) on a launch pad with mount legs over ground/sky,
+   in the new mesh+depth pipeline rocket view (Tab cycles to it), orbit camera,
+   with the vehicle-assembly HUD (per-stage mass/dv, TWR, total dv, payload,
+   target orbit). Verified via `shot rocket`.
 2. Staging animation - on launch (Space) the rocket lifts and each stage
    detaches and falls away as its propellant depletes, driven by the existing
    ascent sim state.

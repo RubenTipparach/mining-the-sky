@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use glam::{DVec3, Mat3, Vec3};
+use glam::{DVec3, Mat3, Mat4, Vec3};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
@@ -25,6 +25,7 @@ use winit::window::{Window, WindowId};
 mod flight;
 mod hud;
 mod mission;
+mod rocket;
 use flight::{Craft, GravBody, Mode};
 use hud::Hud;
 use mission::Mission;
@@ -128,10 +129,21 @@ const HUD_CAP: u64 = 40000;
 /// Render-space length unit for the system view: 1000 km.
 const MM: f32 = 1.0e6;
 
+/// Depth format for the rocket view's mesh pass.
+const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
 #[derive(Clone, Copy, PartialEq)]
 enum View {
     Surface,
     System,
+    Rocket,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct MeshUniforms {
+    viewproj: [[f32; 4]; 4],
+    sun: [f32; 4],
 }
 
 /// A perspective camera for the system view (all positions in Mm).
@@ -188,12 +200,22 @@ struct World {
     moon_center_m: DVec3,
     moon_mu: f64,
     moon_radius_m: f64,
+
+    // rocket view: an orbit camera framing the 3D vehicle on the pad (metres).
+    rocket_az: f32,
+    rocket_el: f32,
+    rocket_dist: f32,
+    rocket_focus_y: f32,
 }
 
 impl World {
     fn new() -> World {
         let mission = Mission::pioneer_from_spaceport();
         let body = CentralBody::home();
+        let rocket_frame = {
+            let s = rocket::scene();
+            (s.focus_y, s.cam_dist)
+        };
         let home_radius_mm = (body.radius as f32) / MM;
         // A fictional moon: ~0.27 home radii, parked off to one side. Distance is
         // compressed from the real ~60 radii so both bodies frame nicely in one
@@ -228,6 +250,10 @@ impl World {
             moon_center_m,
             moon_mu,
             moon_radius_m,
+            rocket_az: 0.9,
+            rocket_el: 0.16,
+            rocket_dist: rocket_frame.1,
+            rocket_focus_y: rocket_frame.0,
         }
     }
 
@@ -243,8 +269,28 @@ impl World {
     fn toggle_view(&mut self) {
         self.view = match self.view {
             View::Surface => View::System,
-            View::System => View::Surface,
+            View::System => View::Rocket,
+            View::Rocket => View::Surface,
         };
+    }
+
+    /// View-projection + sun for the rocket view (a local scene in metres).
+    fn mesh_uniforms(&self, res: [f32; 2]) -> MeshUniforms {
+        let aspect = res[0] / res[1].max(1.0);
+        let target = Vec3::new(0.0, self.rocket_focus_y, 0.0);
+        let dir = Vec3::new(
+            self.rocket_el.cos() * self.rocket_az.cos(),
+            self.rocket_el.sin(),
+            self.rocket_el.cos() * self.rocket_az.sin(),
+        );
+        let eye = target + dir * self.rocket_dist;
+        let view = Mat4::look_at_rh(eye, target, Vec3::Y);
+        let proj = Mat4::perspective_rh(50f32.to_radians(), aspect, 0.3, 8000.0);
+        let vp = proj * view;
+        MeshUniforms {
+            viewproj: vp.to_cols_array_2d(),
+            sun: [0.40, 0.72, 0.55, 0.0],
+        }
     }
 
     /// System-view perspective camera: position + basis + tan(fov/2), all in Mm.
@@ -403,6 +449,10 @@ impl World {
     }
 
     fn build_overlay(&self, rot: Mat3, aspect: f32) -> Vec<OverlayVertex> {
+        if self.view == View::Rocket {
+            let _ = (rot, aspect);
+            return Vec::new();
+        }
         if self.view == View::System {
             // the system-view craft marker is drawn as a filled shape in the HUD
             // pass (visible on bright bodies); nothing to draw as lines here.
@@ -452,6 +502,9 @@ impl World {
     }
 
     fn build_hud(&self, hud: &Hud, res: (f32, f32)) -> Vec<OverlayVertex> {
+        if self.view == View::Rocket {
+            return self.build_vehicle_hud(hud, res);
+        }
         if self.view == View::System {
             return self.build_system_hud(hud, res);
         }
@@ -700,6 +753,11 @@ struct Gpu {
     overlay_buf: wgpu::Buffer,
     hud_pipeline: wgpu::RenderPipeline,
     hud_buf: wgpu::Buffer,
+    mesh_pipeline: wgpu::RenderPipeline,
+    mesh_uniform_buf: wgpu::Buffer,
+    mesh_bind_group: wgpu::BindGroup,
+    mesh_vbuf: wgpu::Buffer,
+    mesh_vertex_count: u32,
 }
 
 impl Gpu {
@@ -977,6 +1035,96 @@ impl Gpu {
             mapped_at_creation: false,
         });
 
+        // Rocket view: triangle-mesh pipeline with a depth buffer.
+        let mesh_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("rocket"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("rocket.wgsl").into()),
+        });
+        let mesh_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mesh-uniforms"),
+            size: std::mem::size_of::<MeshUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mesh_bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mesh-bind-layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let mesh_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mesh-bind-group"),
+            layout: &mesh_bind_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: mesh_uniform_buf.as_entire_binding(),
+            }],
+        });
+        let mesh_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("mesh-layout"),
+            bind_group_layouts: &[Some(&mesh_bind_layout)],
+            immediate_size: 0,
+        });
+        let mesh_vbuf_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<rocket::MeshVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 12, shader_location: 1 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 24, shader_location: 2 },
+            ],
+        };
+        let mesh_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("mesh-pipeline"),
+            layout: Some(&mesh_layout),
+            vertex: wgpu::VertexState {
+                module: &mesh_shader,
+                entry_point: Some("vs"),
+                buffers: &[mesh_vbuf_layout],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &mesh_shader,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let scene_mesh = rocket::scene().mesh;
+        let mesh_vertex_count = scene_mesh.verts.len() as u32;
+        let mesh_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mesh-vbuf"),
+            size: (scene_mesh.verts.len() * std::mem::size_of::<rocket::MeshVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&mesh_vbuf, 0, bytemuck::cast_slice(&scene_mesh.verts));
+
         Gpu {
             pipeline,
             uniform_buf,
@@ -988,6 +1136,11 @@ impl Gpu {
             overlay_buf,
             hud_pipeline,
             hud_buf,
+            mesh_pipeline,
+            mesh_uniform_buf,
+            mesh_bind_group,
+            mesh_vbuf,
+            mesh_vertex_count,
         }
     }
 
@@ -1011,6 +1164,10 @@ impl Gpu {
                 let su = world.scene_uniforms(res, time);
                 queue.write_buffer(&self.scene_uniform_buf, 0, bytemuck::bytes_of(&su));
             }
+            View::Rocket => {
+                let mu = world.mesh_uniforms(res);
+                queue.write_buffer(&self.mesh_uniform_buf, 0, bytemuck::bytes_of(&mu));
+            }
         }
 
         let aspect = res[0] / res[1];
@@ -1030,18 +1187,27 @@ impl Gpu {
         (n, hn)
     }
 
+    /// Fullscreen raymarch pass (Surface / System) plus the 2D overlay + HUD.
+    /// The rocket view does not use this; it draws meshes then `draw_overlay`.
     fn draw(&self, pass: &mut wgpu::RenderPass, view: View, n_overlay: usize, n_hud: usize) {
         match view {
             View::Surface => {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.draw(0..3, 0..1);
             }
             View::System => {
                 pass.set_pipeline(&self.scene_pipeline);
                 pass.set_bind_group(0, &self.scene_bind_group, &[]);
+                pass.draw(0..3, 0..1);
             }
+            View::Rocket => {}
         }
-        pass.draw(0..3, 0..1);
+        self.draw_overlay(pass, n_overlay, n_hud);
+    }
+
+    /// The 2D line overlay + HUD triangles (no depth).
+    fn draw_overlay(&self, pass: &mut wgpu::RenderPass, n_overlay: usize, n_hud: usize) {
         if n_overlay > 0 {
             pass.set_pipeline(&self.overlay_pipeline);
             pass.set_vertex_buffer(0, self.overlay_buf.slice(..));
@@ -1052,6 +1218,14 @@ impl Gpu {
             pass.set_vertex_buffer(0, self.hud_buf.slice(..));
             pass.draw(0..n_hud as u32, 0..1);
         }
+    }
+
+    /// The 3D rocket/pad mesh (depth-tested). Used in its own pass.
+    fn draw_meshes(&self, pass: &mut wgpu::RenderPass) {
+        pass.set_pipeline(&self.mesh_pipeline);
+        pass.set_bind_group(0, &self.mesh_bind_group, &[]);
+        pass.set_vertex_buffer(0, self.mesh_vbuf.slice(..));
+        pass.draw(0..self.mesh_vertex_count, 0..1);
     }
 }
 
@@ -1083,6 +1257,72 @@ fn render_pass<'a>(
                 load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                 store: wgpu::StoreOp::Store,
             },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    })
+}
+
+fn create_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("depth"),
+            size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
+        .create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// Mesh pass: clear color to sky, clear depth, depth-test enabled.
+fn mesh_pass<'a>(
+    encoder: &'a mut wgpu::CommandEncoder,
+    color: &'a wgpu::TextureView,
+    depth: &'a wgpu::TextureView,
+) -> wgpu::RenderPass<'a> {
+    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("mesh-pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: color,
+            resolve_target: None,
+            depth_slice: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.45, g: 0.62, b: 0.82, a: 1.0 }),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+            view: depth,
+            depth_ops: Some(wgpu::Operations {
+                load: wgpu::LoadOp::Clear(1.0),
+                store: wgpu::StoreOp::Store,
+            }),
+            stencil_ops: None,
+        }),
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    })
+}
+
+/// Overlay pass: keep existing color (load), no depth, for 2D HUD on top.
+fn overlay_pass<'a>(
+    encoder: &'a mut wgpu::CommandEncoder,
+    color: &'a wgpu::TextureView,
+) -> wgpu::RenderPass<'a> {
+    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("overlay-pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: color,
+            resolve_target: None,
+            depth_slice: None,
+            ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
         })],
         depth_stencil_attachment: None,
         timestamp_writes: None,
@@ -1226,7 +1466,17 @@ impl State {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("enc") });
-        {
+        if self.world.view == View::Rocket {
+            let depth = create_depth(&self.device, self.config.width, self.config.height);
+            {
+                let mut pass = mesh_pass(&mut encoder, &view, &depth);
+                self.gpu.draw_meshes(&mut pass);
+            }
+            {
+                let mut pass = overlay_pass(&mut encoder, &view);
+                self.gpu.draw_overlay(&mut pass, n, hn);
+            }
+        } else {
             let mut pass = render_pass(&mut encoder, &view);
             self.gpu.draw(&mut pass, self.world.view, n, hn);
         }
@@ -1249,6 +1499,7 @@ const SHOT_SCENARIOS: &[(&str, &str)] = &[
     ("flight", "out/flight.png"),
     ("system", "out/system.png"),
     ("moon", "out/moon.png"),
+    ("rocket", "out/rocket.png"),
 ];
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1285,6 +1536,12 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
         w.scale = 1.35;
     };
     let time = match scenario {
+        "rocket" => {
+            world.view = View::Rocket;
+            world.rocket_az = 0.9;
+            world.rocket_el = 0.16;
+            0.0
+        }
         "system" => {
             world.view = View::System;
             world.sys_az = 1.4;
@@ -1404,7 +1661,17 @@ fn render_shot(
 
     let mut encoder =
         device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("shot-enc") });
-    {
+    if world.view == View::Rocket {
+        let depth = create_depth(device, width, height);
+        {
+            let mut pass = mesh_pass(&mut encoder, &target_view, &depth);
+            gpu.draw_meshes(&mut pass);
+        }
+        {
+            let mut pass = overlay_pass(&mut encoder, &target_view);
+            gpu.draw_overlay(&mut pass, n, hn);
+        }
+    } else {
         let mut pass = render_pass(&mut encoder, &target_view);
         gpu.draw(&mut pass, world.view, n, hn);
     }
@@ -1562,6 +1829,11 @@ impl ApplicationHandler<UserEvent> for App {
                             state.world.sys_az += dx * 0.005;
                             state.world.sys_el = (state.world.sys_el + dy * 0.005).clamp(-1.5, 1.5);
                         }
+                        View::Rocket => {
+                            state.world.rocket_az -= dx * 0.006;
+                            state.world.rocket_el =
+                                (state.world.rocket_el + dy * 0.006).clamp(-0.2, 1.4);
+                        }
                     }
                 }
                 state.last_cursor = (x, y);
@@ -1579,6 +1851,10 @@ impl ApplicationHandler<UserEvent> for App {
                     View::System => {
                         state.world.sys_dist =
                             (state.world.sys_dist * (1.0 - dy * 0.12)).clamp(15.0, 600.0);
+                    }
+                    View::Rocket => {
+                        state.world.rocket_dist =
+                            (state.world.rocket_dist * (1.0 - dy * 0.12)).clamp(12.0, 400.0);
                     }
                 }
             }
@@ -1657,6 +1933,8 @@ fn main() {
             }
             let scenario = if args.iter().any(|a| a == "moon") {
                 "moon"
+            } else if args.iter().any(|a| a == "rocket") {
+                "rocket"
             } else if args.iter().any(|a| a == "system") {
                 "system"
             } else if args.iter().any(|a| a == "pad") {
@@ -1670,6 +1948,7 @@ fn main() {
             };
             let default = match scenario {
                 "moon" => "out/moon.png",
+                "rocket" => "out/rocket.png",
                 "system" => "out/system.png",
                 "pad" => "out/pad.png",
                 "ascent" => "out/ascent.png",
