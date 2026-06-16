@@ -147,6 +147,7 @@ dependencies = [
  "env_logger",
  "glam",
  "image",
+ "js-sys",
  "log",
  "pollster",
  "sim",

@@ -30,6 +30,65 @@ use hud::Hud;
 use mission::Mission;
 use sim::body::CentralBody;
 
+/// Drawable size for the surface. On the web the winit window reports a near
+/// zero inner size, so derive it from the canvas client rect times the device
+/// pixel ratio (this is what fixes the blank/1x1 browser render).
+fn surface_size(window: &Window) -> (u32, u32) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        webx::canvas_size(window)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let s = window.inner_size();
+        (s.width.max(1), s.height.max(1))
+    }
+}
+
+/// Browser glue: status reporting, WebGPU detection, and canvas sizing.
+#[cfg(target_arch = "wasm32")]
+mod webx {
+    use wasm_bindgen::JsValue;
+    use winit::platform::web::WindowExtWebSys;
+    use winit::window::Window;
+
+    /// Replace the on-page `#hud` text so failures are visible instead of a
+    /// blank page.
+    pub fn set_status(msg: &str) {
+        if let Some(el) = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.get_element_by_id("hud"))
+        {
+            el.set_text_content(Some(msg));
+        }
+    }
+
+    /// True if `navigator.gpu` exists (checked via Reflect so we do not need the
+    /// web-sys `Gpu` feature).
+    pub fn has_webgpu() -> bool {
+        web_sys::window()
+            .map(|w| {
+                let nav = w.navigator();
+                js_sys::Reflect::get(&nav, &JsValue::from_str("gpu"))
+                    .map(|v| !v.is_undefined() && !v.is_null())
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Canvas client size in physical pixels (CSS pixels times devicePixelRatio).
+    pub fn canvas_size(window: &Window) -> (u32, u32) {
+        if let Some(canvas) = window.canvas() {
+            let dpr = web_sys::window().map(|w| w.device_pixel_ratio()).unwrap_or(1.0);
+            let w = (canvas.client_width() as f64 * dpr).round() as u32;
+            let h = (canvas.client_height() as f64 * dpr).round() as u32;
+            (w.max(1), h.max(1))
+        } else {
+            (1, 1)
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
@@ -1053,9 +1112,7 @@ struct State {
 
 impl State {
     async fn new(window: Arc<Window>) -> State {
-        let size = window.inner_size();
-        let width = size.width.max(1);
-        let height = size.height.max(1);
+        let (width, height) = surface_size(&window);
 
         let instance = wgpu::Instance::new(
             wgpu::InstanceDescriptor::new_without_display_handle_from_env(),
@@ -1136,6 +1193,16 @@ impl State {
     }
 
     fn render(&mut self) {
+        // On the web the canvas tracks the viewport via CSS; keep the surface
+        // (and thus the canvas backing buffer) in sync each frame.
+        #[cfg(target_arch = "wasm32")]
+        {
+            let (w, h) = surface_size(&self.window);
+            if w != self.config.width || h != self.config.height {
+                self.resize(w, h);
+            }
+        }
+
         let t = self.start.elapsed().as_secs_f32();
         let frame_dt = (t - self.last_t).clamp(0.0, 0.1);
         self.last_t = t;
@@ -1430,7 +1497,19 @@ impl ApplicationHandler<UserEvent> for App {
         let win = window.clone();
         #[cfg(target_arch = "wasm32")]
         wasm_bindgen_futures::spawn_local(async move {
+            if !webx::has_webgpu() {
+                webx::set_status(
+                    "WebGPU is not available in this browser. Use Chrome/Edge 113+ \
+                     (or Safari 18+) on a machine with a supported GPU.",
+                );
+                return;
+            }
+            webx::set_status("Starting renderer...");
             let state = State::new(win).await;
+            webx::set_status(
+                "Tab: map / rocket view  -  drag: orbit  -  scroll: zoom  -  \
+                 Space: launch  -  F: manual flight",
+            );
             let _ = proxy.send_event(UserEvent::Ready(state));
         });
         #[cfg(not(target_arch = "wasm32"))]
@@ -1520,7 +1599,7 @@ impl ApplicationHandler<UserEvent> for App {
                         return;
                     }
                     match code {
-                        KeyCode::KeyV => state.world.toggle_view(),
+                        KeyCode::Tab | KeyCode::KeyV => state.world.toggle_view(),
                         KeyCode::KeyF => state.world.toggle_flight(),
                         KeyCode::Space if state.world.flight.is_none() => {
                             state.world.toggle_launch()
