@@ -31,6 +31,16 @@ pub struct Mission {
 
     /// Mission time of main-engine cutoff (the ascent/orbit boundary).
     pub meco_t: f32,
+    pub vehicle: &'static str,
+    pub stage_count: usize,
+
+    // scalar ascent telemetry, one per sample: (t, alt_km, speed, downrange_km, stage)
+    tel: Vec<(f32, f32, f32, f32, usize)>,
+    // parking orbit readout
+    park_alt_km: f32,
+    park_speed: f32,
+    peri_km: f32,
+    apo_km: f32,
 
     // parameters for coasting the marker along the ring after MECO
     ring_radius: f32,
@@ -38,6 +48,17 @@ pub struct Mission {
     ring_t2: Vec3,
     theta_meco: f32,
     rate: f32, // rad/s
+}
+
+/// Live readout for the HUD.
+pub struct Telemetry {
+    pub phase: &'static str,
+    pub alt_km: f32,
+    pub speed: f32,
+    pub downrange_km: f32,
+    pub stage: usize,
+    /// peri x apo (km) once in the parking orbit.
+    pub orbit: Option<(f32, f32)>,
 }
 
 fn unit(r: DVec3, radius: f64) -> Vec3 {
@@ -64,7 +85,25 @@ impl Mission {
             .map(|s| (s.t as f32, unit(s.r, radius)))
             .collect();
 
+        let tel: Vec<(f32, f32, f32, f32, usize)> = res
+            .samples
+            .iter()
+            .map(|s| {
+                (
+                    s.t as f32,
+                    (s.alt / 1000.0) as f32,
+                    s.speed as f32,
+                    (s.downrange / 1000.0) as f32,
+                    s.stage,
+                )
+            })
+            .collect();
+
         let reached = res.reached_orbit;
+        let peri_km = ((res.final_orbit.rp - radius) / 1000.0) as f32;
+        let apo_km = ((res.final_orbit.ra - radius) / 1000.0) as f32;
+        let park_alt_km = ((res.final_orbit.ra - radius) / 1000.0) as f32;
+        let park_speed = circular_speed(body.mu, res.final_orbit.ra) as f32;
 
         // Build the parking-orbit ring in the orbital plane (perpendicular to h).
         let h = res.final_orbit.h_vec.normalize_or_zero();
@@ -120,11 +159,53 @@ impl Mission {
             spaceport_lon: SPACEPORT_LON_DEG.to_radians() as f32,
             pad_ring,
             meco_t,
+            vehicle: veh.name,
+            stage_count: veh.stages.len(),
+            tel,
+            park_alt_km,
+            park_speed,
+            peri_km,
+            apo_km,
             ring_radius,
             ring_t1: t1f,
             ring_t2: t2f,
             theta_meco,
             rate,
+        }
+    }
+
+    /// Live telemetry at mission time `clock` (only meaningful once launched).
+    pub fn telemetry(&self, launched: bool, clock: f32) -> Telemetry {
+        if !launched {
+            let stage = self.tel.first().map(|s| s.4).unwrap_or(0);
+            return Telemetry {
+                phase: "READY",
+                alt_km: 0.0,
+                speed: 0.0,
+                downrange_km: 0.0,
+                stage,
+                orbit: None,
+            };
+        }
+        if !self.reached || clock <= self.meco_t {
+            let (alt_km, speed, downrange_km, stage) = sample_tel(&self.tel, clock);
+            Telemetry {
+                phase: "ASCENT",
+                alt_km,
+                speed,
+                downrange_km,
+                stage,
+                orbit: None,
+            }
+        } else {
+            Telemetry {
+                phase: "ORBIT",
+                alt_km: self.park_alt_km,
+                speed: self.park_speed,
+                downrange_km: 0.0,
+                stage: self.stage_count.saturating_sub(1),
+                orbit: Some((self.peri_km, self.apo_km)),
+            }
         }
     }
 
@@ -142,6 +223,27 @@ impl Mission {
             self.ring_point(theta)
         }
     }
+}
+
+fn sample_tel(tel: &[(f32, f32, f32, f32, usize)], t: f32) -> (f32, f32, f32, usize) {
+    if tel.is_empty() {
+        return (0.0, 0.0, 0.0, 0);
+    }
+    let lerp = |a: f32, b: f32, f: f32| a + (b - a) * f;
+    if t <= tel[0].0 {
+        let s = tel[0];
+        return (s.1, s.2, s.3, s.4);
+    }
+    for w in tel.windows(2) {
+        let a = w[0];
+        let b = w[1];
+        if t <= b.0 {
+            let f = ((t - a.0) / (b.0 - a.0).max(1e-3)).clamp(0.0, 1.0);
+            return (lerp(a.1, b.1, f), lerp(a.2, b.2, f), lerp(a.3, b.3, f), a.4);
+        }
+    }
+    let s = *tel.last().unwrap();
+    (s.1, s.2, s.3, s.4)
 }
 
 fn sample_path(path: &[(f32, Vec3)], t: f32) -> Vec3 {

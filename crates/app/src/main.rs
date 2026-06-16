@@ -17,7 +17,9 @@ use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+mod hud;
 mod mission;
+use hud::Hud;
 use mission::Mission;
 
 #[repr(C)]
@@ -40,6 +42,7 @@ struct OverlayVertex {
 }
 
 const OVERLAY_CAP: u64 = 8192;
+const HUD_CAP: u64 = 40000;
 
 struct State {
     window: Arc<Window>,
@@ -52,6 +55,9 @@ struct State {
     bind_group: wgpu::BindGroup,
     overlay_pipeline: wgpu::RenderPipeline,
     overlay_buf: wgpu::Buffer,
+    hud_pipeline: wgpu::RenderPipeline,
+    hud_buf: wgpu::Buffer,
+    hud: Hud,
     start: instant_now::Instant,
     last_t: f32,
 
@@ -334,6 +340,59 @@ impl State {
             mapped_at_creation: false,
         });
 
+        // HUD: same vertices/shader as the overlay but a triangle list (the
+        // bitmap font emits a quad per lit pixel).
+        let hud_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("hud-pipeline"),
+            layout: Some(&overlay_layout),
+            vertex: wgpu::VertexState {
+                module: &overlay_shader,
+                entry_point: Some("vs"),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<OverlayVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x2,
+                            offset: 0,
+                            shader_location: 0,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x3,
+                            offset: 8,
+                            shader_location: 1,
+                        },
+                    ],
+                }],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &overlay_shader,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let hud_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hud-buf"),
+            size: HUD_CAP * std::mem::size_of::<OverlayVertex>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let mission = Mission::pioneer_from_spaceport();
 
         State {
@@ -347,6 +406,9 @@ impl State {
             bind_group,
             overlay_pipeline,
             overlay_buf,
+            hud_pipeline,
+            hud_buf,
+            hud: Hud::new(),
             start: instant_now::Instant::now(),
             last_t: 0.0,
             az: mission.spaceport_lon,
@@ -426,6 +488,14 @@ impl State {
                 .write_buffer(&self.overlay_buf, 0, bytemuck::cast_slice(&verts[..n]));
         }
 
+        // build + upload HUD text for this frame
+        let hud_verts = self.build_hud();
+        let hn = hud_verts.len().min(HUD_CAP as usize);
+        if hn > 0 {
+            self.queue
+                .write_buffer(&self.hud_buf, 0, bytemuck::cast_slice(&hud_verts[..hn]));
+        }
+
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
             | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
@@ -465,6 +535,11 @@ impl State {
                 pass.set_pipeline(&self.overlay_pipeline);
                 pass.set_vertex_buffer(0, self.overlay_buf.slice(..));
                 pass.draw(0..n as u32, 0..1);
+            }
+            if hn > 0 {
+                pass.set_pipeline(&self.hud_pipeline);
+                pass.set_vertex_buffer(0, self.hud_buf.slice(..));
+                pass.draw(0..hn as u32, 0..1);
             }
         }
         self.queue.submit(Some(encoder.finish()));
@@ -542,6 +617,71 @@ impl State {
                 out.push(OverlayVertex { pos: a, color: col });
                 out.push(OverlayVertex { pos: b, color: col });
             }
+        }
+
+        out
+    }
+
+    fn build_hud(&self) -> Vec<OverlayVertex> {
+        let res = (self.config.width as f32, self.config.height.max(1) as f32);
+        let mut out: Vec<OverlayVertex> = Vec::new();
+        let tel = self.mission.telemetry(self.launched, self.clock);
+
+        let dim = [0.55, 0.75, 0.85];
+        let val = [0.92, 0.96, 1.0];
+        let amber = [1.0, 0.78, 0.30];
+        let x = 16.0;
+        let step = hud::LINE_H;
+
+        // label/value row helper
+        let row = |out: &mut Vec<OverlayVertex>, label: &str, value: &str, y: f32| {
+            let cx = self.hud.text(out, label, x, y, dim, res);
+            self.hud.text(out, value, cx, y, val, res);
+        };
+
+        let mut y = 16.0;
+        self.hud.text(&mut out, self.mission.vehicle, x, y, amber, res);
+        y += step * 1.5;
+
+        let phase_col = match tel.phase {
+            "ASCENT" => [1.0, 0.55, 0.15],
+            "ORBIT" => [0.5, 0.9, 1.0],
+            _ => [0.5, 1.0, 0.5],
+        };
+        let cx = self.hud.text(&mut out, "PHASE    ", x, y, dim, res);
+        self.hud.text(&mut out, tel.phase, cx, y, phase_col, res);
+        y += step;
+
+        row(&mut out, "MET      ", &format!("T+{:.0}S", self.clock.max(0.0)), y);
+        y += step;
+        row(&mut out, "ALT      ", &format!("{:.1} KM", tel.alt_km), y);
+        y += step;
+        row(&mut out, "VEL      ", &format!("{:.0} M/S", tel.speed), y);
+        y += step;
+        if let Some((peri, apo)) = tel.orbit {
+            row(&mut out, "ORBIT    ", &format!("{:.0} X {:.0} KM", peri, apo), y);
+        } else {
+            row(&mut out, "RANGE    ", &format!("{:.0} KM", tel.downrange_km), y);
+        }
+        y += step;
+        row(
+            &mut out,
+            "STAGE    ",
+            &format!("{}/{}", tel.stage + 1, self.mission.stage_count),
+            y,
+        );
+        y += step;
+        row(&mut out, "WARP     ", &format!("{:.0}X", self.warp), y);
+
+        // controls hint, bottom-left
+        let mut hy = res.1 - step * 3.0 - 12.0;
+        for line in [
+            "SPACE LAUNCH/RESET",
+            "DRAG ORBIT   SCROLL ZOOM",
+            "[ ] TIME WARP",
+        ] {
+            self.hud.text(&mut out, line, x, hy, dim, res);
+            hy += step;
         }
 
         out
