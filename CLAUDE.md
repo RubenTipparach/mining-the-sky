@@ -14,6 +14,21 @@ Guidance for Claude Code when working in this repository.
 Mining the Sky is a realistic, to-scale, multiplayer hard-sci-fi space sim in
 Rust (WebGPU / wgpu). See docs/DESIGN.md for the full design.
 
+## UI
+
+Prefer a proper GUI toolkit over the bitmap-font / ASCII-terminal HUD that the
+prototype currently hand-draws as text quads. Rust has good options that
+integrate with wgpu + winit:
+
+- `egui` (immediate-mode) via `egui-wgpu` + `egui-winit` is the default choice
+  for in-game HUD, menus, body pickers, build/stage panels, and dev tools.
+- `iced` (Elm-style, retained) is the alternative if we want a more structured
+  app shell.
+
+New UI should be built with egui rather than more hand-rolled text-quad drawing,
+and the existing HUD/menus should migrate to egui as they grow. Keep UI code out
+of the render hot path (egui composits over the wgpu frame).
+
 ## Verifying rendering headlessly (software GPU)
 
 The cloud/CI environment has no physical GPU or display, but you can still run
