@@ -26,6 +26,11 @@ pub struct Mission {
 
     pub spaceport_lat: f32,
     pub spaceport_lon: f32,
+    /// A small ring on the surface marking the launch pad.
+    pub pad_ring: Vec<Vec3>,
+
+    /// Mission time of main-engine cutoff (the ascent/orbit boundary).
+    pub meco_t: f32,
 
     // parameters for coasting the marker along the ring after MECO
     ring_radius: f32,
@@ -33,7 +38,6 @@ pub struct Mission {
     ring_t2: Vec3,
     theta_meco: f32,
     rate: f32, // rad/s
-    meco_t: f32,
 }
 
 fn unit(r: DVec3, radius: f64) -> Vec3 {
@@ -82,6 +86,23 @@ impl Mission {
             Vec::new()
         };
 
+        // Launch-pad marker: a small ring on the surface around the spaceport.
+        let lat = SPACEPORT_LAT_DEG.to_radians();
+        let lon = SPACEPORT_LON_DEG.to_radians();
+        let up0 = Vec3::new(
+            (lat.cos() * lon.cos()) as f32,
+            lat.sin() as f32,
+            (lat.cos() * lon.sin()) as f32,
+        );
+        let east = Vec3::Y.cross(up0).normalize();
+        let north = up0.cross(east).normalize();
+        let pad_ring: Vec<Vec3> = (0..=48)
+            .map(|i| {
+                let a = i as f32 / 48.0 * std::f32::consts::TAU;
+                (up0 + 0.02 * (east * a.cos() + north * a.sin())).normalize()
+            })
+            .collect();
+
         let (theta_meco, rate, meco_t) = if let Some(m) = res.meco {
             let theta = (m.r.dot(t2)).atan2(m.r.dot(t1)) as f32;
             let v_circ = circular_speed(body.mu, res.final_orbit.ra);
@@ -97,12 +118,13 @@ impl Mission {
             reached,
             spaceport_lat: SPACEPORT_LAT_DEG.to_radians() as f32,
             spaceport_lon: SPACEPORT_LON_DEG.to_radians() as f32,
+            pad_ring,
+            meco_t,
             ring_radius,
             ring_t1: t1f,
             ring_t2: t2f,
             theta_meco,
             rate,
-            meco_t,
         }
     }
 

@@ -500,6 +500,9 @@ impl State {
             }
         };
 
+        // launch-pad marker on the surface
+        polyline(&self.mission.pad_ring, [0.9, 0.6, 0.2], &mut out);
+
         // predicted parking orbit ring (drawn first, dim)
         if self.mission.reached {
             polyline(&self.mission.ring, [0.25, 0.7, 0.45], &mut out);
@@ -518,12 +521,19 @@ impl State {
             .collect();
         polyline(&flown, [0.45, 0.9, 1.0], &mut out);
 
-        // rocket marker: a small screen-space diamond at its current position
+        // rocket marker: a small screen-space diamond at its current position,
+        // coloured by flight phase (pad -> powered ascent -> orbit).
         let rp = self.mission.rocket_pos(if self.launched { self.clock } else { 0.0 });
         if let Some(c) = Self::project(rp, rt, aspect, scale) {
             let off = 0.022f32;
             let ox = off / aspect;
-            let col = [1.0, 0.85, 0.25];
+            let col = if !self.launched {
+                [0.4, 1.0, 0.4] // on the pad
+            } else if self.clock <= self.mission.meco_t {
+                [1.0, 0.55, 0.15] // powered ascent
+            } else {
+                [0.5, 0.9, 1.0] // in orbit
+            };
             let top = [c[0], c[1] + off];
             let right = [c[0] + ox, c[1]];
             let bot = [c[0], c[1] - off];
