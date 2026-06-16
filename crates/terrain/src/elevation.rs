@@ -9,6 +9,16 @@
 use glam::DVec3;
 use noise::{Fbm, MultiFractal, NoiseFn, Perlin};
 
+/// A region flattened toward a target height (launch pad, city sites). `inner`
+/// and `outer` are angular radii (radians); fully flat within inner, blending
+/// out to natural terrain by outer.
+struct FlatZone {
+    dir: DVec3,
+    inner: f64,
+    outer: f64,
+    target: f64,
+}
+
 pub struct Elevation {
     // macro field (matches worldgen::planet::generate_elevation)
     continents: Fbm<Perlin>,
@@ -16,11 +26,18 @@ pub struct Elevation {
     warp: Fbm<Perlin>,
     // close-up relief
     mountains: Fbm<Perlin>,
+    hills: Fbm<Perlin>,
     fine: Fbm<Perlin>,
     /// Sea level in the raw noise domain (matches the map's land fraction).
     sea: f64,
     /// Vertical scale: raw noise unit -> metres.
     relief_m: f64,
+    flat_zones: Vec<FlatZone>,
+}
+
+fn smoothstep(e0: f64, e1: f64, x: f64) -> f64 {
+    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 #[allow(dead_code)]
@@ -55,6 +72,11 @@ impl Elevation {
             .set_frequency(5.0)
             .set_persistence(0.5)
             .set_lacunarity(2.3);
+        let hills = Fbm::<Perlin>::new(seed.wrapping_add(909))
+            .set_octaves(6)
+            .set_frequency(11.0)
+            .set_persistence(0.5)
+            .set_lacunarity(2.2);
         let fine = Fbm::<Perlin>::new(seed.wrapping_add(1313))
             .set_octaves(7)
             .set_frequency(30.0)
@@ -66,13 +88,28 @@ impl Elevation {
             detail,
             warp,
             mountains,
+            hills,
             fine,
             // Match worldgen's seed-47 sea level exactly (its preview prints
             // 0.070) so the coastline aligns with the baked map and the coastal
             // spaceport reads as land, not water.
             sea: 0.070,
             relief_m: 9000.0,
+            flat_zones: Vec::new(),
         }
+    }
+
+    /// Flatten a circular region (e.g. the launch pad or a city) to its natural
+    /// centre height. `inner_m`/`outer_m` are surface radii in metres.
+    pub fn add_flat_zone(&mut self, dir: DVec3, inner_m: f64, outer_m: f64, planet_radius: f64) {
+        let d = dir.normalize();
+        let target = self.base_height(d);
+        self.flat_zones.push(FlatZone {
+            dir: d,
+            inner: inner_m / planet_radius,
+            outer: outer_m / planet_radius,
+            target,
+        });
     }
 
     /// The raw macro field value (matches worldgen exactly).
@@ -94,17 +131,32 @@ impl Elevation {
         v[idx]
     }
 
-    /// Signed elevation in metres relative to sea level (negative = sea floor).
-    pub fn height_m(&self, dir: DVec3) -> f64 {
+    /// Natural elevation (metres, signed) before any flatten zones.
+    fn base_height(&self, dir: DVec3) -> f64 {
         let d = dir.normalize();
         let above = self.raw(d) - self.sea;
         let land = above.max(0.0);
-        // ridged mountains, gated to land and stronger inland
+        // ridged mountains, gated to land and much stronger inland
         let m = 1.0 - self.mountains.get([d.x * 5.0, d.y * 5.0, d.z * 5.0]).abs();
-        let ridges = m * m * land * 1.7;
+        let ridges = m * m * land * 2.6;
+        // rolling hills across the land, growing away from the coast
+        let hills = self.hills.get([d.x * 11.0, d.y * 11.0, d.z * 11.0]) * land.sqrt() * 0.12;
         // fine roughness everywhere
         let fine = self.fine.get([d.x, d.y, d.z]) * 0.05;
-        (above + ridges + fine) * self.relief_m
+        (above + ridges + hills + fine) * self.relief_m
+    }
+
+    /// Signed elevation in metres relative to sea level (negative = sea floor),
+    /// with flatten zones (pad / cities) applied.
+    pub fn height_m(&self, dir: DVec3) -> f64 {
+        let d = dir.normalize();
+        let mut h = self.base_height(d);
+        for z in &self.flat_zones {
+            let ang = d.dot(z.dir).clamp(-1.0, 1.0).acos();
+            let t = 1.0 - smoothstep(z.inner, z.outer, ang); // 1 inside, 0 outside
+            h += (z.target - h) * t;
+        }
+        h
     }
 
     /// Clamped land height (>= 0) for displacing the visible surface.

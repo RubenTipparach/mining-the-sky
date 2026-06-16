@@ -264,11 +264,22 @@ fn terrain_color(signed_h: f64, slope: f32, jitter: f32) -> [f32; 3] {
 /// the surface point so the rocket (built at y=0) sits on it.
 pub fn build_terrain() -> Mesh {
     let planet = Planet { radius: 6.2e6 };
-    let elev = Elevation::new(47);
+    let mut elev = Elevation::new(47);
 
-    let lat = SPACEPORT_LAT_DEG.to_radians();
-    let lon = SPACEPORT_LON_DEG.to_radians();
+    // Location override (lat,lon degrees) via env, else the spaceport. Lets us
+    // verify terrain relief at a mountainous spot without recompiling.
+    let (lat_deg, lon_deg) = std::env::var("MTS_TERRAIN_LATLON")
+        .ok()
+        .and_then(|s| {
+            let mut it = s.split(',');
+            Some((it.next()?.trim().parse().ok()?, it.next()?.trim().parse().ok()?))
+        })
+        .unwrap_or((SPACEPORT_LAT_DEG, SPACEPORT_LON_DEG));
+    let lat = (lat_deg as f64).to_radians();
+    let lon = (lon_deg as f64).to_radians();
     let dir = DVec3::new(lat.cos() * lon.cos(), lat.sin(), lat.cos() * lon.sin()).normalize();
+    // Keep the launch pad area flat.
+    elev.add_flat_zone(dir, 2500.0, 8000.0, planet.radius);
     let h0 = elev.land_height_m(dir);
     let origin = dir * (planet.radius + h0);
 
@@ -280,6 +291,27 @@ pub fn build_terrain() -> Mesh {
         let d = w - origin;
         Vec3::new(d.dot(east) as f32, d.dot(up) as f32, d.dot(north) as f32)
     };
+
+    // DEBUG: global highest-elevation point (to prove terrain has height).
+    {
+        let mut best = (0.0f64, 0.0f64, f64::MIN);
+        let mut la = -80.0;
+        while la <= 80.0 {
+            let mut lo = -180.0;
+            while lo <= 180.0 {
+                let llat = (la as f64).to_radians();
+                let llon = (lo as f64).to_radians();
+                let d = DVec3::new(llat.cos() * llon.cos(), llat.sin(), llat.cos() * llon.sin());
+                let h = elev.height_m(d.normalize());
+                if h > best.2 {
+                    best = (la, lo, h);
+                }
+                lo += 3.0;
+            }
+            la += 3.0;
+        }
+        eprintln!("[terrain] global max elevation {:.0} m at lat {:.1} lon {:.1}", best.2, best.0, best.1);
+    }
 
     // Finer LOD: select as if the camera sits ~60 m over the pad.
     let cam = origin + up * 60.0;

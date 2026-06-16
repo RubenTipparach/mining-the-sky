@@ -139,6 +139,14 @@ enum View {
     Rocket,
 }
 
+/// What the orbital (system) view is centred on.
+#[derive(Clone, Copy, PartialEq)]
+enum Focus {
+    Home,
+    Moon,
+    Pair,
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct MeshUniforms {
@@ -230,6 +238,8 @@ struct World {
     rocket_el: f32,
     rocket_dist: f32,
     rocket_focus_y: f32,
+
+    sys_target: Focus,
 }
 
 impl World {
@@ -278,6 +288,43 @@ impl World {
             rocket_el: 0.12,
             rocket_dist: rocket_frame.1,
             rocket_focus_y: rocket_frame.0,
+            sys_target: Focus::Pair,
+        }
+    }
+
+    /// Cycle the orbital-view focus and reframe the camera onto it.
+    fn cycle_focus(&mut self) {
+        self.sys_target = match self.sys_target {
+            Focus::Home => Focus::Moon,
+            Focus::Moon => Focus::Pair,
+            Focus::Pair => Focus::Home,
+        };
+        self.apply_focus();
+    }
+
+    /// Point the orbital camera at the current focus body (or pair) and frame it.
+    fn apply_focus(&mut self) {
+        match self.sys_target {
+            Focus::Home => {
+                self.sys_focus = Vec3::ZERO;
+                self.sys_dist = self.home_radius_mm * 4.0;
+            }
+            Focus::Moon => {
+                self.sys_focus = self.moon_center_mm;
+                self.sys_dist = self.moon_radius_mm * 6.0;
+            }
+            Focus::Pair => {
+                self.sys_focus = self.moon_center_mm * 0.5;
+                self.sys_dist = self.moon_center_mm.length() * 1.25 + self.home_radius_mm;
+            }
+        }
+    }
+
+    fn focus_label(&self) -> &'static str {
+        match self.sys_target {
+            Focus::Home => "HOME",
+            Focus::Moon => "MOON",
+            Focus::Pair => "HOME + MOON",
         }
     }
 
@@ -741,8 +788,12 @@ impl World {
         };
 
         let mut y = 16.0;
-        hud.text(&mut out, "SYSTEM MAP", x, y, amber, res);
+        hud.text(&mut out, "ORBITAL MAP", x, y, amber, res);
         y += step * 1.5;
+
+        let cx = hud.text(&mut out, "CENTER   ", x, y, dim, res);
+        hud.text(&mut out, self.focus_label(), cx, y, [0.6, 0.9, 1.0], res);
+        y += step;
 
         let moon_dist = self.moon_center_mm.length();
         row(&mut out, "HOME     ", &format!("R {:.0} KM", self.home_radius_mm * 1000.0), y);
@@ -782,8 +833,13 @@ impl World {
             }
         }
 
-        let mut hy = res.1 - step * 3.0 - 12.0;
-        for line in ["V  BACK TO SURFACE", "F  MANUAL CONTROL", "DRAG ORBIT   SCROLL ZOOM"] {
+        let mut hy = res.1 - step * 4.0 - 12.0;
+        for line in [
+            "C  CENTER ON BODY / PAIR",
+            "DRAG ORBIT   SCROLL ZOOM",
+            "TAB VIEW   F MANUAL",
+            "[ ] TIME WARP",
+        ] {
             hud.text(&mut out, line, x, hy, dim, res);
             hy += step;
         }
@@ -1969,7 +2025,7 @@ impl ApplicationHandler<UserEvent> for App {
                             state.world.sys_el = (state.world.sys_el + dy * 0.005).clamp(-1.5, 1.5);
                         }
                         View::Rocket => {
-                            state.world.rocket_az -= dx * 0.006;
+                            state.world.rocket_az += dx * 0.006;
                             state.world.rocket_el =
                                 (state.world.rocket_el + dy * 0.006).clamp(-0.2, 1.4);
                         }
@@ -1989,7 +2045,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     View::System => {
                         state.world.sys_dist =
-                            (state.world.sys_dist * (1.0 - dy * 0.12)).clamp(15.0, 600.0);
+                            (state.world.sys_dist * (1.0 - dy * 0.12)).clamp(2.0, 40000.0);
                     }
                     View::Rocket => {
                         state.world.rocket_dist =
@@ -2015,6 +2071,9 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     match code {
                         KeyCode::Tab | KeyCode::KeyV => state.world.toggle_view(),
+                        KeyCode::KeyC if state.world.view == View::System => {
+                            state.world.cycle_focus()
+                        }
                         KeyCode::KeyF => state.world.toggle_flight(),
                         KeyCode::Space if state.world.flight.is_none() => {
                             state.world.toggle_launch()
