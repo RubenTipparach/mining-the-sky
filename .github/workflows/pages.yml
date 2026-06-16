@@ -1,12 +1,11 @@
 name: Deploy WebGPU client to GitHub Pages
 
 # Builds the `app` crate to WebAssembly with Trunk and publishes it to GitHub
-# Pages, the same idea as the Caelum web build. Runs on pushes to the default
-# branch and can be triggered manually.
+# Pages (same idea as the Caelum web build). Triggers on every push to any
+# branch, plus manual runs. Whichever commit pushed last updates the live site.
 
 on:
   push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -14,7 +13,7 @@ permissions:
   pages: write
   id-token: write
 
-# Allow one concurrent deployment; cancel in-progress runs of this workflow.
+# One deployment at a time; newer pushes cancel an in-progress run.
 concurrency:
   group: pages
   cancel-in-progress: true
@@ -38,6 +37,13 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-wasm-${{ hashFiles('**/Cargo.lock') }}
+
+      # Enables Pages via the API if it is not already on, so no manual toggle
+      # is needed (requires Pages to be permitted for the repo).
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
 
       - name: Install Trunk
         uses: jetli/trunk-action@v0.5.0
