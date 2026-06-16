@@ -27,6 +27,83 @@ const EDGES: [[usize; 2]; 12] = [
 /// Extract a mesh from `f` over a grid of `dim` sample points per axis, with
 /// spacing `cell` (world units) starting at `origin`.
 pub fn surface_nets<F: Fn(Vec3) -> f32>(f: &F, origin: Vec3, cell: f32, dim: usize) -> Mesh {
+    let (mesh, _cell_vert) = mesh_core(f, origin, cell, dim);
+    mesh
+}
+
+/// Like `surface_nets`, but adds downward skirts along the four vertical
+/// boundary faces of the chunk so neighbouring octree leaves of a different LOD
+/// can never show a crack. The terrain field is monotone in radius (a
+/// heightfield in disguise), so vertically-stacked leaves are pruned and only
+/// the four side faces ever abut a coarser/finer neighbour. Each side gets a
+/// curtain that drops `skirt_len` along `down`, hidden under the surface.
+pub fn surface_nets_skirted<F: Fn(Vec3) -> f32>(
+    f: &F,
+    origin: Vec3,
+    cell: f32,
+    dim: usize,
+    down: Vec3,
+    skirt_len: f32,
+) -> Mesh {
+    let n = dim;
+    let (mut mesh, cell_vert) = mesh_core(f, origin, cell, dim);
+    if n < 2 {
+        return mesh;
+    }
+    let idx = |x: usize, y: usize, z: usize| (x * n + y) * n + z;
+    let drop = down * skirt_len;
+
+    // The surface vertex of the boundary column at the given face cell, scanning
+    // the vertical (y) axis. For a heightfield there is exactly one per column.
+    let col = |fixed_axis: usize, fixed: usize, t: usize| -> u32 {
+        for y in 0..n - 1 {
+            let (x, yy, z) = match fixed_axis {
+                0 => (fixed, y, t),
+                _ => (t, y, fixed),
+            };
+            let v = cell_vert[idx(x, yy, z)];
+            if v != u32::MAX {
+                return v;
+            }
+        }
+        u32::MAX
+    };
+
+    let mut skirt = |mesh: &mut Mesh, a: u32, b: u32| {
+        if a == u32::MAX || b == u32::MAX {
+            return;
+        }
+        let pa = mesh.positions[a as usize];
+        let pb = mesh.positions[b as usize];
+        let nrm = (pb - pa).cross(drop).normalize_or_zero();
+        let base = mesh.positions.len() as u32;
+        for p in [pa, pb, pb + drop, pa + drop] {
+            mesh.positions.push(p);
+            mesh.normals.push(nrm);
+        }
+        mesh.indices
+            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    };
+
+    // x=0 and x=n-2 faces, stitched along z; z=0 and z=n-2 faces, along x.
+    for &face in &[0usize, n - 2] {
+        for t in 0..n - 2 {
+            skirt(&mut mesh, col(0, face, t), col(0, face, t + 1));
+            skirt(&mut mesh, col(2, face, t), col(2, face, t + 1));
+        }
+    }
+    mesh
+}
+
+/// Shared Surface Nets core: returns the mesh plus the per-cell vertex index
+/// table (`u32::MAX` where a cell has no surface vertex), which the skirted
+/// variant needs to find boundary columns.
+fn mesh_core<F: Fn(Vec3) -> f32>(
+    f: &F,
+    origin: Vec3,
+    cell: f32,
+    dim: usize,
+) -> (Mesh, Vec<u32>) {
     let n = dim;
     let idx = |x: usize, y: usize, z: usize| (x * n + y) * n + z;
     let pos_of = |x: usize, y: usize, z: usize| {
@@ -158,7 +235,7 @@ pub fn surface_nets<F: Fn(Vec3) -> f32>(f: &F, origin: Vec3, cell: f32, dim: usi
         }
     }
 
-    Mesh { positions, normals, indices }
+    (Mesh { positions, normals, indices }, cell_vert)
 }
 
 fn uf_find(parent: &mut [u32], mut x: u32) -> u32 {

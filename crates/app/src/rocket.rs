@@ -211,7 +211,9 @@ pub fn scene() -> Scene {
 // ---------------------------------------------------------------------------
 
 use glam::DVec3;
-use terrain::{build_mesh, select, Elevation, Planet};
+use terrain::octree::select as octree_select;
+use terrain::surfacenets::surface_nets_skirted;
+use terrain::{Elevation, Planet};
 
 /// Spaceport (matches sim / worldgen seed 47).
 const SPACEPORT_LAT_DEG: f64 = -1.7;
@@ -257,9 +259,16 @@ fn terrain_color(signed_h: f64, slope: f32, jitter: f32, abs_lat: f64) -> [f32; 
     [base[0] * b, base[1] * b, base[2] * b]
 }
 
-/// Build the planet LOD terrain around the spaceport, in the rocket view's
-/// local tangent frame (metres, +Y up). Returns the mesh; the local origin is
-/// the surface point so the rocket (built at y=0) sits on it.
+/// Build the planet terrain around the spaceport as an octree dual-contouring
+/// mesh, in the rocket view's local tangent frame (metres, +Y up). The octree
+/// refines toward the pad and coarsens to the horizon; each surface-bearing
+/// leaf is meshed with Surface Nets and skirted so LOD seams are crack-free.
+///
+/// The iso-surface is the real planet SDF: signed distance to the displaced
+/// sea-level sphere, `|world_p| - (radius + land_height(dir))`. The subtraction
+/// is done in f64 (both terms ~6.2e6 m) to dodge the catastrophic cancellation
+/// that an f32 local-space SDF would suffer; the resulting density is metre-
+/// scale, so the octree/mesh run in f32 local coordinates (floating origin).
 pub fn build_terrain() -> Mesh {
     let planet = Planet { radius: 6.2e6 };
     let mut elev = Elevation::new(47);
@@ -276,8 +285,11 @@ pub fn build_terrain() -> Mesh {
     let lat = (lat_deg as f64).to_radians();
     let lon = (lon_deg as f64).to_radians();
     let dir = DVec3::new(lat.cos() * lon.cos(), lat.sin(), lat.cos() * lon.sin()).normalize();
-    // Keep the launch pad area flat.
-    elev.add_flat_zone(dir, 2500.0, 8000.0, planet.radius);
+    // Keep the launch pad area flat. MTS_TERRAIN_NOFLAT skips this so the raw
+    // relief is visible right at the pad (terrain/seam verification only).
+    if std::env::var("MTS_TERRAIN_NOFLAT").is_err() {
+        elev.add_flat_zone(dir, 2500.0, 8000.0, planet.radius);
+    }
     let h0 = elev.land_height_m(dir);
     let origin = dir * (planet.radius + h0);
 
@@ -285,32 +297,50 @@ pub fn build_terrain() -> Mesh {
     let up = dir;
     let north = (DVec3::Y - up * up.dot(DVec3::Y)).normalize();
     let east = north.cross(up).normalize();
-    let to_local = |w: DVec3| -> Vec3 {
-        let d = w - origin;
-        Vec3::new(d.dot(east) as f32, d.dot(up) as f32, d.dot(north) as f32)
+    let to_world = |p: Vec3| -> DVec3 {
+        origin + east * p.x as f64 + up * p.y as f64 + north * p.z as f64
     };
 
-    // Finer LOD: select as if the camera sits ~60 m over the pad.
-    let cam = origin + up * 60.0;
-    let lod = select(&planet, cam, 1.4, 18);
+    // Planet SDF in local metres: positive above the surface, negative below.
+    let radius = planet.radius;
+    let density = |p: Vec3| -> f32 {
+        let w = to_world(p);
+        let r = w.length();
+        let surf = radius + elev.land_height_m(w / r);
+        (r - surf) as f32
+    };
+
+    // A cube region centred on the pad, wide enough to reach past the flat pad
+    // zone so distant relief rises to the horizon. The surface (heightfield-
+    // monotone in radius) only threads a thin band, so the octree prunes most of
+    // the cube; it refines near the pad-height camera and coarsens to the edges.
+    let region = 16000.0f32;
+    let region_min = Vec3::new(-region * 0.5, -region * 0.5, -region * 0.5);
+    let cam = Vec3::new(0.0, 60.0, 0.0);
+    let leaves = octree_select(&density, cam, region_min, region, 1.6, 8);
 
     let mut m = Mesh::default();
-    let n = 9;
-    for patch in &lod.patches {
-        let pm = build_mesh(&planet, patch, n, &elev, 120.0);
-        for tri in pm.indices.chunks(3) {
-            let w0 = pm.positions[tri[0] as usize];
-            let w1 = pm.positions[tri[1] as usize];
-            let w2 = pm.positions[tri[2] as usize];
-            let a = to_local(w0);
-            let b = to_local(w1);
-            let c = to_local(w2);
+    let leaf_n = 12usize;
+    for l in &leaves {
+        let cell = l.size / (leaf_n as f32 - 1.0);
+        // Mesh a one-cell apron beyond the leaf box on every side. A Surface Nets
+        // vertex sits ~half a cell inside its grid, so without the apron each leaf
+        // surface stops half a cell short of its edge and equal-LOD neighbours
+        // leave a ~1-cell trench. The apron makes neighbours overlap so their
+        // surfaces coincide; the skirt then only has to hide the residual step at
+        // an actual LOD (fine/coarse) boundary.
+        let origin = l.min - Vec3::splat(cell);
+        let lm = surface_nets_skirted(&density, origin, cell, leaf_n + 2, Vec3::NEG_Y, l.size);
+        for tri in lm.indices.chunks(3) {
+            let a = lm.positions[tri[0] as usize];
+            let b = lm.positions[tri[1] as usize];
+            let c = lm.positions[tri[2] as usize];
             let mut nrm = (b - a).cross(c - a).normalize_or_zero();
             if nrm.y < 0.0 {
                 nrm = -nrm; // terrain faces up
             }
-            let centroid = (w0 + w1 + w2) / 3.0;
-            let cdir = centroid.normalize();
+            // Colour by the real (signed) elevation at the triangle's direction.
+            let cdir = to_world((a + b + c) / 3.0).normalize();
             let slope = 1.0 - nrm.y;
             let abs_lat = cdir.y.clamp(-1.0, 1.0).asin().abs();
             let col = terrain_color(elev.height_m(cdir), slope, hashf(a), abs_lat);

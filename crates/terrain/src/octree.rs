@@ -1,8 +1,9 @@
 //! Chunked octree LOD for dual-contouring terrain. Nodes subdivide where they
 //! are near the camera AND contain the iso-surface (empty space is skipped), so
 //! the leaf chunks are fine near the viewer and coarse far away. Each leaf is
-//! then meshed independently with Surface Nets - the practical octree-DC LOD
-//! scheme (seam stitching between levels is the follow-up).
+//! then meshed independently with Surface Nets, with a one-cell apron so equal-
+//! LOD neighbours overlap and downward skirts (see `surfacenets::
+//! surface_nets_skirted`) so LOD-boundary seams are crack-free.
 
 use glam::Vec3;
 
