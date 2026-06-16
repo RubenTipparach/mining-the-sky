@@ -231,7 +231,8 @@ struct World {
     universe: Universe,
     /// Indices into `universe.bodies` of the navigable bodies (stars + planets).
     nav: Vec<usize>,
-    focus_idx: usize,
+    /// Index (into `universe.bodies`) of the focused body.
+    focus: usize,
 }
 
 impl World {
@@ -280,7 +281,7 @@ impl World {
             rocket_focus_y: rocket_frame.0,
             universe: Universe { bodies: Vec::new() },
             nav: Vec::new(),
-            focus_idx: 0,
+            focus: 0,
         };
         // Generate the full Kepler-47 system; the landable moon is injected as
         // home's first moon so the map and the flight sim agree.
@@ -293,19 +294,15 @@ impl World {
             .filter(|(_, b)| matches!(b.kind, Kind::StarA | Kind::StarB | Kind::Planet))
             .map(|(i, _)| i)
             .collect();
-        // default focus: the home world
-        w.focus_idx = w
-            .nav
-            .iter()
-            .position(|&i| w.universe.bodies[i].is_home)
-            .unwrap_or(0);
+        // default focus: the home world (body index)
+        w.focus = w.universe.home_index();
         w.apply_focus();
         w
     }
 
     /// The currently focused body.
     fn focus_body(&self) -> &Body {
-        &self.universe.bodies[self.nav[self.focus_idx]]
+        &self.universe.bodies[self.focus]
     }
 
     fn focus_label(&self) -> &str {
@@ -317,37 +314,57 @@ impl World {
         (res.0 - 170.0, 40.0, hud::LINE_H * 1.35)
     }
 
-    /// Map a click position to a body menu entry (index into `nav`), if any.
+    /// Map a click on the body menu to a body index, if any.
     fn map_menu_pick(&self, res: (f32, f32), cx: f32, cy: f32) -> Option<usize> {
         let (mx, my0, mdy) = Self::map_menu_layout(res);
         if cx < mx - 8.0 || cx > mx + 160.0 {
             return None;
         }
-        for i in 0..self.nav.len() {
+        for (i, &bi) in self.nav.iter().enumerate() {
             let yy = my0 + i as f32 * mdy;
             if cy >= yy - 2.0 && cy <= yy + hud::LINE_H + 2.0 {
-                return Some(i);
+                return Some(bi);
             }
         }
         None
     }
 
-    /// Cycle the orbital-map focus and reframe the camera onto it.
-    fn cycle_focus(&mut self) {
-        self.set_focus((self.focus_idx + 1) % self.nav.len());
+    /// Pick the nearest body to a screen position (any body, incl. moons /
+    /// asteroids / comets). Returns its body index.
+    fn pick_body(&self, res: (f32, f32), cx: f32, cy: f32) -> Option<usize> {
+        let cam = self.system_camera(res.0 / res.1.max(1.0));
+        let ndc = [cx / res.0 * 2.0 - 1.0, 1.0 - cy / res.1 * 2.0];
+        let mut best = None;
+        let mut best_d = 0.05f32; // clip-space threshold
+        for i in 0..self.universe.bodies.len() {
+            if let Some(c) = cam.project(self.universe.position(i, self.sys_time)) {
+                let d = ((c[0] - ndc[0]).powi(2) + (c[1] - ndc[1]).powi(2)).sqrt();
+                if d < best_d {
+                    best_d = d;
+                    best = Some(i);
+                }
+            }
+        }
+        best
     }
 
-    fn set_focus(&mut self, idx: usize) {
-        if idx < self.nav.len() {
-            self.focus_idx = idx;
+    /// Cycle the orbital-map focus through the navigable bodies.
+    fn cycle_focus(&mut self) {
+        let cur = self.nav.iter().position(|&i| i == self.focus).unwrap_or(0);
+        let next = self.nav[(cur + 1) % self.nav.len()];
+        self.set_focus(next);
+    }
+
+    fn set_focus(&mut self, body_idx: usize) {
+        if body_idx < self.universe.bodies.len() {
+            self.focus = body_idx;
             self.apply_focus();
         }
     }
 
-    /// Point the orbital camera at the current focus body and frame it.
     /// World position of the focused body at the current sim time.
     fn focus_pos(&self) -> DVec3 {
-        self.universe.position(self.nav[self.focus_idx], self.sys_time)
+        self.universe.position(self.focus, self.sys_time)
     }
 
     fn apply_focus(&mut self) {
@@ -903,7 +920,7 @@ impl World {
         for (i, &bi) in self.nav.iter().enumerate() {
             let b = &self.universe.bodies[bi];
             let yy = my0 + i as f32 * mdy;
-            let col = if i == self.focus_idx { [1.0, 0.9, 0.4] } else { dim };
+            let col = if bi == self.focus { [1.0, 0.9, 0.4] } else { dim };
             let tag = if i < 9 { format!("{}", i + 1) } else { "-".into() };
             hud.text(&mut out, &format!("{}  {}", tag, b.name), mx, yy, col, res);
         }
@@ -1995,12 +2012,15 @@ impl ApplicationHandler<UserEvent> for App {
                     // not start an orbit drag).
                     if pressed && state.world.view == View::Map {
                         let res = (state.config.width as f32, state.config.height as f32);
-                        if let Some(f) = state.world.map_menu_pick(
-                            res,
-                            state.last_cursor.0 as f32,
-                            state.last_cursor.1 as f32,
-                        ) {
-                            state.world.set_focus(f);
+                        let (cx, cy) = (state.last_cursor.0 as f32, state.last_cursor.1 as f32);
+                        // a click on the menu, or on any body in the scene, jumps
+                        // focus (and does not start an orbit drag).
+                        if let Some(b) = state
+                            .world
+                            .map_menu_pick(res, cx, cy)
+                            .or_else(|| state.world.pick_body(res, cx, cy))
+                        {
+                            state.world.set_focus(b);
                             return;
                         }
                     }
@@ -2097,7 +2117,9 @@ impl ApplicationHandler<UserEvent> for App {
                             // In the map (no manual flight), number keys jump to
                             // a body; in flight they select the thrust mode.
                             if state.world.view == View::Map && state.world.flight.is_none() {
-                                state.world.set_focus(idx);
+                                if let Some(&bi) = state.world.nav.get(idx) {
+                                    state.world.set_focus(bi);
+                                }
                             } else if let Some(c) = state.world.flight.as_mut() {
                                 c.mode = match idx {
                                     0 => Mode::Prograde,
