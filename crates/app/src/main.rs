@@ -17,10 +17,13 @@ use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+mod flight;
 mod hud;
 mod mission;
+use flight::{Craft, Mode};
 use hud::Hud;
 use mission::Mission;
+use sim::body::CentralBody;
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -63,6 +66,8 @@ struct State {
 
     // mission + camera + flight state
     mission: Mission,
+    body: CentralBody,
+    flight: Option<Craft>,
     az: f32,
     el: f32,
     scale: f32,
@@ -418,9 +423,26 @@ impl State {
             clock: 0.0,
             warp: 8.0,
             mission,
+            body: CentralBody::home(),
+            flight: None,
             dragging: false,
             last_cursor: (0.0, 0.0),
         }
+    }
+
+    /// Take or release manual control of the craft.
+    fn toggle_flight(&mut self) {
+        if self.flight.is_some() {
+            self.flight = None;
+            return;
+        }
+        let (r, v) = if self.launched && self.mission.reached && self.clock > self.mission.meco_t {
+            self.mission.orbit_state_at(self.clock)
+        } else {
+            self.mission.pad_state()
+        };
+        self.flight = Some(Craft::maneuvering(r, v));
+        log::info!("Manual flight control engaged");
     }
 
     fn resize(&mut self, width: u32, height: u32) {
@@ -456,7 +478,11 @@ impl State {
         let t = self.start.elapsed().as_secs_f32();
         let frame_dt = (t - self.last_t).clamp(0.0, 0.1);
         self.last_t = t;
-        if self.launched {
+        if let Some(craft) = self.flight.as_mut() {
+            // manual flight integrates live; cap warp so control stays sane
+            let dt_sim = frame_dt * self.warp.min(8.0);
+            craft.integrate(&self.body, dt_sim as f64);
+        } else if self.launched {
             self.clock += frame_dt * self.warp;
         }
 
@@ -578,30 +604,34 @@ impl State {
         // launch-pad marker on the surface
         polyline(&self.mission.pad_ring, [0.9, 0.6, 0.2], &mut out);
 
-        // predicted parking orbit ring (drawn first, dim)
-        if self.mission.reached {
-            polyline(&self.mission.ring, [0.25, 0.7, 0.45], &mut out);
-        }
+        let (marker_pos, marker_col) = if let Some(craft) = self.flight.as_ref() {
+            // manual flight: live predicted conic + craft marker
+            let pred = craft.predicted_orbit(&self.body);
+            polyline(&pred, [0.5, 0.55, 0.25], &mut out);
+            let col = if craft.crashed {
+                [1.0, 0.25, 0.2]
+            } else if craft.landed {
+                [0.4, 1.0, 0.5]
+            } else {
+                [1.0, 0.85, 0.25]
+            };
+            (craft.marker(&self.body), col)
+        } else {
+            // scripted launch overlay
+            if self.mission.reached {
+                polyline(&self.mission.ring, [0.25, 0.7, 0.45], &mut out);
+            }
+            let path_pts: Vec<Vec3> = self.mission.path.iter().map(|(_, p)| *p).collect();
+            polyline(&path_pts, [0.20, 0.45, 0.55], &mut out);
+            let flown: Vec<Vec3> = self
+                .mission
+                .path
+                .iter()
+                .filter(|(t, _)| *t <= self.clock)
+                .map(|(_, p)| *p)
+                .collect();
+            polyline(&flown, [0.45, 0.9, 1.0], &mut out);
 
-        // predicted full ascent (dim), then the flown portion (bright)
-        let path_pts: Vec<Vec3> = self.mission.path.iter().map(|(_, p)| *p).collect();
-        polyline(&path_pts, [0.20, 0.45, 0.55], &mut out);
-
-        let flown: Vec<Vec3> = self
-            .mission
-            .path
-            .iter()
-            .filter(|(t, _)| *t <= self.clock)
-            .map(|(_, p)| *p)
-            .collect();
-        polyline(&flown, [0.45, 0.9, 1.0], &mut out);
-
-        // rocket marker: a small screen-space diamond at its current position,
-        // coloured by flight phase (pad -> powered ascent -> orbit).
-        let rp = self.mission.rocket_pos(if self.launched { self.clock } else { 0.0 });
-        if let Some(c) = Self::project(rp, rt, aspect, scale) {
-            let off = 0.022f32;
-            let ox = off / aspect;
             let col = if !self.launched {
                 [0.4, 1.0, 0.4] // on the pad
             } else if self.clock <= self.mission.meco_t {
@@ -609,13 +639,21 @@ impl State {
             } else {
                 [0.5, 0.9, 1.0] // in orbit
             };
+            let rp = self.mission.rocket_pos(if self.launched { self.clock } else { 0.0 });
+            (rp, col)
+        };
+
+        // rocket marker: a small screen-space diamond at its current position
+        if let Some(c) = Self::project(marker_pos, rt, aspect, scale) {
+            let off = 0.022f32;
+            let ox = off / aspect;
             let top = [c[0], c[1] + off];
             let right = [c[0] + ox, c[1]];
             let bot = [c[0], c[1] - off];
             let left = [c[0] - ox, c[1]];
             for (a, b) in [(top, right), (right, bot), (bot, left), (left, top)] {
-                out.push(OverlayVertex { pos: a, color: col });
-                out.push(OverlayVertex { pos: b, color: col });
+                out.push(OverlayVertex { pos: a, color: marker_col });
+                out.push(OverlayVertex { pos: b, color: marker_col });
             }
         }
 
@@ -625,7 +663,6 @@ impl State {
     fn build_hud(&self) -> Vec<OverlayVertex> {
         let res = (self.config.width as f32, self.config.height.max(1) as f32);
         let mut out: Vec<OverlayVertex> = Vec::new();
-        let tel = self.mission.telemetry(self.launched, self.clock);
 
         let dim = [0.55, 0.75, 0.85];
         let val = [0.92, 0.96, 1.0];
@@ -639,6 +676,11 @@ impl State {
             self.hud.text(out, value, cx, y, val, res);
         };
 
+        if let Some(craft) = self.flight.as_ref() {
+            return self.build_flight_hud(craft, res);
+        }
+
+        let tel = self.mission.telemetry(self.launched, self.clock);
         let mut y = 16.0;
         self.hud.text(&mut out, self.mission.vehicle, x, y, amber, res);
         y += step * 1.5;
@@ -674,10 +716,64 @@ impl State {
         row(&mut out, "WARP     ", &format!("{:.0}X", self.warp), y);
 
         // controls hint, bottom-left
-        let mut hy = res.1 - step * 3.0 - 12.0;
+        let mut hy = res.1 - step * 4.0 - 12.0;
         for line in [
             "SPACE LAUNCH/RESET",
+            "F  TAKE MANUAL CONTROL",
             "DRAG ORBIT   SCROLL ZOOM",
+            "[ ] TIME WARP",
+        ] {
+            self.hud.text(&mut out, line, x, hy, dim, res);
+            hy += step;
+        }
+
+        out
+    }
+
+    fn build_flight_hud(&self, craft: &Craft, res: (f32, f32)) -> Vec<OverlayVertex> {
+        let mut out: Vec<OverlayVertex> = Vec::new();
+        let dim = [0.55, 0.75, 0.85];
+        let val = [0.92, 0.96, 1.0];
+        let amber = [1.0, 0.78, 0.30];
+        let x = 16.0;
+        let step = hud::LINE_H;
+        let row = |out: &mut Vec<OverlayVertex>, label: &str, value: &str, y: f32| {
+            let cx = self.hud.text(out, label, x, y, dim, res);
+            self.hud.text(out, value, cx, y, val, res);
+        };
+
+        let mut y = 16.0;
+        self.hud.text(&mut out, "MANUAL FLIGHT", x, y, amber, res);
+        y += step * 1.5;
+
+        let status = craft.status();
+        let scol = match status {
+            "CRASHED" => [1.0, 0.3, 0.25],
+            "LANDED" => [0.4, 1.0, 0.5],
+            _ => [1.0, 0.8, 0.3],
+        };
+        let cx = self.hud.text(&mut out, "STATUS   ", x, y, dim, res);
+        self.hud.text(&mut out, status, cx, y, scol, res);
+        y += step;
+
+        row(&mut out, "ALT      ", &format!("{:.1} KM", craft.altitude(&self.body) / 1000.0), y);
+        y += step;
+        row(&mut out, "VEL      ", &format!("{:.0} M/S", craft.speed()), y);
+        y += step;
+        row(&mut out, "VSPD     ", &format!("{:.0} M/S", craft.vertical_speed()), y);
+        y += step;
+        row(&mut out, "THROTTLE ", &format!("{:.0}", craft.throttle * 100.0), y);
+        y += step;
+        row(&mut out, "PROP     ", &format!("{:.0}", craft.prop_frac() * 100.0), y);
+        y += step;
+        row(&mut out, "MODE     ", craft.mode.label(), y);
+
+        // controls hint, bottom-left
+        let mut hy = res.1 - step * 4.0 - 12.0;
+        for line in [
+            "W / S  THROTTLE",
+            "1 PRO  2 RETRO  3 OUT  4 IN",
+            "F  RELEASE CONTROL",
             "[ ] TIME WARP",
         ] {
             self.hud.text(&mut out, line, x, hy, dim, res);
@@ -785,14 +881,54 @@ impl ApplicationHandler<UserEvent> for App {
                 state.scale = (state.scale * (1.0 - dy * 0.12)).clamp(0.12, 3.0);
             }
             WindowEvent::KeyboardInput { event: key_event, .. } => {
-                if key_event.state == ElementState::Pressed && !key_event.repeat {
-                    match key_event.physical_key {
-                        PhysicalKey::Code(KeyCode::Space) => state.toggle_launch(),
-                        PhysicalKey::Code(KeyCode::BracketRight) => {
+                if key_event.state == ElementState::Pressed {
+                    let code = match key_event.physical_key {
+                        PhysicalKey::Code(c) => c,
+                        _ => return,
+                    };
+                    // throttle ramps while held (responds to key repeat)
+                    if let Some(craft) = state.flight.as_mut() {
+                        match code {
+                            KeyCode::KeyW => {
+                                craft.throttle = (craft.throttle + 0.08).min(1.0)
+                            }
+                            KeyCode::KeyS => {
+                                craft.throttle = (craft.throttle - 0.08).max(0.0)
+                            }
+                            _ => {}
+                        }
+                    }
+                    if key_event.repeat {
+                        return;
+                    }
+                    match code {
+                        KeyCode::KeyF => state.toggle_flight(),
+                        KeyCode::Space if state.flight.is_none() => state.toggle_launch(),
+                        KeyCode::BracketRight => {
                             state.warp = (state.warp * 2.0).min(256.0);
                         }
-                        PhysicalKey::Code(KeyCode::BracketLeft) => {
+                        KeyCode::BracketLeft => {
                             state.warp = (state.warp * 0.5).max(1.0);
+                        }
+                        KeyCode::Digit1 => {
+                            if let Some(c) = state.flight.as_mut() {
+                                c.mode = Mode::Prograde;
+                            }
+                        }
+                        KeyCode::Digit2 => {
+                            if let Some(c) = state.flight.as_mut() {
+                                c.mode = Mode::Retrograde;
+                            }
+                        }
+                        KeyCode::Digit3 => {
+                            if let Some(c) = state.flight.as_mut() {
+                                c.mode = Mode::RadialOut;
+                            }
+                        }
+                        KeyCode::Digit4 => {
+                            if let Some(c) = state.flight.as_mut() {
+                                c.mode = Mode::RadialIn;
+                            }
                         }
                         _ => {}
                     }

@@ -48,6 +48,15 @@ pub struct Mission {
     ring_t2: Vec3,
     theta_meco: f32,
     rate: f32, // rad/s
+
+    // f64 state for seeding manual free-flight
+    orbit_t1: DVec3,
+    orbit_t2: DVec3,
+    ra_m: f64,
+    v_circ_ms: f64,
+    up0_d: DVec3,
+    radius_m: f64,
+    omega: f64,
 }
 
 /// Live readout for the HUD.
@@ -142,10 +151,16 @@ impl Mission {
             })
             .collect();
 
+        let v_circ_ms = circular_speed(body.mu, res.final_orbit.ra);
+        let up0_d = DVec3::new(
+            lat.cos() * lon.cos(),
+            lat.sin(),
+            lat.cos() * lon.sin(),
+        );
+
         let (theta_meco, rate, meco_t) = if let Some(m) = res.meco {
             let theta = (m.r.dot(t2)).atan2(m.r.dot(t1)) as f32;
-            let v_circ = circular_speed(body.mu, res.final_orbit.ra);
-            let rate = (v_circ / res.final_orbit.ra) as f32;
+            let rate = (v_circ_ms / res.final_orbit.ra) as f32;
             (theta, rate, m.t as f32)
         } else {
             (0.0, 0.0, f32::INFINITY)
@@ -171,7 +186,30 @@ impl Mission {
             ring_t2: t2f,
             theta_meco,
             rate,
+            orbit_t1: t1,
+            orbit_t2: t2,
+            ra_m: res.final_orbit.ra,
+            v_circ_ms,
+            up0_d,
+            radius_m: radius,
+            omega: body.omega(),
         }
+    }
+
+    /// Inertial state (metres, m/s) of the parking orbit at mission time
+    /// `clock`, for handing the craft over to manual free-flight.
+    pub fn orbit_state_at(&self, clock: f32) -> (DVec3, DVec3) {
+        let theta = (self.theta_meco + self.rate * (clock - self.meco_t)) as f64;
+        let r = self.ra_m * (self.orbit_t1 * theta.cos() + self.orbit_t2 * theta.sin());
+        let v = self.v_circ_ms * (-self.orbit_t1 * theta.sin() + self.orbit_t2 * theta.cos());
+        (r, v)
+    }
+
+    /// Inertial state of the craft sitting on the launch pad.
+    pub fn pad_state(&self) -> (DVec3, DVec3) {
+        let r = self.up0_d * self.radius_m;
+        let v = self.omega * DVec3::Y.cross(r);
+        (r, v)
     }
 
     /// Live telemetry at mission time `clock` (only meaningful once launched).
