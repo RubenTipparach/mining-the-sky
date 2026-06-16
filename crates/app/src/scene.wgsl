@@ -20,7 +20,6 @@ struct Scene {
     planet_col: array<vec4<f32>, 16>, // rgb colour
 };
 
-const BARY: vec3<f32> = vec3<f32>(-360.0, 0.0, 0.0);
 
 @group(0) @binding(0) var<uniform> s: Scene;
 @group(0) @binding(1) var home_tex: texture_2d<f32>;
@@ -96,7 +95,7 @@ fn shade_star(p: vec3<f32>, center: vec3<f32>, rd: vec3<f32>, tint: vec3<f32>) -
 
 fn shade_planet(p: vec3<f32>, center: vec3<f32>, color: vec3<f32>) -> vec3<f32> {
     let n = normalize(p - center);
-    let sun = normalize(BARY - p);
+    let sun = normalize(s.sun.xyz - p);
     let ndl = max(dot(n, sun), 0.0);
     // faint banding for variety
     let band = 0.92 + 0.08 * sin(n.y * 18.0);
@@ -105,7 +104,7 @@ fn shade_planet(p: vec3<f32>, center: vec3<f32>, color: vec3<f32>) -> vec3<f32> 
 
 fn shade_home(p: vec3<f32>, rd: vec3<f32>) -> vec3<f32> {
     let n = normalize(p - s.home.xyz);
-    let sun = normalize(BARY - p);
+    let sun = normalize(s.sun.xyz - p);
 
     let lon = atan2(n.z, n.x);
     let lat = asin(clamp(n.y, -1.0, 1.0));
@@ -132,7 +131,7 @@ fn shade_home(p: vec3<f32>, rd: vec3<f32>) -> vec3<f32> {
 
 fn shade_moon(p: vec3<f32>) -> vec3<f32> {
     let n = normalize(p - s.moon.xyz);
-    let sun = normalize(BARY - p);
+    let sun = normalize(s.sun.xyz - p);
     // grey regolith with darker maria from noise
     let maria = vnoise(n * 6.0) * 0.5 + vnoise(n * 18.0) * 0.25;
     let base = mix(0.32, 0.62, smoothstep(0.35, 0.75, maria));
@@ -192,7 +191,7 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
             let d = sqrt(max(dot(oc, oc) - tca * tca, 0.0));
             let r = s.home.w;
             let halo = smoothstep(r * 1.06, r, d) * smoothstep(r * 0.985, r, d);
-            let sun = normalize(s.sun.xyz);
+            let sun = normalize(s.sun.xyz - s.home.xyz);
             let lit = clamp(dot(normalize(oc), sun) * 0.5 + 0.6, 0.0, 1.0);
             col = col + vec3<f32>(0.3, 0.5, 1.0) * halo * lit * 0.9;
         }

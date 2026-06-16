@@ -135,7 +135,6 @@ enum View {
 
 
 use universe::{Body, Kind, Universe};
-use universe::BARY;
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -168,9 +167,10 @@ const LOG_DEPTH_FAR: f32 = 2.0e7;
 /// Horizon haze colour shared by the sky and the terrain aerial-perspective fog.
 const HORIZON: [f32; 3] = [0.74, 0.82, 0.93];
 
-/// A perspective camera for the system view (all positions in Mm).
+/// A perspective camera for the orbital map. The position is f64 (Mm) so the
+/// full-scale system stays precise; projection is camera-relative.
 struct SystemCamera {
-    pos: Vec3,
+    pos: DVec3,
     right: Vec3,
     up: Vec3,
     forward: Vec3,
@@ -179,9 +179,10 @@ struct SystemCamera {
 }
 
 impl SystemCamera {
-    /// Project a world point (Mm) to clip space, or `None` if behind the camera.
-    fn project(&self, p: Vec3) -> Option<[f32; 2]> {
-        let rel = p - self.pos;
+    /// Project a world point (Mm, f64) to clip space, or `None` if behind the
+    /// camera. Camera-relative, so f32 precision holds near the focused body.
+    fn project(&self, p: DVec3) -> Option<[f32; 2]> {
+        let rel = (p - self.pos).as_vec3();
         let fd = rel.dot(self.forward);
         if fd <= 0.0 {
             return None;
@@ -205,12 +206,13 @@ struct World {
     clock: f32, // mission-elapsed seconds
     warp: f32,
 
-    // system view: a perspective camera framing the home world + its moon.
+    // orbital map: a perspective camera framing the focused body.
     view: View,
     sys_az: f32,
     sys_el: f32,
-    sys_dist: f32, // camera distance from the focus point (Mm)
-    sys_focus: Vec3,
+    sys_dist: f64,    // camera distance from the focus point (Mm)
+    sys_focus: DVec3, // focused body position (Mm), updated each frame
+    sys_time: f64,    // simulation seconds (drives on-rails orbits)
     home_radius_mm: f32,
     moon_center_mm: Vec3,
     moon_radius_mm: f32,
@@ -256,7 +258,7 @@ impl World {
         let mut w = World {
             launched: false,
             clock: 0.0,
-            warp: 8.0,
+            warp: 1.0,
             mission,
             body,
             flight: None,
@@ -264,7 +266,8 @@ impl World {
             sys_az: 1.4,
             sys_el: 0.30,
             sys_dist: 120.0,
-            sys_focus: moon_center_mm * 0.5,
+            sys_focus: DVec3::ZERO,
+            sys_time: 0.0,
             home_radius_mm,
             moon_center_mm,
             moon_radius_mm,
@@ -281,7 +284,7 @@ impl World {
         };
         // Generate the full Kepler-47 system; the landable moon is injected as
         // home's first moon so the map and the flight sim agree.
-        w.universe = universe::generate(47, w.home_radius_mm, w.moon_center_mm, w.moon_radius_mm);
+        w.universe = universe::generate(47, w.home_radius_mm);
         w.nav = w
             .universe
             .bodies
@@ -342,12 +345,14 @@ impl World {
     }
 
     /// Point the orbital camera at the current focus body and frame it.
+    /// World position of the focused body at the current sim time.
+    fn focus_pos(&self) -> DVec3 {
+        self.universe.position(self.nav[self.focus_idx], self.sys_time)
+    }
+
     fn apply_focus(&mut self) {
-        let (pos, radius) = {
-            let b = self.focus_body();
-            (b.pos, b.radius)
-        };
-        self.sys_focus = pos;
+        let radius = self.focus_body().radius;
+        self.sys_focus = self.focus_pos();
         self.sys_dist = (radius * 4.0).max(2.0);
     }
 
@@ -425,8 +430,8 @@ impl World {
             self.sys_el.sin(),
             self.sys_el.cos() * self.sys_az.sin(),
         );
-        let cam_pos = self.sys_focus + dir * self.sys_dist;
-        let forward = (self.sys_focus - cam_pos).normalize();
+        let cam_pos = self.sys_focus + dir.as_dvec3() * self.sys_dist;
+        let forward = (self.sys_focus - cam_pos).as_vec3().normalize();
         let right = forward.cross(Vec3::Y).normalize();
         let up = right.cross(forward).normalize();
         let fov: f32 = 42.0_f32.to_radians();
@@ -440,46 +445,55 @@ impl World {
         }
     }
 
-    /// Perspective camera + body uniforms for the system view.
+    /// Perspective camera + body uniforms for the orbital map. All body centres
+    /// are passed camera-relative (floating origin) so f32 holds at AU scale.
     fn scene_uniforms(&self, res: [f32; 2], time: f32) -> SceneUniforms {
         let aspect = res[0] / res[1].max(1.0);
         let cam = self.system_camera(aspect);
+        let t = self.sys_time;
+        let rel = |p: DVec3| -> Vec3 { (p - cam.pos).as_vec3() };
 
-        // Light comes from the binary barycentre (direction from origin).
-        let sun = BARY.normalize();
-        let _ = time;
+        let u = &self.universe;
+        let home_i = u.home_index();
+        let home_r = rel(u.position(home_i, t));
+        let bary_r = rel(DVec3::ZERO);
 
-        let star_a = BARY + Vec3::new(0.0, 0.0, 26.0);
-        let star_b = BARY - Vec3::new(0.0, 0.0, 26.0);
+        // find star indices (0,1 by construction)
+        let star_a = rel(u.position(0, t));
+        let star_b = rel(u.position(1, t));
+
+        // home's first moon as the rendered "moon"
+        let moon_r = u
+            .bodies
+            .iter()
+            .position(|b| b.orbit.parent == Some(home_i))
+            .map(|mi| (rel(u.position(mi, t)), u.bodies[mi].radius as f32))
+            .unwrap_or((Vec3::ZERO, 0.0));
 
         // circumbinary planets (excluding the textured home world)
         let mut planets = [[0.0f32; 4]; 16];
         let mut planet_col = [[0.0f32; 4]; 16];
         let mut n = 0usize;
-        for b in &self.universe.bodies {
+        for (i, b) in u.bodies.iter().enumerate() {
             if b.kind != Kind::Planet || b.is_home || n >= 16 {
                 continue;
             }
-            planets[n] = [b.pos.x, b.pos.y, b.pos.z, b.radius];
+            let p = rel(u.position(i, t));
+            planets[n] = [p.x, p.y, p.z, b.radius as f32];
             planet_col[n] = [b.color[0], b.color[1], b.color[2], 1.0];
             n += 1;
         }
 
         SceneUniforms {
-            cam_pos: [cam.pos.x, cam.pos.y, cam.pos.z, 0.0],
+            cam_pos: [0.0, 0.0, 0.0, 0.0], // camera at origin (floating origin)
             cam_x: [cam.right.x, cam.right.y, cam.right.z, 0.0],
             cam_y: [cam.up.x, cam.up.y, cam.up.z, 0.0],
             cam_z: [cam.forward.x, cam.forward.y, cam.forward.z, 0.0],
-            sun: [sun.x, sun.y, sun.z, 0.0],
-            home: [0.0, 0.0, 0.0, self.home_radius_mm],
-            moon: [
-                self.moon_center_mm.x,
-                self.moon_center_mm.y,
-                self.moon_center_mm.z,
-                self.moon_radius_mm,
-            ],
-            sunbody: [star_a.x, star_a.y, star_a.z, 16.0],
-            sunbody2: [star_b.x, star_b.y, star_b.z, 9.0],
+            sun: [bary_r.x, bary_r.y, bary_r.z, 0.0], // barycentre (light source)
+            home: [home_r.x, home_r.y, home_r.z, self.home_radius_mm],
+            moon: [moon_r.0.x, moon_r.0.y, moon_r.0.z, moon_r.1],
+            sunbody: [star_a.x, star_a.y, star_a.z, u.bodies[0].radius as f32],
+            sunbody2: [star_b.x, star_b.y, star_b.z, u.bodies[1].radius as f32],
             params: [cam.fovscale, aspect, time, n as f32],
             res: [res[0], res[1], 0.0, 0.0],
             planets,
@@ -489,6 +503,11 @@ impl World {
 
     /// Advance simulation by a real frame dt (seconds).
     fn advance(&mut self, frame_dt: f32) {
+        // On-rails orbital clock: warp is the time scale (1x .. 10000x).
+        self.sys_time += frame_dt as f64 * self.warp as f64;
+        // keep the camera following the (moving) focused body
+        self.sys_focus = self.focus_pos();
+
         let bodies = self.grav_bodies();
         if let Some(craft) = self.flight.as_mut() {
             let dt_sim = frame_dt * self.warp.min(8.0);
@@ -552,13 +571,16 @@ impl World {
             return Vec::new();
         }
         let cam = self.system_camera(aspect);
-        let r = self.home_radius_mm;
+        let r = self.home_radius_mm as f64;
+        let home_pos = self.universe.position(self.universe.home_index(), self.sys_time);
         let mut out: Vec<OverlayVertex> = Vec::new();
 
+        // trajectory positions are home-centred unit-sphere; place them at the
+        // home world's current orbital position.
         let polyline = |pts: &[Vec3], color: [f32; 3], out: &mut Vec<OverlayVertex>| {
             let mut prev: Option<[f32; 2]> = None;
             for &p in pts {
-                let cur = cam.project(p * r);
+                let cur = cam.project(home_pos + p.as_dvec3() * r);
                 if let (Some(a), Some(b)) = (prev, cur) {
                     out.push(OverlayVertex { pos: a, color });
                     out.push(OverlayVertex { pos: b, color });
@@ -588,35 +610,31 @@ impl World {
             polyline(&flown, [0.45, 0.9, 1.0], &mut out);
         }
 
-        // Orbit rings, revealed as you zoom out: the moon's orbit first, then
-        // the planet orbits about the Sun.
-        let circle =
-            |center: Vec3, radius: f32, color: [f32; 3], out: &mut Vec<OverlayVertex>| {
-                let mut prev: Option<[f32; 2]> = None;
-                for k in 0..=120 {
-                    let a = k as f32 / 120.0 * std::f32::consts::TAU;
-                    let p = center + Vec3::new(a.cos(), 0.0, a.sin()) * radius;
-                    let cur = cam.project(p);
-                    if let (Some(u), Some(v)) = (prev, cur) {
-                        out.push(OverlayVertex { pos: u, color });
-                        out.push(OverlayVertex { pos: v, color });
-                    }
-                    prev = cur;
+        // Orbit rings sampled from the actual ellipses. Planet rings appear at
+        // system zoom; the focused planet's moon rings appear when zoomed in.
+        let t = self.sys_time;
+        let ring = |i: usize, color: [f32; 3], out: &mut Vec<OverlayVertex>| {
+            let mut prev: Option<[f32; 2]> = None;
+            for k in 0..=128 {
+                let cur = cam.project(self.universe.ring_point(i, k as f64 / 128.0, t));
+                if let (Some(u), Some(v)) = (prev, cur) {
+                    out.push(OverlayVertex { pos: u, color });
+                    out.push(OverlayVertex { pos: v, color });
                 }
-            };
-        // Planet orbit rings appear at system zoom; the focused planet's moon
-        // rings appear when zoomed in near it.
-        let focus = self.focus_body();
-        for b in &self.universe.bodies {
+                prev = cur;
+            }
+        };
+        let focus_pos = self.focus_pos();
+        for (i, b) in self.universe.bodies.iter().enumerate() {
             match b.kind {
-                Kind::Planet if self.sys_dist > 140.0 && b.orbit_r > 0.0 => {
-                    circle(b.orbit_center, b.orbit_r, [0.38, 0.38, 0.52], &mut out);
+                Kind::Planet if self.sys_dist > 8.0e3 => {
+                    ring(i, [0.38, 0.38, 0.52], &mut out);
                 }
-                Kind::Moon if self.sys_dist < 120.0 && b.orbit_r > 0.0 => {
-                    // only the moons of the focused planet, to avoid clutter
-                    let near_focus = (b.orbit_center - focus.pos).length() < 1.0;
-                    if near_focus {
-                        circle(b.orbit_center, b.orbit_r, [0.35, 0.5, 0.75], &mut out);
+                Kind::Moon => {
+                    // only the focused planet's moons, and only when zoomed near
+                    let center = self.universe.orbit_center(i, t);
+                    if self.sys_dist < 5.0e3 && (center - focus_pos).length() < 1.0 {
+                        ring(i, [0.35, 0.5, 0.75], &mut out);
                     }
                 }
                 _ => {}
@@ -830,6 +848,9 @@ impl World {
         row(&mut out, "RANGE    ", &format!("{:.0} MM", moon_dist), y);
         y += step;
         row(&mut out, "CAM DIST ", &format!("{:.0} MM", self.sys_dist), y);
+        y += step;
+        let days = self.sys_time / 86_400.0;
+        row(&mut out, "TIME     ", &format!("{:.0}X  T+{:.1}D", self.warp, days), y);
 
         if let Some(craft) = self.flight.as_ref() {
             y += step * 1.5;
@@ -850,26 +871,26 @@ impl World {
             row(&mut out, "TO MOON  ", &format!("{:.1} MM", to_moon), y);
         }
 
-        // Rocket/craft marker in the scene: filled diamond + dark outline so it
-        // is visible over dark sky and bright bodies alike.
+        // Rocket/craft marker, placed at the home world's orbital position.
         let aspect = res.0 / res.1.max(1.0);
         let cam = self.system_camera(aspect);
+        let home_pos = self.universe.position(self.universe.home_index(), self.sys_time);
         let (mpos, mcol) = self.surface_marker();
-        if let Some(c) = cam.project(mpos * self.home_radius_mm) {
+        if let Some(c) = cam.project(home_pos + mpos.as_dvec3() * self.home_radius_mm as f64) {
             push_filled_diamond(&mut out, c, 0.030, aspect, [0.0, 0.0, 0.0]);
             push_filled_diamond(&mut out, c, 0.020, aspect, mcol);
         }
 
         // locator dots for every small body (moons, asteroids, comets) so the
         // full system reads even though only stars/planets are ray-marched.
-        for b in &self.universe.bodies {
+        for (i, b) in self.universe.bodies.iter().enumerate() {
             let sz = match b.kind {
                 Kind::Moon => 0.009,
                 Kind::AsteroidMajor | Kind::Comet => 0.007,
                 Kind::AsteroidMinor => 0.005,
                 _ => continue,
             };
-            if let Some(c) = cam.project(b.pos) {
+            if let Some(c) = cam.project(self.universe.position(i, self.sys_time)) {
                 push_filled_diamond(&mut out, c, sz + 0.004, aspect, [0.0, 0.0, 0.0]);
                 push_filled_diamond(&mut out, c, sz, aspect, b.color);
             }
@@ -1694,14 +1715,15 @@ fn make_shot_device() -> (wgpu::Device, wgpu::Queue) {
 /// Build the world + sun time for a named validation scenario.
 #[cfg(not(target_arch = "wasm32"))]
 fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
+    let _ = (width, height);
     let mut world = World::new();
-    // Frame the map view on the home planet (where the launch/orbit is drawn).
+    // Frame the map on the home world (where the launch/orbit is drawn).
     let frame_map = |w: &mut World| {
         w.view = View::Map;
-        w.sys_focus = Vec3::ZERO;
+        let hi = w.nav.iter().position(|&i| w.universe.bodies[i].is_home).unwrap_or(0);
+        w.set_focus(hi);
         w.sys_az = 1.4;
         w.sys_el = 0.32;
-        w.sys_dist = w.home_radius_mm * 3.2;
     };
     let time = match scenario {
         "rocket" | "pad" => {
@@ -1711,28 +1733,18 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             0.0
         }
         "system" => {
-            // wide system shot: the binary + planet orbits
+            // wide system shot: the binary + planet orbits, framed on the barycentre
             world.view = View::Map;
-            world.sys_focus = BARY;
-            world.sys_dist = 1500.0;
+            world.sys_focus = DVec3::ZERO;
+            world.sys_dist = 4.0e6; // ~27 AU
             world.sys_az = 1.4;
             world.sys_el = 0.55;
             6.0
         }
         "moon" => {
-            world.view = View::Map;
-            world.sys_focus = world.moon_center_mm;
-            world.sys_az = 1.2;
-            world.sys_el = 0.25;
-            world.sys_dist = 4.5;
-            let cam = world.system_camera(width as f32 / height as f32);
-            let to_cam = (cam.pos * MM).as_dvec3() - world.moon_center_m;
-            let up = to_cam.normalize();
-            let mut craft =
-                Craft::maneuvering(world.moon_center_m + up * world.moon_radius_m, DVec3::ZERO);
-            craft.landed = true;
-            craft.landed_on = "MOON";
-            world.flight = Some(craft);
+            // home + its moon
+            frame_map(&mut world);
+            world.sys_dist = 60.0;
             6.0
         }
         "ascent" => {
@@ -2021,8 +2033,9 @@ impl ApplicationHandler<UserEvent> for App {
                 };
                 match state.world.view {
                     View::Map => {
+                        // zoom spans body-radius to far outer system (~150 AU)
                         state.world.sys_dist =
-                            (state.world.sys_dist * (1.0 - dy * 0.12)).clamp(2.0, 40000.0);
+                            (state.world.sys_dist * (1.0 - dy as f64 * 0.12)).clamp(2.0, 2.2e7);
                     }
                     View::Rocket => {
                         state.world.rocket_dist =
@@ -2056,7 +2069,7 @@ impl ApplicationHandler<UserEvent> for App {
                             state.world.toggle_launch()
                         }
                         KeyCode::BracketRight => {
-                            state.world.warp = (state.world.warp * 2.0).min(256.0);
+                            state.world.warp = (state.world.warp * 2.0).min(10000.0);
                         }
                         KeyCode::BracketLeft => {
                             state.world.warp = (state.world.warp * 0.5).max(1.0);
