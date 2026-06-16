@@ -17,3 +17,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "lod"
 path = "src/bin/lod.rs"
+
+[[bin]]
+name = "dc"
+path = "src/bin/dc.rs"

@@ -9,6 +9,7 @@ pub mod cubesphere;
 pub mod elevation;
 pub mod quadtree;
 pub mod render;
+pub mod surfacenets;
 
 pub use elevation::Elevation;
 pub use quadtree::{build_mesh, select, Lod, Mesh, Patch, Planet};

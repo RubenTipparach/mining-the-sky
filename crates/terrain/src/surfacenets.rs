@@ -1,0 +1,162 @@
+//! Naive Surface Nets - a simple form of dual contouring. It meshes the
+//! iso-surface (density == 0) of an arbitrary 3D scalar field, placing one
+//! vertex per surface-straddling cell at the average of its edge crossings
+//! (the "mass point") and connecting a quad across every sign-changing grid
+//! edge. Because it works on a full 3D field (not a heightmap) it handles
+//! overhangs, arches and caves, and it LODs cleanly via an octree later.
+
+use glam::Vec3;
+
+pub struct Mesh {
+    pub positions: Vec<Vec3>,
+    pub normals: Vec<Vec3>,
+    pub indices: Vec<u32>,
+}
+
+// Marching-cubes corner offsets and the 12 edges (corner index pairs).
+const CORNERS: [[i32; 3]; 8] = [
+    [0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1],
+    [0, 1, 0], [1, 1, 0], [1, 1, 1], [0, 1, 1],
+];
+const EDGES: [[usize; 2]; 12] = [
+    [0, 1], [1, 2], [2, 3], [3, 0],
+    [4, 5], [5, 6], [6, 7], [7, 4],
+    [0, 4], [1, 5], [2, 6], [3, 7],
+];
+
+/// Extract a mesh from `f` over a grid of `dim` sample points per axis, with
+/// spacing `cell` (world units) starting at `origin`.
+pub fn surface_nets<F: Fn(Vec3) -> f32>(f: &F, origin: Vec3, cell: f32, dim: usize) -> Mesh {
+    let n = dim;
+    let idx = |x: usize, y: usize, z: usize| (x * n + y) * n + z;
+    let pos_of = |x: usize, y: usize, z: usize| {
+        origin + Vec3::new(x as f32, y as f32, z as f32) * cell
+    };
+
+    // sample the field
+    let mut d = vec![0.0f32; n * n * n];
+    for x in 0..n {
+        for y in 0..n {
+            for z in 0..n {
+                d[idx(x, y, z)] = f(pos_of(x, y, z));
+            }
+        }
+    }
+
+    let grad = |p: Vec3| -> Vec3 {
+        let e = cell * 0.5;
+        Vec3::new(
+            f(p + Vec3::X * e) - f(p - Vec3::X * e),
+            f(p + Vec3::Y * e) - f(p - Vec3::Y * e),
+            f(p + Vec3::Z * e) - f(p - Vec3::Z * e),
+        )
+        .normalize_or_zero()
+    };
+
+    let mut positions = Vec::new();
+    let mut normals = Vec::new();
+    let mut cell_vert = vec![u32::MAX; n * n * n];
+
+    // one vertex per surface-straddling cell (cells run 0..n-1)
+    for x in 0..n - 1 {
+        for y in 0..n - 1 {
+            for z in 0..n - 1 {
+                let mut dens = [0.0f32; 8];
+                let mut neg = 0;
+                for (c, off) in CORNERS.iter().enumerate() {
+                    let v = d[idx(x + off[0] as usize, y + off[1] as usize, z + off[2] as usize)];
+                    dens[c] = v;
+                    if v < 0.0 {
+                        neg += 1;
+                    }
+                }
+                if neg == 0 || neg == 8 {
+                    continue;
+                }
+                let mut sum = Vec3::ZERO;
+                let mut cnt = 0.0f32;
+                for [a, b] in EDGES {
+                    let (da, db) = (dens[a], dens[b]);
+                    if (da < 0.0) == (db < 0.0) {
+                        continue;
+                    }
+                    let t = da / (da - db);
+                    let pa = pos_of(
+                        x + CORNERS[a][0] as usize,
+                        y + CORNERS[a][1] as usize,
+                        z + CORNERS[a][2] as usize,
+                    );
+                    let pb = pos_of(
+                        x + CORNERS[b][0] as usize,
+                        y + CORNERS[b][1] as usize,
+                        z + CORNERS[b][2] as usize,
+                    );
+                    sum += pa.lerp(pb, t);
+                    cnt += 1.0;
+                }
+                let p = sum / cnt;
+                cell_vert[idx(x, y, z)] = positions.len() as u32;
+                positions.push(p);
+                normals.push(grad(p));
+            }
+        }
+    }
+
+    // quad per sign-changing grid edge, from the four cells sharing it.
+    let mut indices = Vec::new();
+    let mut quad = |a: u32, b: u32, c: u32, e: u32, flip: bool, out: &mut Vec<u32>| {
+        if a == u32::MAX || b == u32::MAX || c == u32::MAX || e == u32::MAX {
+            return;
+        }
+        if flip {
+            out.extend_from_slice(&[a, c, b, a, e, c]);
+        } else {
+            out.extend_from_slice(&[a, b, c, a, c, e]);
+        }
+    };
+    for x in 1..n - 1 {
+        for y in 1..n - 1 {
+            for z in 1..n - 1 {
+                let d0 = d[idx(x, y, z)];
+                // edge +X
+                let dx = d[idx(x + 1, y, z)];
+                if (d0 < 0.0) != (dx < 0.0) {
+                    quad(
+                        cell_vert[idx(x, y - 1, z - 1)],
+                        cell_vert[idx(x, y, z - 1)],
+                        cell_vert[idx(x, y, z)],
+                        cell_vert[idx(x, y - 1, z)],
+                        d0 < 0.0,
+                        &mut indices,
+                    );
+                }
+                // edge +Y
+                let dy = d[idx(x, y + 1, z)];
+                if (d0 < 0.0) != (dy < 0.0) {
+                    quad(
+                        cell_vert[idx(x - 1, y, z - 1)],
+                        cell_vert[idx(x, y, z - 1)],
+                        cell_vert[idx(x, y, z)],
+                        cell_vert[idx(x - 1, y, z)],
+                        d0 >= 0.0,
+                        &mut indices,
+                    );
+                }
+                // edge +Z
+                let dz = d[idx(x, y, z + 1)];
+                if (d0 < 0.0) != (dz < 0.0) {
+                    quad(
+                        cell_vert[idx(x - 1, y - 1, z)],
+                        cell_vert[idx(x, y - 1, z)],
+                        cell_vert[idx(x, y, z)],
+                        cell_vert[idx(x - 1, y, z)],
+                        d0 < 0.0,
+                        &mut indices,
+                    );
+                }
+            }
+        }
+    }
+
+    Mesh { positions, normals, indices }
+}
