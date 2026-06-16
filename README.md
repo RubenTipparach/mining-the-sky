@@ -39,8 +39,9 @@ See **[docs/DESIGN.md](docs/DESIGN.md)** for the full design document covering:
   coastlines, day/night terminator, atmospheric limb, dark-side city lights)
   with a free orbit camera, the staged launch-to-orbit drawn live on the globe,
   a bitmap-font telemetry HUD, and a manual free-flight mode (fly the craft
-  under live physics, change orbit, and land back on the surface). Includes a
-  headless `shot` mode that renders a frame to a PNG (no display needed).
+  under live physics, change orbit, and land back on the surface). A perspective
+  "system view" frames the home world and its moon. Includes a headless `shot`
+  mode that renders a frame to a PNG (no display needed).
 
 ## Build and run
 
@@ -55,11 +56,13 @@ cargo run -p worldgen --bin bake --release -- 47
 cargo run -p sim --bin launch --release
 
 # Run the real-time WebGPU client natively
-#   drag = orbit camera, scroll = zoom, Space = launch, F = manual flight, [ ] = warp
+#   drag = orbit camera, scroll = zoom, Space = launch, F = manual flight,
+#   V = system view (home world + moon), [ ] = time warp
 cargo run -p app --release
 
-# Render one client frame to a PNG headlessly (no window needed)
-cargo run -p app --release -- shot out/client.png
+# Render frames to PNGs headlessly (no window needed)
+cargo run -p app --release -- shot out/client.png         # surface / launch view
+cargo run -p app --release -- shot system out/system.png  # system view
 
 # Build the browser (WASM) client locally
 cd crates/app && trunk serve     # then open the printed localhost URL
@@ -81,6 +84,11 @@ telemetry HUD.
 
 ![](docs/images/client.png)
 
+System view (`V`): a perspective camera framing the home world and its moon, the
+seed of the multi-body 3D renderer.
+
+![](docs/images/system.png)
+
 ## Live demo (GitHub Pages)
 
 `.github/workflows/pages.yml` builds the WASM client with Trunk and deploys it to
@@ -93,8 +101,9 @@ needs a WebGPU-capable browser.
 Initial vertical slice working (design doc roadmap M0-M2): procedural planet
 with coastal-delta cities, roads, and night lights; a live native/browser
 WebGPU client with a free orbit camera that flies the staged launch-to-orbit
-drawn on the globe, a telemetry HUD, and a manual free-flight mode (fly the
-craft under live physics and land anywhere on the world). Next: a second body
-(moon/asteroid) to fly to and land on; true 3D-perspective terrain (toward
-walkable surfaces); then the economy loop (fundraise, launch parts, assemble in
-orbit).
+drawn on the globe, a telemetry HUD, a manual free-flight mode (fly the craft
+under live physics and land anywhere on the world), and a perspective system
+view showing the home world and its moon. Next: fly the craft between bodies
+(patched-conic transfer) and land on the moon; true 3D-perspective terrain
+(toward walkable surfaces); then the economy loop (fundraise, launch parts,
+assemble in orbit).
