@@ -131,8 +131,7 @@ pub fn scene() -> Scene {
     let veh = Vehicle::pioneer();
     let mut m = Mesh::default();
 
-    // ground + pad
-    m.plane(0.0, 600.0, [0.20, 0.27, 0.15]);
+    // pad slab (the planet terrain is the ground; see build_terrain)
     m.bx(Vec3::new(0.0, PAD_TOP * 0.5, 0.0), Vec3::new(9.0, PAD_TOP * 0.5, 9.0), [0.42, 0.42, 0.45]);
 
     let base_y = PAD_TOP + MOUNT_H;
@@ -206,4 +205,90 @@ pub fn scene() -> Scene {
         focus_y: top * 0.45,
         cam_dist: top * 1.7,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Real planet terrain in the rocket view.
+//
+// The planet is ~6200 km; the rocket is metres. We render the LOD cube-sphere
+// surface in a local tangent frame whose origin is the spaceport surface point
+// (floating origin), so every vertex is small and f32-precise. The mesh pipeline
+// applies a logarithmic depth buffer so near (rocket) and far (horizon) coexist
+// without z-fighting.
+// ---------------------------------------------------------------------------
+
+use glam::DVec3;
+use terrain::{build_mesh, select, Elevation, Planet};
+
+/// Spaceport (matches sim / worldgen seed 47).
+const SPACEPORT_LAT_DEG: f64 = -1.7;
+const SPACEPORT_LON_DEG: f64 = -102.9;
+
+fn mix3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
+    let t = t.clamp(0.0, 1.0);
+    [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]
+}
+
+fn terrain_color(signed_h: f64) -> [f32; 3] {
+    if signed_h <= 0.0 {
+        return [0.05, 0.18, 0.32]; // sea
+    }
+    let t = (signed_h / 3500.0).clamp(0.0, 1.0) as f32;
+    let low = [0.22, 0.34, 0.16];
+    let mid = [0.40, 0.34, 0.22];
+    let hi = [0.86, 0.88, 0.92];
+    if t < 0.5 {
+        mix3(low, mid, t * 2.0)
+    } else {
+        mix3(mid, hi, (t - 0.5) * 2.0)
+    }
+}
+
+/// Build the planet LOD terrain around the spaceport, in the rocket view's
+/// local tangent frame (metres, +Y up). Returns the mesh; the local origin is
+/// the surface point so the rocket (built at y=0) sits on it.
+pub fn build_terrain() -> Mesh {
+    let planet = Planet { radius: 6.2e6 };
+    let elev = Elevation::new(47);
+
+    let lat = SPACEPORT_LAT_DEG.to_radians();
+    let lon = SPACEPORT_LON_DEG.to_radians();
+    let dir = DVec3::new(lat.cos() * lon.cos(), lat.sin(), lat.cos() * lon.sin()).normalize();
+    let h0 = elev.land_height_m(dir);
+    let origin = dir * (planet.radius + h0);
+
+    // tangent basis: up = radial, north toward +Y, east = north x up
+    let up = dir;
+    let north = (DVec3::Y - up * up.dot(DVec3::Y)).normalize();
+    let east = north.cross(up).normalize();
+    let to_local = |w: DVec3| -> Vec3 {
+        let d = w - origin;
+        Vec3::new(d.dot(east) as f32, d.dot(up) as f32, d.dot(north) as f32)
+    };
+
+    // Select LOD as if the camera sits ~120 m over the pad so it refines locally.
+    let cam = origin + up * 120.0;
+    let lod = select(&planet, cam, 1.6, 16);
+
+    let mut m = Mesh::default();
+    let n = 9;
+    for patch in &lod.patches {
+        let pm = build_mesh(&planet, patch, n, &elev, 120.0);
+        for tri in pm.indices.chunks(3) {
+            let w0 = pm.positions[tri[0] as usize];
+            let w1 = pm.positions[tri[1] as usize];
+            let w2 = pm.positions[tri[2] as usize];
+            let a = to_local(w0);
+            let b = to_local(w1);
+            let c = to_local(w2);
+            let mut nrm = (b - a).cross(c - a).normalize_or_zero();
+            if nrm.y < 0.0 {
+                nrm = -nrm; // terrain faces up
+            }
+            let centroid = (w0 + w1 + w2) / 3.0;
+            let col = terrain_color(elev.height_m(centroid.normalize()));
+            m.tri(a, b, c, nrm, col);
+        }
+    }
+    m
 }

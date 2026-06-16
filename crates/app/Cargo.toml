@@ -16,6 +16,7 @@ bytemuck = { version = "1", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 glam = "0.30"
 sim = { path = "../sim" }
+terrain = { path = "../terrain" }
 log = "0.4"
 cfg-if = "1"
 

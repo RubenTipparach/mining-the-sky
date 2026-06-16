@@ -151,6 +151,7 @@ dependencies = [
  "log",
  "pollster",
  "sim",
+ "terrain",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",

@@ -67,8 +67,11 @@ web demo.
 
 ## Backlog (after this task)
 
-- GPU rocket-view LOD terrain (wire in `crates/terrain`): place the pad/rocket on
-  real displaced terrain with log-depth + camera-relative positions.
+- DONE (first pass) - GPU rocket-view LOD terrain: the rocket view now renders
+  the real `crates/terrain` cube-sphere LOD surface in a floating-origin tangent
+  frame at the spaceport, with a logarithmic depth buffer, and the rocket sits on
+  it. Follow-ups: match the macro shape to the worldgen baked planet, dynamic LOD
+  as the camera moves, atmosphere, and more relief.
 - Ground view + astronaut 3rd-person view; full view cycle.
 - Map-view polish: pan, center-on-body / center-on-rocket.
 - Economy loop: fundraise, launch parts (robonauts, refineries), assemble a

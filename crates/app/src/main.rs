@@ -144,7 +144,12 @@ enum View {
 struct MeshUniforms {
     viewproj: [[f32; 4]; 4],
     sun: [f32; 4],
+    /// params.x = logarithmic-depth Fcoef = 1 / log2(far + 1).
+    params: [f32; 4],
 }
+
+/// Far plane for the rocket-view log-depth buffer (m): beyond planet diameter.
+const LOG_DEPTH_FAR: f32 = 2.0e7;
 
 /// A perspective camera for the system view (all positions in Mm).
 struct SystemCamera {
@@ -285,11 +290,14 @@ impl World {
         );
         let eye = target + dir * self.rocket_dist;
         let view = Mat4::look_at_rh(eye, target, Vec3::Y);
-        let proj = Mat4::perspective_rh(50f32.to_radians(), aspect, 0.3, 8000.0);
+        // wide near/far range; the logarithmic depth buffer keeps precision.
+        let proj = Mat4::perspective_rh(50f32.to_radians(), aspect, 0.1, LOG_DEPTH_FAR);
         let vp = proj * view;
+        let fcoef = 1.0 / (LOG_DEPTH_FAR + 1.0).log2();
         MeshUniforms {
             viewproj: vp.to_cols_array_2d(),
             sun: [0.40, 0.72, 0.55, 0.0],
+            params: [fcoef, 0.0, 0.0, 0.0],
         }
     }
 
@@ -1115,7 +1123,9 @@ impl Gpu {
             multiview_mask: None,
             cache: None,
         });
-        let scene_mesh = rocket::scene().mesh;
+        let mut scene_mesh = rocket::scene().mesh;
+        // Append the real planet LOD terrain (same local tangent frame).
+        scene_mesh.verts.extend(rocket::build_terrain().verts);
         let mesh_vertex_count = scene_mesh.verts.len() as u32;
         let mesh_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mesh-vbuf"),
