@@ -36,8 +36,11 @@ See **[docs/DESIGN.md](docs/DESIGN.md)** for the full design document covering:
   orbit from the seed-47 spaceport and plots the trajectory.
 - `crates/app` - the real-time client (wgpu / WebGPU) that runs natively and in
   the browser via WebAssembly. Renders the baked worldgen planet (real
-  coastlines, day/night terminator, atmospheric limb, dark-side city lights) as
-  the seed of the Caelum-style renderer.
+  coastlines, day/night terminator, atmospheric limb, dark-side city lights)
+  with a free orbit camera, the staged launch-to-orbit drawn live on the globe,
+  a bitmap-font telemetry HUD, and a manual free-flight mode (fly the craft
+  under live physics, change orbit, and land back on the surface). Includes a
+  headless `shot` mode that renders a frame to a PNG (no display needed).
 
 ## Build and run
 
@@ -52,7 +55,11 @@ cargo run -p worldgen --bin bake --release -- 47
 cargo run -p sim --bin launch --release
 
 # Run the real-time WebGPU client natively
+#   drag = orbit camera, scroll = zoom, Space = launch, F = manual flight, [ ] = warp
 cargo run -p app --release
+
+# Render one client frame to a PNG headlessly (no window needed)
+cargo run -p app --release -- shot out/client.png
 
 # Build the browser (WASM) client locally
 cd crates/app && trunk serve     # then open the printed localhost URL
@@ -68,6 +75,12 @@ Launch-to-orbit (Pioneer I from the seed-47 spaceport, 205 km circular orbit):
 
 ![](docs/images/launch.png)
 
+The real-time client (headless `shot`): Pioneer I in its parking orbit over the
+day/night terminator, dark-side city lights, atmospheric limb, and the live
+telemetry HUD.
+
+![](docs/images/client.png)
+
 ## Live demo (GitHub Pages)
 
 `.github/workflows/pages.yml` builds the WASM client with Trunk and deploys it to
@@ -79,6 +92,9 @@ needs a WebGPU-capable browser.
 
 Initial vertical slice working (design doc roadmap M0-M2): procedural planet
 with coastal-delta cities, roads, and night lights; a live native/browser
-WebGPU view of the baked world; and a staged rocket that launches from the
-spaceport into a stable orbit. Next: render the rocket + orbit in the real-time
-client, then the economy loop (fundraise, launch parts, assemble in orbit).
+WebGPU client with a free orbit camera that flies the staged launch-to-orbit
+drawn on the globe, a telemetry HUD, and a manual free-flight mode (fly the
+craft under live physics and land anywhere on the world). Next: a second body
+(moon/asteroid) to fly to and land on; true 3D-perspective terrain (toward
+walkable surfaces); then the economy loop (fundraise, launch parts, assemble in
+orbit).
