@@ -1,0 +1,19 @@
+[package]
+name = "terrain"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Cube-sphere quadtree LOD terrain with continuous procedural elevation"
+
+[dependencies]
+glam = "0.30"
+noise = "0.9"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[lib]
+name = "terrain"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lod"
+path = "src/bin/lod.rs"
