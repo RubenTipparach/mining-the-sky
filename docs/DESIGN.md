@@ -1,16 +1,16 @@
-# Mining the Sky — Master Design Document
+# Mining the Sky - Master Design Document
 
 > A realistic, to-scale, multiplayer hard-sci-fi space sim set in a fictionalized
 > version of the **Kepler-47** circumbinary system. Massive-scale orbital
 > maneuvering, in-situ resource utilization (ISRU), space industrialization,
-> factory automation, and advanced spaceship construction — in an async,
+> factory automation, and advanced spaceship construction - in an async,
 > time-compressed sandbox.
 
 - **Status:** Draft 0.1 (initial design)
 - **Date:** 2026-06-16
 - **Language/Runtime:** Rust
 - **Inspirations:** [Caelum](https://github.com/RubenTipparach/Caelum) (rendering tech),
-  *High Frontier* (board game — orbital/economic model), Kerbal Space Program
+  *High Frontier* (board game - orbital/economic model), Kerbal Space Program
   (patched conics), Factorio / Satisfactory (automation), EVE Online (sandbox/economy).
 
 ---
@@ -29,7 +29,7 @@ and one mined asteroid at a time.
    rendering tech (from Caelum) exists specifically to make this scale
    renderable and beautiful.
 2. **Orbital maneuvering as the central skill.** Movement is not WASD through a
-   void — it is delta-v budgeting, transfer windows, gravity assists, and
+   void - it is delta-v budgeting, transfer windows, gravity assists, and
    maneuver nodes. Borrowed directly from *High Frontier*'s "burns cost fuel,
    trajectories are committed" feel.
 3. **ISRU and industrialization.** You don't buy ships from a shop; you mine
@@ -58,11 +58,11 @@ the C. Below is the concrete mapping from Caelum source to our ports.
 
 | Caelum source | What it does | Our port |
 | --- | --- | --- |
-| `src/lod.c` / `lod.h` | Icosahedron-rooted **aperture-4 quadtree** sphere LOD. 20 root faces, max depth 13, 16,384-node pool, split when `distance < patch_arc * split_factor`. Per-frame GPU upload budget (64/frame). | `crates/render/src/lod/` — same icosphere + quadtree, ported to f64 spherical math + wgpu mesh upload budget. |
-| `lod.c` per-level `level_stats{patch_count, min/max_distance}` | The **LOD analyzer** — per-depth statistics gathered each frame in `lod_tree_update`. | `crates/render/src/lod/analyzer.rs` + egui overlay panel. |
-| `src/camera.c` / `camera.h` | `pos_d[3]` (f64 accumulator) → `position` (f32 for render). `jetpack_speed_mult` = **scroll-wheel speed multiplier**. `space_mode` toggles at >50 km. | `crates/sim/src/camera.rs` — f64 position, scroll-wheel exponential speed scaling, distance-aware mode switch. |
-| `shaders/planet.glsl` | **Logarithmic depth** (`gl_Position.z = (log2(max(1e-6, 1.0+w)) * Fcoef + log_depth.z) * w`) and **double-float floating origin** (`cam_rel = (a_pos - cam_hi) - cam_lo`). | `assets/shaders/*.wgsl` — same log-depth + hi/lo camera-relative trick in WGSL. |
-| `shaders/atmosphere.glsl` | **Single-scattering Rayleigh+Mie** ray march, 8 view samples / 4 light samples, Henyey-Greenstein, `wavelengthsInv4 = (5.602, 9.473, 19.644)`. | `assets/shaders/atmosphere.wgsl` — same model, optionally upgraded to precomputed Bruneton LUTs later. |
+| `src/lod.c` / `lod.h` | Icosahedron-rooted **aperture-4 quadtree** sphere LOD. 20 root faces, max depth 13, 16,384-node pool, split when `distance < patch_arc * split_factor`. Per-frame GPU upload budget (64/frame). | `crates/render/src/lod/` - same icosphere + quadtree, ported to f64 spherical math + wgpu mesh upload budget. |
+| `lod.c` per-level `level_stats{patch_count, min/max_distance}` | The **LOD analyzer** - per-depth statistics gathered each frame in `lod_tree_update`. | `crates/render/src/lod/analyzer.rs` + egui overlay panel. |
+| `src/camera.c` / `camera.h` | `pos_d[3]` (f64 accumulator) → `position` (f32 for render). `jetpack_speed_mult` = **scroll-wheel speed multiplier**. `space_mode` toggles at >50 km. | `crates/sim/src/camera.rs` - f64 position, scroll-wheel exponential speed scaling, distance-aware mode switch. |
+| `shaders/planet.glsl` | **Logarithmic depth** (`gl_Position.z = (log2(max(1e-6, 1.0+w)) * Fcoef + log_depth.z) * w`) and **double-float floating origin** (`cam_rel = (a_pos - cam_hi) - cam_lo`). | `assets/shaders/*.wgsl` - same log-depth + hi/lo camera-relative trick in WGSL. |
+| `shaders/atmosphere.glsl` | **Single-scattering Rayleigh+Mie** ray march, 8 view samples / 4 light samples, Henyey-Greenstein, `wavelengthsInv4 = (5.602, 9.473, 19.644)`. | `assets/shaders/atmosphere.wgsl` - same model, optionally upgraded to precomputed Bruneton LUTs later. |
 | `shaders/planet.glsl` surface shading | Smooth terminator, atmospheric tinting, AO, ocean specular, rim light, Rayleigh fog. | Port to WGSL PBR-lite surface model. |
 | `src/celestial.c` | Solar-system body definitions and hierarchy. | `crates/sim/src/orbits/` body graph (see §6). |
 | `src/hex_terrain.c` | Hex grid terrain. | **Dropped** per design goal. |
@@ -93,11 +93,11 @@ Rust."* Each choice below lists the pick, the runner-up, and why.
 
 ### 3.1 Graphics: **`wgpu`** (WebGPU)
 
-- **Pick:** [`wgpu`](https://github.com/gfx-rs/wgpu) — the Rust WebGPU
+- **Pick:** [`wgpu`](https://github.com/gfx-rs/wgpu) - the Rust WebGPU
   implementation. One WGSL codebase runs on Vulkan, Metal, DX12, and the browser
   (WASM + WebGPU). Native multithreaded command encoding, compute shaders for
   our GPU orbital propagation (§6.4).
-- **Runner-up:** raw `ash` (Vulkan) — more control, far more boilerplate, no
+- **Runner-up:** raw `ash` (Vulkan) - more control, far more boilerplate, no
   browser target. Rejected: WebGPU's portability + compute is exactly what a
   to-scale multiplatform sim needs.
 - **Shaders:** WGSL authored directly. We keep a thin reflection layer so
@@ -125,10 +125,10 @@ Rust."* Each choice below lists the pick, the runner-up, and why.
   coordinate assumptions (f32 transforms, no native floating origin / log-depth)
   fight our core requirements. We'd spend more time subverting Bevy's render
   graph than building. Revisit if Bevy ships first-class large-world support.
-- **Runner-up B:** `hecs` / `flecs-rs` — lighter, but we'd reimplement the
+- **Runner-up B:** `hecs` / `flecs-rs` - lighter, but we'd reimplement the
   parallel scheduler. `bevy_ecs` gives us that for free.
 - **Decision:** custom engine, `bevy_ecs` for the ECS, `wgpu` for rendering. We
-  keep full control of LOD, depth, floating origin, and atmosphere — exactly the
+  keep full control of LOD, depth, floating origin, and atmosphere - exactly the
   things Bevy doesn't do for us.
 
 ### 3.5 Async runtime & jobs: **`tokio`** (net/IO) + **`rayon`** (data parallelism)
@@ -143,18 +143,18 @@ Rust."* Each choice below lists the pick, the runner-up, and why.
 
 - Local rigid-body physics (ship docking, construction collisions, surface
   rovers) uses [`avian3d`](https://github.com/Jondolf/avian) (ECS-native) or
-  `rapier3d`. **Orbital** motion is *not* rigid-body physics — see §6. Rigid
+  `rapier3d`. **Orbital** motion is *not* rigid-body physics - see §6. Rigid
   bodies operate only in the local floating-origin frame near the player.
 
 ### 3.7 Networking: **QUIC via `aeronet` / WebTransport** (see §7)
 
 - **Pick:** [`aeronet`](https://github.com/aecsocket/aeronet) transport
-  abstraction over **WebTransport (QUIC)** — reliable streams *and* unreliable
+  abstraction over **WebTransport (QUIC)** - reliable streams *and* unreliable
   datagrams, one API for native (`wtransport`/`quinn`) and browser (WASM). This
   is the modern successor to WebRTC data channels for our use case.
 - **Runner-up:** WebRTC data channels (`matchbox`/`webrtc-rs`). Heavier
   handshake (SDP/ICE/STUN/TURN), designed for P2P/NAT punching we don't need for
-  a client–authority topology. We keep WebRTC in our back pocket only if we
+  a client-authority topology. We keep WebRTC in our back pocket only if we
   later want serverless P2P clusters.
 - **Replication:** `lightyear` or `renet`-style snapshot/delta replication on
   top of `aeronet`. See §7 for why our async time model means this is *state
@@ -216,7 +216,7 @@ mining-the-sky/
 
 - **Fixed-step simulation** for industry/economy and rigid-body physics
   (e.g. 30 Hz), decoupled from render framerate.
-- **Orbital state is evaluated, not stepped** (§6) — it's a pure function of
+- **Orbital state is evaluated, not stepped** (§6) - it's a pure function of
   absolute time, so it doesn't need a fixed step and is trivially time-
   compressible and parallelizable.
 - **Multithreaded rendering:** the LOD update produces a list of visible patches;
@@ -232,7 +232,7 @@ mining-the-sky/
 ### 5.1 Floating origin (the foundation of "to-scale")
 
 - **World space is f64**, in meters, with the system barycenter at the origin.
-  Kepler-47c orbits at ~1 AU ≈ `1.5e11` m — f32 (24-bit mantissa) loses meter
+  Kepler-47c orbits at ~1 AU ≈ `1.5e11` m - f32 (24-bit mantissa) loses meter
   precision past ~16,000 km from origin, so f64 is mandatory for world state.
 - **Each frame** we rebase the render origin onto the camera. The GPU never sees
   absolute coordinates; it sees **camera-relative f32**, with the camera passed
@@ -261,7 +261,7 @@ Ported from Caelum's `jetpack_speed_mult` / `space_mode`:
 - Every player has a **local `t` and a local time-compression factor** (1×,
   10×, 1,000×, …, like KSP/High Frontier warp). Compression just advances *that
   player's* `t` faster.
-- **Crucially, body and on-rails ship positions are `f(elements, t)`** — a pure
+- **Crucially, body and on-rails ship positions are `f(elements, t)`** - a pure
   function of absolute time (§6). So two players at the same `t` compute the
   *same* positions regardless of how fast each got there. Time compression
   therefore needs **no synchronization** and never blocks anyone. This is the
@@ -281,7 +281,7 @@ Ported from Caelum's `jetpack_speed_mult` / `space_mode`:
 
 ### 6.1 Why not "just RK4 everything"
 
-- **RK4 is not symplectic** — it has secular energy drift, so a station left for
+- **RK4 is not symplectic** - it has secular energy drift, so a station left for
   game-weeks at 10,000× compression slowly spirals. Bad for a persistent sandbox.
 - **Stepwise integration is non-deterministic across machines/time-compression.**
   Different step counts (because of different warp factors and frame rates)
@@ -297,24 +297,24 @@ Like KSP and conceptually like *High Frontier*'s committed trajectories:
 - Each body/ship on rails has a set of **orbital elements** `(a, e, i, Ω, ω, M0, epoch)`
   about a single dominant primary (a star, planet, or the binary barycenter).
 - Position at time `t` = solve **Kepler's equation** `M = E − e·sin E`
-  (elliptic) / hyperbolic analog, via **Newton–Halley iteration** (3–4 iters,
+  (elliptic) / hyperbolic analog, via **Newton-Halley iteration** (3-4 iters,
   f64). This is:
-  - **Exact** (no drift — a parked station stays parked forever),
+  - **Exact** (no drift - a parked station stays parked forever),
   - **`O(1)` per body, evaluated at absolute `t`** (deterministic & async-safe),
-  - **Embarrassingly parallel** (CPU via rayon, or GPU via compute — §6.4).
+  - **Embarrassingly parallel** (CPU via rayon, or GPU via compute - §6.4).
 - **Patched conics / SOI transitions:** each body owns a sphere-of-influence
   radius `r_SOI = a · (m/M)^(2/5)`. A trajectory is a sequence of conic arcs;
   when a ship crosses an SOI boundary, we re-root its elements to the new
   primary at the crossing time. Hyperbolic flybys give free gravity assists.
 - **Maneuver nodes:** a burn at time `t_b` instantaneously changes velocity and
   produces a **new element set valid from `t_b`**. Trajectories are thus a list
-  of `(elements, valid_interval, primary)` arcs — cheap to store, replicate, and
+  of `(elements, valid_interval, primary)` arcs - cheap to store, replicate, and
   re-derive. This is the "committed burn" feel from *High Frontier*.
 
 ### 6.3 The circumbinary wrinkle (Kepler-47 specifics)
 
 Kepler-47 is a **binary** (§8). Planets orbit the *barycenter* of the two stars,
-not a single mass — pure two-body conics are an approximation here.
+not a single mass - pure two-body conics are an approximation here.
 
 - **Cheap model (v1):** treat the binary as a single point mass at the
   barycenter for planet/ship orbits outside the binary's critical radius
@@ -322,8 +322,8 @@ not a single mass — pure two-body conics are an approximation here.
 - **Honest model (v2, optional):** the two stars are a known, closed-form
   two-body orbit (period ~7.45 d); their gravity on a circumbinary craft is a
   **time-periodic perturbation**. Apply it via **Encke's method** (integrate
-  only the small deviation from the reference conic) — cheap and drift-resistant
-  — only for craft we're actively simulating near the stars.
+  only the small deviation from the reference conic) - cheap and drift-resistant
+  - only for craft we're actively simulating near the stars.
 
 ### 6.4 GPU-assisted batch propagation
 
@@ -340,11 +340,11 @@ not a single mass — pure two-body conics are an approximation here.
 For the small set of bodies under continuous thrust or strong perturbation
 (active maneuvering ships, station-keeping, aerobraking passes):
 
-- **Adaptive high-order:** **Dormand–Prince RK45** (error-controlled) for
+- **Adaptive high-order:** **Dormand-Prince RK45** (error-controlled) for
   general thrusting arcs, or **IAS15** (15th-order adaptive, from the REBOUND
   N-body code) when we want research-grade accuracy on chaotic close encounters.
-- **Long-term N-body (if ever needed):** a **Wisdom–Holman symplectic
-  integrator** preserves energy over millions of steps — the right tool for
+- **Long-term N-body (if ever needed):** a **Wisdom-Holman symplectic
+  integrator** preserves energy over millions of steps - the right tool for
   evolving the *whole system* forward, which we mostly avoid by keeping bodies
   on analytic rails.
 - These run off the main thread (rayon/tokio) and only for the handful of craft
@@ -365,7 +365,7 @@ backbone for a persistent, time-compressed, multiplayer sandbox.
   events. Clients are simulation peers for *continuous* orbital state (which they
   can recompute exactly from elements) and request *discrete* actions from the
   server.
-- **Transport:** `aeronet` over **WebTransport/QUIC** — reliable ordered streams
+- **Transport:** `aeronet` over **WebTransport/QUIC** - reliable ordered streams
   for RPC/economy, unreliable datagrams for high-frequency presence (a player's
   ship near you). Native and browser share one code path.
 
@@ -401,7 +401,7 @@ motion locally. This is what makes async time compression bandwidth-cheap.
 ### 7.4 Why not WebRTC
 
 WebRTC data channels were considered (great for P2P/NAT traversal) but bring
-SDP/ICE/STUN/TURN complexity we don't need for a client–authority topology.
+SDP/ICE/STUN/TURN complexity we don't need for a client-authority topology.
 WebTransport/QUIC gives us streams+datagrams, native+browser, with a simpler
 handshake. WebRTC stays as a future option for serverless P2P shards.
 
@@ -420,15 +420,15 @@ doesn't hand us.
 | --- | --- | --- | --- | --- |
 | Kepler-47A (primary) | ~1.04 | ~0.96 | ~5,636 | Sun-like G-type |
 | Kepler-47B (secondary) | ~0.36 | ~0.35 | cooler | M-dwarf companion |
-| Binary orbit | — | — | — | Period **~7.45 d**, the pair orbits a common barycenter |
+| Binary orbit | - | - | - | Period **~7.45 d**, the pair orbits a common barycenter |
 
-### 8.2 Planets (real, approximate — circumbinary, orbiting the barycenter)
+### 8.2 Planets (real, approximate - circumbinary, orbiting the barycenter)
 
 | Planet | Period (d) | Radius (R⊕) | Mass (M⊕, est.) | Notes |
 | --- | --- | --- | --- | --- |
-| Kepler-47b | ~49.5 | ~3.0 | ~7–10 | Innermost; hot |
+| Kepler-47b | ~49.5 | ~3.0 | ~7-10 | Innermost; hot |
 | Kepler-47d | ~187 | ~7 | (larger) | Discovered later; between b and c |
-| Kepler-47c | ~303 | ~4.7 | ~16–23 | In/near the habitable zone |
+| Kepler-47c | ~303 | ~4.7 | ~16-23 | In/near the habitable zone |
 
 > Values are approximate and will be pinned to a single cited dataset in
 > `assets/data/kepler47.ron`. "To scale" = correct relative sizes, distances,
@@ -438,10 +438,10 @@ doesn't hand us.
 ### 8.3 Fictionalized additions (for gameplay)
 
 - **Moons** around 47c/47d (none confirmed in reality) as early colony targets
-  with low gravity wells — ideal first ISRU sites.
+  with low gravity wells - ideal first ISRU sites.
 - **Asteroid belt(s) / Trojan swarms** at resonances and the binary's stable
   Lagrange-like regions, seeded with a procedural resource distribution
-  (metals, volatiles, water ice) — the raw feedstock of the industry game.
+  (metals, volatiles, water ice) - the raw feedstock of the industry game.
 - **Named orbital infrastructure** (starter station, shipyards) placed on
   defined element sets.
 - **Resource model:** each body/asteroid carries a composition vector (Fe, Ni,
@@ -474,7 +474,7 @@ regolith/ice  ──mine──►  raw ore/volatiles  ──refine──►  met
 ```
 
 - Hard-sci-fi constraints: **power budget** (solar falloff with distance from the
-  binary — note *two* light sources), **waste heat / radiators**, **mass &
+  binary - note *two* light sources), **waste heat / radiators**, **mass &
   delta-v**, **life support** for crewed ops.
 
 ### 9.2 Factories & automation (Factorio-in-orbit)
@@ -522,7 +522,7 @@ Frame outline (per camera):
    scatter coefficients as uniforms.
 6. **Post / UI:** tonemap, then egui dev overlays (LOD analyzer, orbit debug).
 
-Command recording for passes 4–5 is split across threads via render bundles.
+Command recording for passes 4-5 is split across threads via render bundles.
 
 ---
 
@@ -530,12 +530,12 @@ Command recording for passes 4–5 is split across threads via render bundles.
 
 | Milestone | Goal | Key deliverables |
 | --- | --- | --- |
-| **M0 — Skeleton** | Window + wgpu clears, workspace crates, CI. | `app`/`render`/`core` crates, WGSL pipeline harness. |
-| **M1 — One planet, to scale** | Render Kepler-47c to scale with LOD + log-depth + floating origin + atmosphere; scroll-wheel camera. | LOD quadtree, log-depth WGSL, hi/lo origin, atmosphere port, LOD analyzer overlay. |
-| **M2 — Orbits on rails** | Full system from `kepler47.ron`; analytic Kepler + patched conics; maneuver nodes; trajectory ribbons; time compression. | `sim/orbits`, GPU batch propagate, time/clock, transfer planner. |
-| **M3 — ISRU loop** | Mine→refine→fabricate→build one ship on one body. | `industry` crate, recipes, power/heat, shipyard. |
-| **M4 — Multiplayer sandbox** | Authority server, aeronet/WebTransport, element + economy replication, async time. | `net` crate, causal event log, anti-cheat trajectory checks. |
-| **M5 — Browser build** | WASM + WebGPU client. | wasm target, asset streaming, WebTransport-in-browser. |
+| **M0 - Skeleton** | Window + wgpu clears, workspace crates, CI. | `app`/`render`/`core` crates, WGSL pipeline harness. |
+| **M1 - One planet, to scale** | Render Kepler-47c to scale with LOD + log-depth + floating origin + atmosphere; scroll-wheel camera. | LOD quadtree, log-depth WGSL, hi/lo origin, atmosphere port, LOD analyzer overlay. |
+| **M2 - Orbits on rails** | Full system from `kepler47.ron`; analytic Kepler + patched conics; maneuver nodes; trajectory ribbons; time compression. | `sim/orbits`, GPU batch propagate, time/clock, transfer planner. |
+| **M3 - ISRU loop** | Mine→refine→fabricate→build one ship on one body. | `industry` crate, recipes, power/heat, shipyard. |
+| **M4 - Multiplayer sandbox** | Authority server, aeronet/WebTransport, element + economy replication, async time. | `net` crate, causal event log, anti-cheat trajectory checks. |
+| **M5 - Browser build** | WASM + WebGPU client. | wasm target, asset streaming, WebTransport-in-browser. |
 
 ---
 
@@ -562,16 +562,16 @@ Command recording for passes 4–5 is split across threads via render bundles.
 
 ---
 
-## Appendix A — Source References
+## Appendix A - Source References
 
 - Caelum engine (C/sokol-gfx): `src/lod.c`, `src/camera.c`, `shaders/planet.glsl`,
-  `shaders/atmosphere.glsl`, `src/celestial.c` —
+  `shaders/atmosphere.glsl`, `src/celestial.c` -
   <https://github.com/RubenTipparach/Caelum>
 - Rust graphics: `wgpu` (WebGPU). Networking: `aeronet` (WebTransport/QUIC),
   `lightyear`/`renet` (replication), `quinn`/`wtransport` (QUIC). ECS:
   `bevy_ecs`. Math: `glam`. Parallelism: `rayon`, `tokio`. Physics: `avian3d`.
-- Orbital mechanics: Kepler's equation (Newton–Halley), patched conics (KSP-
-  style), Encke's method, Dormand–Prince RK45, IAS15 (REBOUND), Wisdom–Holman
+- Orbital mechanics: Kepler's equation (Newton-Halley), patched conics (KSP-
+  style), Encke's method, Dormand-Prince RK45, IAS15 (REBOUND), Wisdom-Holman
   symplectic.
 - Kepler-47 science: Orosz et al. 2012, *Kepler-47: A Transiting Circumbinary
   Multiplanet System* (Science) and follow-ups (the third planet, 47d).
