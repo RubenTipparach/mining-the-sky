@@ -8,6 +8,7 @@ struct U {
     viewproj: mat4x4<f32>,
     sun: vec4<f32>,    // world-space sun direction in xyz
     params: vec4<f32>, // x = log-depth Fcoef
+    fog: vec4<f32>,    // rgb = horizon haze, w = fog density
 };
 
 @group(0) @binding(0) var<uniform> u: U;
@@ -50,7 +51,12 @@ fn fs(in: VsOut) -> FsOut {
     let diff = max(dot(n, s), 0.0);
     let amb = mix(vec3<f32>(0.18, 0.16, 0.14), vec3<f32>(0.40, 0.45, 0.55), clamp(n.y * 0.5 + 0.5, 0.0, 1.0));
     let sun_col = vec3<f32>(1.0, 0.97, 0.9);
-    let lit = in.color * (amb + sun_col * diff * 0.95);
+    var lit = in.color * (amb + sun_col * diff * 0.95);
+
+    // aerial perspective: fade toward horizon haze with view distance.
+    let dist = in.flogz - 1.0; // = view-space distance (clip.w)
+    let fog = 1.0 - exp(-dist * u.fog.w);
+    lit = mix(lit, u.fog.rgb, clamp(fog, 0.0, 1.0));
 
     var out: FsOut;
     out.color = vec4<f32>(lit, 1.0);

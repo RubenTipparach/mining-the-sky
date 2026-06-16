@@ -146,10 +146,29 @@ struct MeshUniforms {
     sun: [f32; 4],
     /// params.x = logarithmic-depth Fcoef = 1 / log2(far + 1).
     params: [f32; 4],
+    /// rgb = horizon haze colour, w = fog density (1/visibility metres).
+    fog: [f32; 4],
+}
+
+/// A perspective sky for the rocket view (drawn behind the terrain).
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct SkyUniforms {
+    right: [f32; 4],
+    up: [f32; 4],
+    fwd: [f32; 4],
+    sun: [f32; 4],
+    /// x = tan(fov/2), y = aspect, z/w unused.
+    params: [f32; 4],
+    /// rgb = horizon haze colour (matches the terrain fog).
+    horizon: [f32; 4],
 }
 
 /// Far plane for the rocket-view log-depth buffer (m): beyond planet diameter.
 const LOG_DEPTH_FAR: f32 = 2.0e7;
+
+/// Horizon haze colour shared by the sky and the terrain aerial-perspective fog.
+const HORIZON: [f32; 3] = [0.74, 0.82, 0.93];
 
 /// A perspective camera for the system view (all positions in Mm).
 struct SystemCamera {
@@ -255,8 +274,8 @@ impl World {
             moon_center_m,
             moon_mu,
             moon_radius_m,
-            rocket_az: 0.9,
-            rocket_el: 0.16,
+            rocket_az: 4.97,
+            rocket_el: 0.12,
             rocket_dist: rocket_frame.1,
             rocket_focus_y: rocket_frame.0,
         }
@@ -279,9 +298,8 @@ impl World {
         };
     }
 
-    /// View-projection + sun for the rocket view (a local scene in metres).
-    fn mesh_uniforms(&self, res: [f32; 2]) -> MeshUniforms {
-        let aspect = res[0] / res[1].max(1.0);
+    /// Rocket-view camera: eye, target, basis, and tan(fov/2).
+    fn rocket_camera(&self, aspect: f32) -> (Vec3, Vec3, Vec3, Vec3, Vec3, f32) {
         let target = Vec3::new(0.0, self.rocket_focus_y, 0.0);
         let dir = Vec3::new(
             self.rocket_el.cos() * self.rocket_az.cos(),
@@ -289,6 +307,18 @@ impl World {
             self.rocket_el.cos() * self.rocket_az.sin(),
         );
         let eye = target + dir * self.rocket_dist;
+        let fwd = (target - eye).normalize();
+        let right = fwd.cross(Vec3::Y).normalize();
+        let up = right.cross(fwd).normalize();
+        let tan = (50f32.to_radians() * 0.5).tan();
+        let _ = aspect;
+        (eye, target, right, up, fwd, tan)
+    }
+
+    /// View-projection + sun + fog for the rocket view (local scene, metres).
+    fn mesh_uniforms(&self, res: [f32; 2]) -> MeshUniforms {
+        let aspect = res[0] / res[1].max(1.0);
+        let (eye, target, _r, _u, _f, _t) = self.rocket_camera(aspect);
         let view = Mat4::look_at_rh(eye, target, Vec3::Y);
         // wide near/far range; the logarithmic depth buffer keeps precision.
         let proj = Mat4::perspective_rh(50f32.to_radians(), aspect, 0.1, LOG_DEPTH_FAR);
@@ -298,6 +328,21 @@ impl World {
             viewproj: vp.to_cols_array_2d(),
             sun: [0.40, 0.72, 0.55, 0.0],
             params: [fcoef, 0.0, 0.0, 0.0],
+            fog: [HORIZON[0], HORIZON[1], HORIZON[2], 1.0 / 42_000.0],
+        }
+    }
+
+    /// Sky uniforms for the rocket view.
+    fn sky_uniforms(&self, res: [f32; 2]) -> SkyUniforms {
+        let aspect = res[0] / res[1].max(1.0);
+        let (_eye, _target, right, up, fwd, tan) = self.rocket_camera(aspect);
+        SkyUniforms {
+            right: [right.x, right.y, right.z, 0.0],
+            up: [up.x, up.y, up.z, 0.0],
+            fwd: [fwd.x, fwd.y, fwd.z, 0.0],
+            sun: [0.40, 0.72, 0.55, 0.0],
+            params: [tan, aspect, 0.0, 0.0],
+            horizon: [HORIZON[0], HORIZON[1], HORIZON[2], 0.0],
         }
     }
 
@@ -766,6 +811,9 @@ struct Gpu {
     mesh_bind_group: wgpu::BindGroup,
     mesh_vbuf: wgpu::Buffer,
     mesh_vertex_count: u32,
+    sky_pipeline: wgpu::RenderPipeline,
+    sky_uniform_buf: wgpu::Buffer,
+    sky_bind_group: wgpu::BindGroup,
 }
 
 impl Gpu {
@@ -1123,6 +1171,73 @@ impl Gpu {
             multiview_mask: None,
             cache: None,
         });
+        // Sky pipeline: fullscreen, depth-compatible with the mesh pass but
+        // never writes depth, so the terrain draws over it.
+        let sky_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("sky"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("sky.wgsl").into()),
+        });
+        let sky_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sky-uniforms"),
+            size: std::mem::size_of::<SkyUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let sky_bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("sky-bind-layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let sky_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sky-bind-group"),
+            layout: &sky_bind_layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: sky_uniform_buf.as_entire_binding() }],
+        });
+        let sky_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("sky-layout"),
+            bind_group_layouts: &[Some(&sky_bind_layout)],
+            immediate_size: 0,
+        });
+        let sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("sky-pipeline"),
+            layout: Some(&sky_layout),
+            vertex: wgpu::VertexState {
+                module: &sky_shader,
+                entry_point: Some("vs"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &sky_shader,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         let mut scene_mesh = rocket::scene().mesh;
         // Append the real planet LOD terrain (same local tangent frame).
         scene_mesh.verts.extend(rocket::build_terrain().verts);
@@ -1151,6 +1266,9 @@ impl Gpu {
             mesh_bind_group,
             mesh_vbuf,
             mesh_vertex_count,
+            sky_pipeline,
+            sky_uniform_buf,
+            sky_bind_group,
         }
     }
 
@@ -1177,6 +1295,8 @@ impl Gpu {
             View::Rocket => {
                 let mu = world.mesh_uniforms(res);
                 queue.write_buffer(&self.mesh_uniform_buf, 0, bytemuck::bytes_of(&mu));
+                let sk = world.sky_uniforms(res);
+                queue.write_buffer(&self.sky_uniform_buf, 0, bytemuck::bytes_of(&sk));
             }
         }
 
@@ -1230,12 +1350,19 @@ impl Gpu {
         }
     }
 
-    /// The 3D rocket/pad mesh (depth-tested). Used in its own pass.
+    /// The 3D rocket/pad/terrain mesh (depth-tested). Used in its own pass.
     fn draw_meshes(&self, pass: &mut wgpu::RenderPass) {
         pass.set_pipeline(&self.mesh_pipeline);
         pass.set_bind_group(0, &self.mesh_bind_group, &[]);
         pass.set_vertex_buffer(0, self.mesh_vbuf.slice(..));
         pass.draw(0..self.mesh_vertex_count, 0..1);
+    }
+
+    /// Fullscreen sky behind the terrain (no depth write).
+    fn draw_sky(&self, pass: &mut wgpu::RenderPass) {
+        pass.set_pipeline(&self.sky_pipeline);
+        pass.set_bind_group(0, &self.sky_bind_group, &[]);
+        pass.draw(0..3, 0..1);
     }
 }
 
@@ -1480,6 +1607,7 @@ impl State {
             let depth = create_depth(&self.device, self.config.width, self.config.height);
             {
                 let mut pass = mesh_pass(&mut encoder, &view, &depth);
+                self.gpu.draw_sky(&mut pass);
                 self.gpu.draw_meshes(&mut pass);
             }
             {
@@ -1548,8 +1676,8 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
     let time = match scenario {
         "rocket" => {
             world.view = View::Rocket;
-            world.rocket_az = 0.9;
-            world.rocket_el = 0.16;
+            world.rocket_az = 4.97; // face inland (land), coast to the sides
+            world.rocket_el = 0.12;
             0.0
         }
         "system" => {
@@ -1675,6 +1803,7 @@ fn render_shot(
         let depth = create_depth(device, width, height);
         {
             let mut pass = mesh_pass(&mut encoder, &target_view, &depth);
+            gpu.draw_sky(&mut pass);
             gpu.draw_meshes(&mut pass);
         }
         {

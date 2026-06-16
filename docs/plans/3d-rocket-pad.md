@@ -70,8 +70,22 @@ web demo.
 - DONE (first pass) - GPU rocket-view LOD terrain: the rocket view now renders
   the real `crates/terrain` cube-sphere LOD surface in a floating-origin tangent
   frame at the spaceport, with a logarithmic depth buffer, and the rocket sits on
-  it. Follow-ups: match the macro shape to the worldgen baked planet, dynamic LOD
-  as the camera moves, atmosphere, and more relief.
+  it.
+
+## Surface-detail stages (do A, B, D now; C = Phase 2, on user go-ahead)
+
+- Stage A - Terrain realism + match the map: make the rocket-view terrain derive
+  from the SAME elevation field as the worldgen baked planet (consistent
+  continents/coastlines, so the coastal spaceport reads with ocean to one side),
+  and increase relief so the vista is dramatic.
+- Stage B - Atmosphere + sky: replace the flat clear with a sky gradient + sun
+  glow, and add aerial-perspective (distance fog) on the terrain so it fades into
+  the horizon haze. Sky as a fullscreen pass; fog in the terrain fragment.
+- Stage D - Surface detail: finer near-pad LOD (deeper quadtree, smaller patches)
+  and procedural ground detail (slope-based rock/grass colouring + micro colour
+  noise) so the ground is not flat green.
+- Stage C = Phase 2 (NOT YET - wait for user): launch + staging animation. On
+  Space the rocket lifts and stages detach/fall as propellant depletes.
 - Ground view + astronaut 3rd-person view; full view cycle.
 - Map-view polish: pan, center-on-body / center-on-rocket.
 - Economy loop: fundraise, launch parts (robonauts, refineries), assemble a

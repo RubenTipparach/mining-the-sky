@@ -229,19 +229,34 @@ fn mix3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
     [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]
 }
 
-fn terrain_color(signed_h: f64) -> [f32; 3] {
+fn hashf(p: Vec3) -> f32 {
+    let mut h = (p.x * 127.1 + p.y * 311.7 + p.z * 74.7).sin() * 43758.547;
+    h -= h.floor();
+    h
+}
+
+fn terrain_color(signed_h: f64, slope: f32, jitter: f32) -> [f32; 3] {
     if signed_h <= 0.0 {
-        return [0.05, 0.18, 0.32]; // sea
+        // shallow to deep sea
+        let t = ((-signed_h) / 1200.0).clamp(0.0, 1.0) as f32;
+        return mix3([0.07, 0.22, 0.34], [0.03, 0.10, 0.20], t);
     }
-    let t = (signed_h / 3500.0).clamp(0.0, 1.0) as f32;
-    let low = [0.22, 0.34, 0.16];
-    let mid = [0.40, 0.34, 0.22];
-    let hi = [0.86, 0.88, 0.92];
-    if t < 0.5 {
-        mix3(low, mid, t * 2.0)
+    let t = (signed_h / 4200.0).clamp(0.0, 1.0) as f32;
+    let grass = [0.20, 0.34, 0.15];
+    let scrub = [0.36, 0.33, 0.18];
+    let snow = [0.88, 0.90, 0.95];
+    let mut base = if t < 0.55 {
+        mix3(grass, scrub, t / 0.55)
     } else {
-        mix3(mid, hi, (t - 0.5) * 2.0)
-    }
+        mix3(scrub, snow, (t - 0.55) / 0.45)
+    };
+    // steep faces read as bare rock
+    let rock = [0.32, 0.28, 0.25];
+    let steep = ((slope - 0.30) / 0.35).clamp(0.0, 1.0);
+    base = mix3(base, rock, steep);
+    // micro brightness variation so the ground is not flat
+    let b = 0.90 + 0.16 * jitter;
+    [base[0] * b, base[1] * b, base[2] * b]
 }
 
 /// Build the planet LOD terrain around the spaceport, in the rocket view's
@@ -266,9 +281,9 @@ pub fn build_terrain() -> Mesh {
         Vec3::new(d.dot(east) as f32, d.dot(up) as f32, d.dot(north) as f32)
     };
 
-    // Select LOD as if the camera sits ~120 m over the pad so it refines locally.
-    let cam = origin + up * 120.0;
-    let lod = select(&planet, cam, 1.6, 16);
+    // Finer LOD: select as if the camera sits ~60 m over the pad.
+    let cam = origin + up * 60.0;
+    let lod = select(&planet, cam, 1.4, 18);
 
     let mut m = Mesh::default();
     let n = 9;
@@ -286,7 +301,8 @@ pub fn build_terrain() -> Mesh {
                 nrm = -nrm; // terrain faces up
             }
             let centroid = (w0 + w1 + w2) / 3.0;
-            let col = terrain_color(elev.height_m(centroid.normalize()));
+            let slope = 1.0 - nrm.y;
+            let col = terrain_color(elev.height_m(centroid.normalize()), slope, hashf(a));
             m.tri(a, b, c, nrm, col);
         }
     }
