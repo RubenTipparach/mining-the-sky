@@ -308,6 +308,41 @@ impl World {
         }
     }
 
+    /// World position + colour of the surface-view craft/rocket marker.
+    fn surface_marker(&self) -> (Vec3, [f32; 3]) {
+        if let Some(craft) = self.flight.as_ref() {
+            let col = if craft.crashed {
+                [1.0, 0.25, 0.2]
+            } else if craft.landed {
+                [0.4, 1.0, 0.5]
+            } else {
+                [1.0, 0.85, 0.25]
+            };
+            (craft.marker(&self.body), col)
+        } else {
+            let col = if !self.launched {
+                [0.4, 1.0, 0.4]
+            } else if self.clock <= self.mission.meco_t {
+                [1.0, 0.55, 0.15]
+            } else {
+                [0.5, 0.9, 1.0]
+            };
+            let rp = self.mission.rocket_pos(if self.launched { self.clock } else { 0.0 });
+            (rp, col)
+        }
+    }
+
+    /// Draw the surface-view marker as a filled, outlined diamond (HUD pass) so
+    /// it is visible over both the lit surface and dark space.
+    fn append_surface_marker(&self, out: &mut Vec<OverlayVertex>, aspect: f32) {
+        let (pos, col) = self.surface_marker();
+        let rt = self.camera_rot().transpose();
+        if let Some(c) = Self::project(pos, rt, aspect, self.scale) {
+            push_filled_diamond(out, c, 0.026, aspect, [0.0, 0.0, 0.0]);
+            push_filled_diamond(out, c, 0.017, aspect, col);
+        }
+    }
+
     fn build_overlay(&self, rot: Mat3, aspect: f32) -> Vec<OverlayVertex> {
         if self.view == View::System {
             // the system-view craft marker is drawn as a filled shape in the HUD
@@ -334,17 +369,10 @@ impl World {
         // launch-pad marker on the surface
         polyline(&self.mission.pad_ring, [0.9, 0.6, 0.2], &mut out);
 
-        let (marker_pos, marker_col) = if let Some(craft) = self.flight.as_ref() {
+        // trajectories (the marker itself is drawn filled in the HUD pass)
+        if let Some(craft) = self.flight.as_ref() {
             let pred = craft.predicted_orbit(&self.body);
             polyline(&pred, [0.5, 0.55, 0.25], &mut out);
-            let col = if craft.crashed {
-                [1.0, 0.25, 0.2]
-            } else if craft.landed {
-                [0.4, 1.0, 0.5]
-            } else {
-                [1.0, 0.85, 0.25]
-            };
-            (craft.marker(&self.body), col)
         } else {
             if self.mission.reached {
                 polyline(&self.mission.ring, [0.25, 0.7, 0.45], &mut out);
@@ -359,20 +387,6 @@ impl World {
                 .map(|(_, p)| *p)
                 .collect();
             polyline(&flown, [0.45, 0.9, 1.0], &mut out);
-
-            let col = if !self.launched {
-                [0.4, 1.0, 0.4]
-            } else if self.clock <= self.mission.meco_t {
-                [1.0, 0.55, 0.15]
-            } else {
-                [0.5, 0.9, 1.0]
-            };
-            let rp = self.mission.rocket_pos(if self.launched { self.clock } else { 0.0 });
-            (rp, col)
-        };
-
-        if let Some(c) = Self::project(marker_pos, rt, aspect, scale) {
-            push_marker(&mut out, c, aspect, marker_col);
         }
 
         out
@@ -946,7 +960,10 @@ impl Gpu {
         if n > 0 {
             queue.write_buffer(&self.overlay_buf, 0, bytemuck::cast_slice(&verts[..n]));
         }
-        let hud_verts = world.build_hud(hud, (res[0], res[1]));
+        let mut hud_verts = world.build_hud(hud, (res[0], res[1]));
+        if world.view == View::Surface {
+            world.append_surface_marker(&mut hud_verts, aspect);
+        }
         let hn = hud_verts.len().min(HUD_CAP as usize);
         if hn > 0 {
             queue.write_buffer(&self.hud_buf, 0, bytemuck::cast_slice(&hud_verts[..hn]));
@@ -992,19 +1009,6 @@ fn push_filled_diamond(out: &mut Vec<OverlayVertex>, c: [f32; 2], hy: f32, aspec
     }
 }
 
-/// Push a small screen-space diamond marker (line list) at clip point `c`.
-fn push_marker(out: &mut Vec<OverlayVertex>, c: [f32; 2], aspect: f32, color: [f32; 3]) {
-    let off = 0.022f32;
-    let ox = off / aspect;
-    let top = [c[0], c[1] + off];
-    let right = [c[0] + ox, c[1]];
-    let bot = [c[0], c[1] - off];
-    let left = [c[0] - ox, c[1]];
-    for (a, b) in [(top, right), (right, bot), (bot, left), (left, top)] {
-        out.push(OverlayVertex { pos: a, color });
-        out.push(OverlayVertex { pos: b, color });
-    }
-}
 
 fn render_pass<'a>(
     encoder: &'a mut wgpu::CommandEncoder,
@@ -1472,11 +1476,11 @@ impl ApplicationHandler<UserEvent> for App {
                     let dy = (y - state.last_cursor.1) as f32;
                     match state.world.view {
                         View::Surface => {
-                            state.world.az -= dx * 0.005;
+                            state.world.az += dx * 0.005;
                             state.world.el = (state.world.el + dy * 0.005).clamp(-1.5, 1.5);
                         }
                         View::System => {
-                            state.world.sys_az -= dx * 0.005;
+                            state.world.sys_az += dx * 0.005;
                             state.world.sys_el = (state.world.sys_el + dy * 0.005).clamp(-1.5, 1.5);
                         }
                     }
