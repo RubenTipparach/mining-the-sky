@@ -34,6 +34,14 @@ pub struct Mission {
     pub vehicle: &'static str,
     pub stage_count: usize,
 
+    /// Vehicle assembly readout: per stage (name, wet tonnes, ideal dv m/s),
+    /// ordered bottom (index 0) to top, plus stack totals.
+    pub stack: Vec<(&'static str, f32, f32)>,
+    pub liftoff_mass_t: f32,
+    pub liftoff_twr: f32,
+    pub total_dv: f32,
+    pub payload_t: f32,
+
     // scalar ascent telemetry, one per sample: (t, alt_km, speed, downrange_km, stage)
     tel: Vec<(f32, f32, f32, f32, usize)>,
     // parking orbit readout
@@ -108,6 +116,20 @@ impl Mission {
             })
             .collect();
 
+        // Vehicle assembly stats (independent of the flight).
+        let mut stack: Vec<(&'static str, f32, f32)> = Vec::new();
+        let mut total_dv = 0.0f32;
+        for (i, s) in veh.stages.iter().enumerate() {
+            let upper = veh.mass_above(i);
+            let dv = s.dv(upper) as f32;
+            total_dv += dv;
+            stack.push((s.name, (s.wet() / 1000.0) as f32, dv));
+        }
+        let liftoff_mass_t = (veh.liftoff_mass() / 1000.0) as f32;
+        let liftoff_twr =
+            (veh.stages[0].thrust / (veh.liftoff_mass() * body.surface_gravity())) as f32;
+        let payload_t = (veh.payload / 1000.0) as f32;
+
         let reached = res.reached_orbit;
         let peri_km = ((res.final_orbit.rp - radius) / 1000.0) as f32;
         let apo_km = ((res.final_orbit.ra - radius) / 1000.0) as f32;
@@ -176,6 +198,11 @@ impl Mission {
             meco_t,
             vehicle: veh.name,
             stage_count: veh.stages.len(),
+            stack,
+            liftoff_mass_t,
+            liftoff_twr,
+            total_dv,
+            payload_t,
             tel,
             park_alt_km,
             park_speed,
@@ -245,6 +272,11 @@ impl Mission {
                 orbit: Some((self.peri_km, self.apo_km)),
             }
         }
+    }
+
+    /// Target parking-orbit altitude (km) for the vehicle readout.
+    pub fn target_orbit_km(&self) -> f32 {
+        self.apo_km
     }
 
     fn ring_point(&self, theta: f32) -> Vec3 {

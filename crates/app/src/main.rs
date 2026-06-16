@@ -398,6 +398,9 @@ impl World {
         if let Some(craft) = self.flight.as_ref() {
             return self.build_flight_hud(hud, craft, res);
         }
+        if !self.launched {
+            return self.build_vehicle_hud(hud, res);
+        }
 
         let mut out: Vec<OverlayVertex> = Vec::new();
         let dim = [0.55, 0.75, 0.85];
@@ -503,6 +506,56 @@ impl World {
             "F  RELEASE CONTROL",
             "[ ] TIME WARP",
         ] {
+            hud.text(&mut out, line, x, hy, dim, res);
+            hy += step;
+        }
+        out
+    }
+
+    fn build_vehicle_hud(&self, hud: &Hud, res: (f32, f32)) -> Vec<OverlayVertex> {
+        let mut out: Vec<OverlayVertex> = Vec::new();
+        let dim = [0.55, 0.75, 0.85];
+        let val = [0.92, 0.96, 1.0];
+        let amber = [1.0, 0.78, 0.30];
+        let green = [0.5, 1.0, 0.5];
+        let x = 16.0;
+        let step = hud::LINE_H;
+        let row = |out: &mut Vec<OverlayVertex>, label: &str, value: &str, y: f32, c: [f32; 3]| {
+            let cx = hud.text(out, label, x, y, dim, res);
+            hud.text(out, value, cx, y, c, res);
+        };
+
+        let m = &self.mission;
+        let mut y = 16.0;
+        hud.text(&mut out, "VEHICLE ASSEMBLY", x, y, amber, res);
+        y += step * 1.3;
+        hud.text(&mut out, m.vehicle, x, y, val, res);
+        y += step * 1.3;
+
+        // stages, top of the stack first
+        for (i, (name, wet_t, dv)) in m.stack.iter().enumerate().rev() {
+            let label = format!("S{} {}", i + 1, name);
+            let value = format!("{:.0} T  {:.0} M/S", wet_t, dv);
+            // pad the label column to align values
+            let padded = format!("{:<11}", label);
+            row(&mut out, &padded, &value, y, val);
+            y += step;
+        }
+        y += step * 0.5;
+        row(&mut out, "MASS     ", &format!("{:.0} T", m.liftoff_mass_t), y, val);
+        y += step;
+        row(&mut out, "TWR      ", &format!("{:.2}", m.liftoff_twr), y, val);
+        y += step;
+        row(&mut out, "DELTA-V  ", &format!("{:.0} M/S", m.total_dv), y, val);
+        y += step;
+        row(&mut out, "PAYLOAD  ", &format!("{:.0} T", m.payload_t), y, val);
+        y += step;
+        row(&mut out, "TARGET   ", &format!("{:.0} KM ORBIT", m.target_orbit_km()), y, val);
+        y += step * 1.3;
+        hud.text(&mut out, "SPACE  LAUNCH", x, y, green, res);
+
+        let mut hy = res.1 - step * 3.0 - 12.0;
+        for line in ["DRAG ORBIT   SCROLL ZOOM", "V  SYSTEM VIEW", "[ ] TIME WARP"] {
             hud.text(&mut out, line, x, hy, dim, res);
             hy += step;
         }
@@ -1158,6 +1211,15 @@ fn screenshot(path: &str, width: u32, height: u32, scenario: &str) {
             world.flight = Some(craft);
             6.0
         }
+        "pad" => {
+            // pre-launch: the vehicle assembly panel, planet framed at the limb.
+            world.view = View::Surface;
+            world.launched = false;
+            world.az = world.mission.spaceport_lon + 1.15;
+            world.el = world.mission.spaceport_lat + 0.25;
+            world.scale = 1.35;
+            (world.az + 1.66 - world.mission.spaceport_lon) / 0.03
+        }
         _ => {
             // surface / launch view: launched, craft coasting in its parking
             // orbit, the spaceport at the limb so the ascent arc + orbit ring
@@ -1441,12 +1503,15 @@ fn main() {
                 "moon"
             } else if args.iter().any(|a| a == "system") {
                 "system"
+            } else if args.iter().any(|a| a == "pad") {
+                "pad"
             } else {
                 "surface"
             };
             let default = match scenario {
                 "moon" => "out/moon.png",
                 "system" => "out/system.png",
+                "pad" => "out/pad.png",
                 _ => "out/client.png",
             };
             let path = args
