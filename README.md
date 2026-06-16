@@ -61,9 +61,12 @@ cargo run -p sim --bin launch --release
 #   1-4 = thrust mode, W/S = throttle, V = system view, [ ] = time warp
 cargo run -p app --release
 
-# Render frames to PNGs headlessly (no window needed)
+# Render frames to PNGs headlessly (no window needed) for visual validation
+cargo run -p app --release -- shot all                    # every feature -> ./out
 cargo run -p app --release -- shot pad    out/pad.png     # pre-launch vehicle assembly
-cargo run -p app --release -- shot        out/client.png  # launch / parking orbit
+cargo run -p app --release -- shot ascent out/ascent.png  # mid powered ascent
+cargo run -p app --release -- shot        out/client.png  # parking orbit
+cargo run -p app --release -- shot flight out/flight.png  # manual free-flight HUD
 cargo run -p app --release -- shot system out/system.png  # home world + moon
 cargo run -p app --release -- shot moon   out/moon.png    # landed on the moon
 
