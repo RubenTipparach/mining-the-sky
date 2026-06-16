@@ -3,10 +3,15 @@
 //! A wgpu/WebGPU app (native + browser via wasm) that renders a live
 //! procedural planet and flies an interactive launch-to-orbit. The planet is an
 //! orthographic raymarch of the baked worldgen texture; on top of it we draw
-//! the `sim` crate's staged ascent: drag to orbit the camera, scroll to zoom,
-//! press Space to launch Pioneer I from the seed-47 spaceport and watch it fly
-//! a gravity turn into a parking orbit. This is the start of the Caelum-style
-//! renderer; the camera/overlay here is the seam the 3D LOD renderer grows from.
+//! the `sim` crate's staged ascent and a manual free-flight mode: drag to orbit
+//! the camera, scroll to zoom, Space to launch Pioneer I from the seed-47
+//! spaceport, F to take manual control and land. This is the start of the
+//! Caelum-style renderer; the camera/overlay here is the seam the 3D LOD
+//! renderer grows from.
+//!
+//! The render state is split into `World` (simulation + camera, no GPU) and
+//! `Gpu` (pipelines + buffers), so the windowed client and a headless
+//! `--shot` screenshot path share the same scene-recording code.
 
 use std::sync::Arc;
 
@@ -47,24 +52,12 @@ struct OverlayVertex {
 const OVERLAY_CAP: u64 = 8192;
 const HUD_CAP: u64 = 40000;
 
-struct State {
-    window: Arc<Window>,
-    surface: wgpu::Surface<'static>,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
-    pipeline: wgpu::RenderPipeline,
-    uniform_buf: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
-    overlay_pipeline: wgpu::RenderPipeline,
-    overlay_buf: wgpu::Buffer,
-    hud_pipeline: wgpu::RenderPipeline,
-    hud_buf: wgpu::Buffer,
-    hud: Hud,
-    start: instant_now::Instant,
-    last_t: f32,
+// ---------------------------------------------------------------------------
+// World: simulation, camera, and flight state (no GPU objects). Also owns the
+// per-frame geometry/uniform builders so both render paths share them.
+// ---------------------------------------------------------------------------
 
-    // mission + camera + flight state
+struct World {
     mission: Mission,
     body: CentralBody,
     flight: Option<Craft>,
@@ -74,70 +67,300 @@ struct State {
     launched: bool,
     clock: f32, // mission-elapsed seconds
     warp: f32,
-
-    // input
-    dragging: bool,
-    last_cursor: (f64, f64),
 }
 
-impl State {
-    async fn new(window: Arc<Window>) -> State {
-        let size = window.inner_size();
-        let width = size.width.max(1);
-        let height = size.height.max(1);
+impl World {
+    fn new() -> World {
+        let mission = Mission::pioneer_from_spaceport();
+        World {
+            az: mission.spaceport_lon,
+            el: mission.spaceport_lat,
+            scale: 1.25,
+            launched: false,
+            clock: 0.0,
+            warp: 8.0,
+            mission,
+            body: CentralBody::home(),
+            flight: None,
+        }
+    }
 
-        let instance = wgpu::Instance::new(
-            wgpu::InstanceDescriptor::new_without_display_handle_from_env(),
-        );
-        let surface = instance.create_surface(window.clone()).expect("surface");
+    /// Advance simulation by a real frame dt (seconds).
+    fn advance(&mut self, frame_dt: f32) {
+        if let Some(craft) = self.flight.as_mut() {
+            let dt_sim = frame_dt * self.warp.min(8.0);
+            craft.integrate(&self.body, dt_sim as f64);
+        } else if self.launched {
+            self.clock += frame_dt * self.warp;
+        }
+    }
 
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            })
-            .await
-            .expect("no adapter");
+    fn toggle_launch(&mut self) {
+        self.launched = !self.launched;
+        self.clock = 0.0;
+        if self.launched {
+            log::info!("Liftoff: Pioneer I");
+        }
+    }
 
-        let limits = if cfg!(target_arch = "wasm32") {
-            wgpu::Limits::downlevel_defaults()
+    fn toggle_flight(&mut self) {
+        if self.flight.is_some() {
+            self.flight = None;
+            return;
+        }
+        let (r, v) = if self.launched && self.mission.reached && self.clock > self.mission.meco_t {
+            self.mission.orbit_state_at(self.clock)
         } else {
-            wgpu::Limits::default()
+            self.mission.pad_state()
+        };
+        self.flight = Some(Craft::maneuvering(r, v));
+        log::info!("Manual flight control engaged");
+    }
+
+    /// World-from-view rotation: column 2 is the world point facing the camera.
+    fn camera_rot(&self) -> Mat3 {
+        let d = Vec3::new(
+            self.el.cos() * self.az.cos(),
+            self.el.sin(),
+            self.el.cos() * self.az.sin(),
+        );
+        let xc = Vec3::Y.cross(d).normalize();
+        let yc = d.cross(xc).normalize();
+        Mat3::from_cols(xc, yc, d)
+    }
+
+    fn uniforms(&self, res: [f32; 2], time: f32) -> Uniforms {
+        let rot = self.camera_rot();
+        let st = time * 0.03 + self.mission.spaceport_lon;
+        let sun = Vec3::new(st.cos() * 0.95, 0.28, st.sin() * 0.95).normalize();
+        Uniforms {
+            resolution: res,
+            scale: self.scale,
+            time,
+            sun: [sun.x, sun.y, sun.z, 0.0],
+            cx: [rot.x_axis.x, rot.x_axis.y, rot.x_axis.z, 0.0],
+            cy: [rot.y_axis.x, rot.y_axis.y, rot.y_axis.z, 0.0],
+            cz: [rot.z_axis.x, rot.z_axis.y, rot.z_axis.z, 0.0],
+        }
+    }
+
+    /// Project a world unit-sphere point through the orthographic camera to
+    /// clip space. Returns `None` when the point is hidden behind the planet.
+    fn project(p: Vec3, rt: Mat3, aspect: f32, scale: f32) -> Option<[f32; 2]> {
+        let v = rt * p;
+        let occluded = v.z < 0.0 && (v.x * v.x + v.y * v.y) < 1.0;
+        if occluded {
+            None
+        } else {
+            Some([v.x / (aspect * scale), v.y / scale])
+        }
+    }
+
+    fn build_overlay(&self, rot: Mat3, aspect: f32) -> Vec<OverlayVertex> {
+        let rt = rot.transpose();
+        let scale = self.scale;
+        let mut out: Vec<OverlayVertex> = Vec::new();
+
+        let polyline = |pts: &[Vec3], color: [f32; 3], out: &mut Vec<OverlayVertex>| {
+            let mut prev: Option<[f32; 2]> = None;
+            for &p in pts {
+                let cur = Self::project(p, rt, aspect, scale);
+                if let (Some(a), Some(b)) = (prev, cur) {
+                    out.push(OverlayVertex { pos: a, color });
+                    out.push(OverlayVertex { pos: b, color });
+                }
+                prev = cur;
+            }
         };
 
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: limits,
-                memory_hints: wgpu::MemoryHints::Performance,
-                experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                trace: wgpu::Trace::Off,
-            })
-            .await
-            .expect("device");
+        // launch-pad marker on the surface
+        polyline(&self.mission.pad_ring, [0.9, 0.6, 0.2], &mut out);
 
-        let caps = surface.get_capabilities(&adapter);
-        let format = caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| f.is_srgb())
-            .unwrap_or(caps.formats[0]);
+        let (marker_pos, marker_col) = if let Some(craft) = self.flight.as_ref() {
+            let pred = craft.predicted_orbit(&self.body);
+            polyline(&pred, [0.5, 0.55, 0.25], &mut out);
+            let col = if craft.crashed {
+                [1.0, 0.25, 0.2]
+            } else if craft.landed {
+                [0.4, 1.0, 0.5]
+            } else {
+                [1.0, 0.85, 0.25]
+            };
+            (craft.marker(&self.body), col)
+        } else {
+            if self.mission.reached {
+                polyline(&self.mission.ring, [0.25, 0.7, 0.45], &mut out);
+            }
+            let path_pts: Vec<Vec3> = self.mission.path.iter().map(|(_, p)| *p).collect();
+            polyline(&path_pts, [0.20, 0.45, 0.55], &mut out);
+            let flown: Vec<Vec3> = self
+                .mission
+                .path
+                .iter()
+                .filter(|(t, _)| *t <= self.clock)
+                .map(|(_, p)| *p)
+                .collect();
+            polyline(&flown, [0.45, 0.9, 1.0], &mut out);
 
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
-            width,
-            height,
-            present_mode: wgpu::PresentMode::Fifo,
-            alpha_mode: caps.alpha_modes[0],
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+            let col = if !self.launched {
+                [0.4, 1.0, 0.4]
+            } else if self.clock <= self.mission.meco_t {
+                [1.0, 0.55, 0.15]
+            } else {
+                [0.5, 0.9, 1.0]
+            };
+            let rp = self.mission.rocket_pos(if self.launched { self.clock } else { 0.0 });
+            (rp, col)
         };
-        surface.configure(&device, &config);
 
+        if let Some(c) = Self::project(marker_pos, rt, aspect, scale) {
+            let off = 0.022f32;
+            let ox = off / aspect;
+            let top = [c[0], c[1] + off];
+            let right = [c[0] + ox, c[1]];
+            let bot = [c[0], c[1] - off];
+            let left = [c[0] - ox, c[1]];
+            for (a, b) in [(top, right), (right, bot), (bot, left), (left, top)] {
+                out.push(OverlayVertex { pos: a, color: marker_col });
+                out.push(OverlayVertex { pos: b, color: marker_col });
+            }
+        }
+
+        out
+    }
+
+    fn build_hud(&self, hud: &Hud, res: (f32, f32)) -> Vec<OverlayVertex> {
+        if let Some(craft) = self.flight.as_ref() {
+            return self.build_flight_hud(hud, craft, res);
+        }
+
+        let mut out: Vec<OverlayVertex> = Vec::new();
+        let dim = [0.55, 0.75, 0.85];
+        let val = [0.92, 0.96, 1.0];
+        let amber = [1.0, 0.78, 0.30];
+        let x = 16.0;
+        let step = hud::LINE_H;
+        let row = |out: &mut Vec<OverlayVertex>, label: &str, value: &str, y: f32| {
+            let cx = hud.text(out, label, x, y, dim, res);
+            hud.text(out, value, cx, y, val, res);
+        };
+
+        let tel = self.mission.telemetry(self.launched, self.clock);
+        let mut y = 16.0;
+        hud.text(&mut out, self.mission.vehicle, x, y, amber, res);
+        y += step * 1.5;
+
+        let phase_col = match tel.phase {
+            "ASCENT" => [1.0, 0.55, 0.15],
+            "ORBIT" => [0.5, 0.9, 1.0],
+            _ => [0.5, 1.0, 0.5],
+        };
+        let cx = hud.text(&mut out, "PHASE    ", x, y, dim, res);
+        hud.text(&mut out, tel.phase, cx, y, phase_col, res);
+        y += step;
+
+        row(&mut out, "MET      ", &format!("T+{:.0}S", self.clock.max(0.0)), y);
+        y += step;
+        row(&mut out, "ALT      ", &format!("{:.1} KM", tel.alt_km), y);
+        y += step;
+        row(&mut out, "VEL      ", &format!("{:.0} M/S", tel.speed), y);
+        y += step;
+        if let Some((peri, apo)) = tel.orbit {
+            row(&mut out, "ORBIT    ", &format!("{:.0} X {:.0} KM", peri, apo), y);
+        } else {
+            row(&mut out, "RANGE    ", &format!("{:.0} KM", tel.downrange_km), y);
+        }
+        y += step;
+        row(
+            &mut out,
+            "STAGE    ",
+            &format!("{}/{}", tel.stage + 1, self.mission.stage_count),
+            y,
+        );
+        y += step;
+        row(&mut out, "WARP     ", &format!("{:.0}X", self.warp), y);
+
+        let mut hy = res.1 - step * 4.0 - 12.0;
+        for line in [
+            "SPACE LAUNCH/RESET",
+            "F  TAKE MANUAL CONTROL",
+            "DRAG ORBIT   SCROLL ZOOM",
+            "[ ] TIME WARP",
+        ] {
+            hud.text(&mut out, line, x, hy, dim, res);
+            hy += step;
+        }
+        out
+    }
+
+    fn build_flight_hud(&self, hud: &Hud, craft: &Craft, res: (f32, f32)) -> Vec<OverlayVertex> {
+        let mut out: Vec<OverlayVertex> = Vec::new();
+        let dim = [0.55, 0.75, 0.85];
+        let val = [0.92, 0.96, 1.0];
+        let amber = [1.0, 0.78, 0.30];
+        let x = 16.0;
+        let step = hud::LINE_H;
+        let row = |out: &mut Vec<OverlayVertex>, label: &str, value: &str, y: f32| {
+            let cx = hud.text(out, label, x, y, dim, res);
+            hud.text(out, value, cx, y, val, res);
+        };
+
+        let mut y = 16.0;
+        hud.text(&mut out, "MANUAL FLIGHT", x, y, amber, res);
+        y += step * 1.5;
+
+        let status = craft.status();
+        let scol = match status {
+            "CRASHED" => [1.0, 0.3, 0.25],
+            "LANDED" => [0.4, 1.0, 0.5],
+            _ => [1.0, 0.8, 0.3],
+        };
+        let cx = hud.text(&mut out, "STATUS   ", x, y, dim, res);
+        hud.text(&mut out, status, cx, y, scol, res);
+        y += step;
+
+        row(&mut out, "ALT      ", &format!("{:.1} KM", craft.altitude(&self.body) / 1000.0), y);
+        y += step;
+        row(&mut out, "VEL      ", &format!("{:.0} M/S", craft.speed()), y);
+        y += step;
+        row(&mut out, "VSPD     ", &format!("{:.0} M/S", craft.vertical_speed()), y);
+        y += step;
+        row(&mut out, "THROTTLE ", &format!("{:.0}", craft.throttle * 100.0), y);
+        y += step;
+        row(&mut out, "PROP     ", &format!("{:.0}", craft.prop_frac() * 100.0), y);
+        y += step;
+        row(&mut out, "MODE     ", craft.mode.label(), y);
+
+        let mut hy = res.1 - step * 4.0 - 12.0;
+        for line in [
+            "W / S  THROTTLE",
+            "1 PRO  2 RETRO  3 OUT  4 IN",
+            "F  RELEASE CONTROL",
+            "[ ] TIME WARP",
+        ] {
+            hud.text(&mut out, line, x, hy, dim, res);
+            hy += step;
+        }
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Gpu: pipelines + buffers, independent of any window/surface.
+// ---------------------------------------------------------------------------
+
+struct Gpu {
+    pipeline: wgpu::RenderPipeline,
+    uniform_buf: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    overlay_pipeline: wgpu::RenderPipeline,
+    overlay_buf: wgpu::Buffer,
+    hud_pipeline: wgpu::RenderPipeline,
+    hud_buf: wgpu::Buffer,
+}
+
+impl Gpu {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Gpu {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("planet"),
             source: wgpu::ShaderSource::Wgsl(include_str!("planet.wgsl").into()),
@@ -150,7 +373,6 @@ impl State {
             mapped_at_creation: false,
         });
 
-        // Baked world texture (RGB albedo, A = city-light emission).
         let planet_img = image::load_from_memory(include_bytes!("../assets/planet.png"))
             .expect("decode planet.png")
             .to_rgba8();
@@ -283,7 +505,6 @@ impl State {
             cache: None,
         });
 
-        // Overlay pipeline: pre-projected clip-space line list, no bind groups.
         let overlay_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("overlay"),
             source: wgpu::ShaderSource::Wgsl(include_str!("overlay.wgsl").into()),
@@ -293,29 +514,30 @@ impl State {
             bind_group_layouts: &[],
             immediate_size: 0,
         });
-        let overlay_pipeline =
+        let vbuf_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<OverlayVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x2,
+                    offset: 0,
+                    shader_location: 0,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x3,
+                    offset: 8,
+                    shader_location: 1,
+                },
+            ],
+        };
+        let make_line_pipeline = |topology: wgpu::PrimitiveTopology, label: &str| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("overlay-pipeline"),
+                label: Some(label),
                 layout: Some(&overlay_layout),
                 vertex: wgpu::VertexState {
                     module: &overlay_shader,
                     entry_point: Some("vs"),
-                    buffers: &[wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<OverlayVertex>() as u64,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &[
-                            wgpu::VertexAttribute {
-                                format: wgpu::VertexFormat::Float32x2,
-                                offset: 0,
-                                shader_location: 0,
-                            },
-                            wgpu::VertexAttribute {
-                                format: wgpu::VertexFormat::Float32x3,
-                                offset: 8,
-                                shader_location: 1,
-                            },
-                        ],
-                    }],
+                    buffers: &[vbuf_layout.clone()],
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -329,14 +551,19 @@ impl State {
                     compilation_options: Default::default(),
                 }),
                 primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::LineList,
+                    topology,
                     ..Default::default()
                 },
                 depth_stencil: None,
                 multisample: wgpu::MultisampleState::default(),
                 multiview_mask: None,
                 cache: None,
-            });
+            })
+        };
+        let overlay_pipeline =
+            make_line_pipeline(wgpu::PrimitiveTopology::LineList, "overlay-pipeline");
+        let hud_pipeline =
+            make_line_pipeline(wgpu::PrimitiveTopology::TriangleList, "hud-pipeline");
 
         let overlay_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("overlay-buf"),
@@ -344,53 +571,6 @@ impl State {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-
-        // HUD: same vertices/shader as the overlay but a triangle list (the
-        // bitmap font emits a quad per lit pixel).
-        let hud_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("hud-pipeline"),
-            layout: Some(&overlay_layout),
-            vertex: wgpu::VertexState {
-                module: &overlay_shader,
-                entry_point: Some("vs"),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<OverlayVertex>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x2,
-                            offset: 0,
-                            shader_location: 0,
-                        },
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x3,
-                            offset: 8,
-                            shader_location: 1,
-                        },
-                    ],
-                }],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &overlay_shader,
-                entry_point: Some("fs"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-
         let hud_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("hud-buf"),
             size: HUD_CAP * std::mem::size_of::<OverlayVertex>() as u64,
@@ -398,14 +578,7 @@ impl State {
             mapped_at_creation: false,
         });
 
-        let mission = Mission::pioneer_from_spaceport();
-
-        State {
-            window,
-            surface,
-            device,
-            queue,
-            config,
+        Gpu {
             pipeline,
             uniform_buf,
             bind_group,
@@ -413,36 +586,169 @@ impl State {
             overlay_buf,
             hud_pipeline,
             hud_buf,
-            hud: Hud::new(),
-            start: instant_now::Instant::now(),
-            last_t: 0.0,
-            az: mission.spaceport_lon,
-            el: mission.spaceport_lat,
-            scale: 1.25,
-            launched: false,
-            clock: 0.0,
-            warp: 8.0,
-            mission,
-            body: CentralBody::home(),
-            flight: None,
-            dragging: false,
-            last_cursor: (0.0, 0.0),
         }
     }
 
-    /// Take or release manual control of the craft.
-    fn toggle_flight(&mut self) {
-        if self.flight.is_some() {
-            self.flight = None;
-            return;
+    /// Upload this frame's uniforms + geometry. Returns (overlay verts, hud verts).
+    fn prepare(
+        &self,
+        queue: &wgpu::Queue,
+        world: &World,
+        hud: &Hud,
+        w: u32,
+        h: u32,
+        time: f32,
+    ) -> (usize, usize) {
+        let res = [w as f32, h.max(1) as f32];
+        let uniforms = world.uniforms(res, time);
+        queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
+
+        let aspect = res[0] / res[1];
+        let verts = world.build_overlay(world.camera_rot(), aspect);
+        let n = verts.len().min(OVERLAY_CAP as usize);
+        if n > 0 {
+            queue.write_buffer(&self.overlay_buf, 0, bytemuck::cast_slice(&verts[..n]));
         }
-        let (r, v) = if self.launched && self.mission.reached && self.clock > self.mission.meco_t {
-            self.mission.orbit_state_at(self.clock)
+        let hud_verts = world.build_hud(hud, (res[0], res[1]));
+        let hn = hud_verts.len().min(HUD_CAP as usize);
+        if hn > 0 {
+            queue.write_buffer(&self.hud_buf, 0, bytemuck::cast_slice(&hud_verts[..hn]));
+        }
+        (n, hn)
+    }
+
+    fn draw(&self, pass: &mut wgpu::RenderPass, n_overlay: usize, n_hud: usize) {
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.draw(0..3, 0..1);
+        if n_overlay > 0 {
+            pass.set_pipeline(&self.overlay_pipeline);
+            pass.set_vertex_buffer(0, self.overlay_buf.slice(..));
+            pass.draw(0..n_overlay as u32, 0..1);
+        }
+        if n_hud > 0 {
+            pass.set_pipeline(&self.hud_pipeline);
+            pass.set_vertex_buffer(0, self.hud_buf.slice(..));
+            pass.draw(0..n_hud as u32, 0..1);
+        }
+    }
+}
+
+fn render_pass<'a>(
+    encoder: &'a mut wgpu::CommandEncoder,
+    view: &'a wgpu::TextureView,
+) -> wgpu::RenderPass<'a> {
+    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view,
+            resolve_target: None,
+            depth_slice: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// State: the windowed client.
+// ---------------------------------------------------------------------------
+
+struct State {
+    window: Arc<Window>,
+    surface: wgpu::Surface<'static>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    config: wgpu::SurfaceConfiguration,
+    gpu: Gpu,
+    hud: Hud,
+    world: World,
+    start: instant_now::Instant,
+    last_t: f32,
+    dragging: bool,
+    last_cursor: (f64, f64),
+}
+
+impl State {
+    async fn new(window: Arc<Window>) -> State {
+        let size = window.inner_size();
+        let width = size.width.max(1);
+        let height = size.height.max(1);
+
+        let instance = wgpu::Instance::new(
+            wgpu::InstanceDescriptor::new_without_display_handle_from_env(),
+        );
+        let surface = instance.create_surface(window.clone()).expect("surface");
+
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            })
+            .await
+            .expect("no adapter");
+
+        let limits = if cfg!(target_arch = "wasm32") {
+            wgpu::Limits::downlevel_defaults()
         } else {
-            self.mission.pad_state()
+            wgpu::Limits::default()
         };
-        self.flight = Some(Craft::maneuvering(r, v));
-        log::info!("Manual flight control engaged");
+
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: limits,
+                memory_hints: wgpu::MemoryHints::Performance,
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                trace: wgpu::Trace::Off,
+            })
+            .await
+            .expect("device");
+
+        let caps = surface.get_capabilities(&adapter);
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| f.is_srgb())
+            .unwrap_or(caps.formats[0]);
+
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width,
+            height,
+            present_mode: wgpu::PresentMode::Fifo,
+            alpha_mode: caps.alpha_modes[0],
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        surface.configure(&device, &config);
+
+        let gpu = Gpu::new(&device, &queue, format);
+
+        State {
+            window,
+            surface,
+            device,
+            queue,
+            config,
+            gpu,
+            hud: Hud::new(),
+            world: World::new(),
+            start: instant_now::Instant::now(),
+            last_t: 0.0,
+            dragging: false,
+            last_cursor: (0.0, 0.0),
+        }
     }
 
     fn resize(&mut self, width: u32, height: u32) {
@@ -453,74 +759,15 @@ impl State {
         }
     }
 
-    /// World-from-view rotation: column 2 is the world point facing the camera.
-    fn camera_rot(&self) -> Mat3 {
-        let d = Vec3::new(
-            self.el.cos() * self.az.cos(),
-            self.el.sin(),
-            self.el.cos() * self.az.sin(),
-        );
-        let xc = Vec3::Y.cross(d).normalize();
-        let yc = d.cross(xc).normalize();
-        Mat3::from_cols(xc, yc, d)
-    }
-
-    fn toggle_launch(&mut self) {
-        self.launched = !self.launched;
-        self.clock = 0.0;
-        if self.launched {
-            log::info!("Liftoff: Pioneer I");
-        }
-    }
-
     fn render(&mut self) {
-        // advance the mission clock by the real frame dt (clamped against hitches)
         let t = self.start.elapsed().as_secs_f32();
         let frame_dt = (t - self.last_t).clamp(0.0, 0.1);
         self.last_t = t;
-        if let Some(craft) = self.flight.as_mut() {
-            // manual flight integrates live; cap warp so control stays sane
-            let dt_sim = frame_dt * self.warp.min(8.0);
-            craft.integrate(&self.body, dt_sim as f64);
-        } else if self.launched {
-            self.clock += frame_dt * self.warp;
-        }
+        self.world.advance(frame_dt);
 
-        let rot = self.camera_rot();
-
-        // sun direction: world-space, slowly rotating, phased so the spaceport
-        // starts near the day side.
-        let st = t * 0.03 + self.mission.spaceport_lon;
-        let sun = Vec3::new(st.cos() * 0.95, 0.28, st.sin() * 0.95).normalize();
-
-        let uniforms = Uniforms {
-            resolution: [self.config.width as f32, self.config.height as f32],
-            scale: self.scale,
-            time: t,
-            sun: [sun.x, sun.y, sun.z, 0.0],
-            cx: [rot.x_axis.x, rot.x_axis.y, rot.x_axis.z, 0.0],
-            cy: [rot.y_axis.x, rot.y_axis.y, rot.y_axis.z, 0.0],
-            cz: [rot.z_axis.x, rot.z_axis.y, rot.z_axis.z, 0.0],
-        };
-        self.queue
-            .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
-
-        // build + upload overlay geometry for this frame
-        let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
-        let verts = self.build_overlay(rot, aspect);
-        let n = verts.len().min(OVERLAY_CAP as usize);
-        if n > 0 {
-            self.queue
-                .write_buffer(&self.overlay_buf, 0, bytemuck::cast_slice(&verts[..n]));
-        }
-
-        // build + upload HUD text for this frame
-        let hud_verts = self.build_hud();
-        let hn = hud_verts.len().min(HUD_CAP as usize);
-        if hn > 0 {
-            self.queue
-                .write_buffer(&self.hud_buf, 0, bytemuck::cast_slice(&hud_verts[..hn]));
-        }
+        let (n, hn) = self
+            .gpu
+            .prepare(&self.queue, &self.world, &self.hud, self.config.width, self.config.height, t);
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
@@ -537,252 +784,138 @@ impl State {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("enc") });
         {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.draw(0..3, 0..1);
-
-            if n > 0 {
-                pass.set_pipeline(&self.overlay_pipeline);
-                pass.set_vertex_buffer(0, self.overlay_buf.slice(..));
-                pass.draw(0..n as u32, 0..1);
-            }
-            if hn > 0 {
-                pass.set_pipeline(&self.hud_pipeline);
-                pass.set_vertex_buffer(0, self.hud_buf.slice(..));
-                pass.draw(0..hn as u32, 0..1);
-            }
+            let mut pass = render_pass(&mut encoder, &view);
+            self.gpu.draw(&mut pass, n, hn);
         }
         self.queue.submit(Some(encoder.finish()));
         frame.present();
     }
-
-    /// Project a world unit-sphere point through the orthographic camera to
-    /// clip space. Returns `None` when the point is hidden behind the planet.
-    fn project(p: Vec3, rt: Mat3, aspect: f32, scale: f32) -> Option<[f32; 2]> {
-        let v = rt * p;
-        let occluded = v.z < 0.0 && (v.x * v.x + v.y * v.y) < 1.0;
-        if occluded {
-            None
-        } else {
-            Some([v.x / (aspect * scale), v.y / scale])
-        }
-    }
-
-    fn build_overlay(&self, rot: Mat3, aspect: f32) -> Vec<OverlayVertex> {
-        let rt = rot.transpose();
-        let scale = self.scale;
-        let mut out: Vec<OverlayVertex> = Vec::new();
-
-        let polyline = |pts: &[Vec3], color: [f32; 3], out: &mut Vec<OverlayVertex>| {
-            let mut prev: Option<[f32; 2]> = None;
-            for &p in pts {
-                let cur = Self::project(p, rt, aspect, scale);
-                if let (Some(a), Some(b)) = (prev, cur) {
-                    out.push(OverlayVertex { pos: a, color });
-                    out.push(OverlayVertex { pos: b, color });
-                }
-                prev = cur;
-            }
-        };
-
-        // launch-pad marker on the surface
-        polyline(&self.mission.pad_ring, [0.9, 0.6, 0.2], &mut out);
-
-        let (marker_pos, marker_col) = if let Some(craft) = self.flight.as_ref() {
-            // manual flight: live predicted conic + craft marker
-            let pred = craft.predicted_orbit(&self.body);
-            polyline(&pred, [0.5, 0.55, 0.25], &mut out);
-            let col = if craft.crashed {
-                [1.0, 0.25, 0.2]
-            } else if craft.landed {
-                [0.4, 1.0, 0.5]
-            } else {
-                [1.0, 0.85, 0.25]
-            };
-            (craft.marker(&self.body), col)
-        } else {
-            // scripted launch overlay
-            if self.mission.reached {
-                polyline(&self.mission.ring, [0.25, 0.7, 0.45], &mut out);
-            }
-            let path_pts: Vec<Vec3> = self.mission.path.iter().map(|(_, p)| *p).collect();
-            polyline(&path_pts, [0.20, 0.45, 0.55], &mut out);
-            let flown: Vec<Vec3> = self
-                .mission
-                .path
-                .iter()
-                .filter(|(t, _)| *t <= self.clock)
-                .map(|(_, p)| *p)
-                .collect();
-            polyline(&flown, [0.45, 0.9, 1.0], &mut out);
-
-            let col = if !self.launched {
-                [0.4, 1.0, 0.4] // on the pad
-            } else if self.clock <= self.mission.meco_t {
-                [1.0, 0.55, 0.15] // powered ascent
-            } else {
-                [0.5, 0.9, 1.0] // in orbit
-            };
-            let rp = self.mission.rocket_pos(if self.launched { self.clock } else { 0.0 });
-            (rp, col)
-        };
-
-        // rocket marker: a small screen-space diamond at its current position
-        if let Some(c) = Self::project(marker_pos, rt, aspect, scale) {
-            let off = 0.022f32;
-            let ox = off / aspect;
-            let top = [c[0], c[1] + off];
-            let right = [c[0] + ox, c[1]];
-            let bot = [c[0], c[1] - off];
-            let left = [c[0] - ox, c[1]];
-            for (a, b) in [(top, right), (right, bot), (bot, left), (left, top)] {
-                out.push(OverlayVertex { pos: a, color: marker_col });
-                out.push(OverlayVertex { pos: b, color: marker_col });
-            }
-        }
-
-        out
-    }
-
-    fn build_hud(&self) -> Vec<OverlayVertex> {
-        let res = (self.config.width as f32, self.config.height.max(1) as f32);
-        let mut out: Vec<OverlayVertex> = Vec::new();
-
-        let dim = [0.55, 0.75, 0.85];
-        let val = [0.92, 0.96, 1.0];
-        let amber = [1.0, 0.78, 0.30];
-        let x = 16.0;
-        let step = hud::LINE_H;
-
-        // label/value row helper
-        let row = |out: &mut Vec<OverlayVertex>, label: &str, value: &str, y: f32| {
-            let cx = self.hud.text(out, label, x, y, dim, res);
-            self.hud.text(out, value, cx, y, val, res);
-        };
-
-        if let Some(craft) = self.flight.as_ref() {
-            return self.build_flight_hud(craft, res);
-        }
-
-        let tel = self.mission.telemetry(self.launched, self.clock);
-        let mut y = 16.0;
-        self.hud.text(&mut out, self.mission.vehicle, x, y, amber, res);
-        y += step * 1.5;
-
-        let phase_col = match tel.phase {
-            "ASCENT" => [1.0, 0.55, 0.15],
-            "ORBIT" => [0.5, 0.9, 1.0],
-            _ => [0.5, 1.0, 0.5],
-        };
-        let cx = self.hud.text(&mut out, "PHASE    ", x, y, dim, res);
-        self.hud.text(&mut out, tel.phase, cx, y, phase_col, res);
-        y += step;
-
-        row(&mut out, "MET      ", &format!("T+{:.0}S", self.clock.max(0.0)), y);
-        y += step;
-        row(&mut out, "ALT      ", &format!("{:.1} KM", tel.alt_km), y);
-        y += step;
-        row(&mut out, "VEL      ", &format!("{:.0} M/S", tel.speed), y);
-        y += step;
-        if let Some((peri, apo)) = tel.orbit {
-            row(&mut out, "ORBIT    ", &format!("{:.0} X {:.0} KM", peri, apo), y);
-        } else {
-            row(&mut out, "RANGE    ", &format!("{:.0} KM", tel.downrange_km), y);
-        }
-        y += step;
-        row(
-            &mut out,
-            "STAGE    ",
-            &format!("{}/{}", tel.stage + 1, self.mission.stage_count),
-            y,
-        );
-        y += step;
-        row(&mut out, "WARP     ", &format!("{:.0}X", self.warp), y);
-
-        // controls hint, bottom-left
-        let mut hy = res.1 - step * 4.0 - 12.0;
-        for line in [
-            "SPACE LAUNCH/RESET",
-            "F  TAKE MANUAL CONTROL",
-            "DRAG ORBIT   SCROLL ZOOM",
-            "[ ] TIME WARP",
-        ] {
-            self.hud.text(&mut out, line, x, hy, dim, res);
-            hy += step;
-        }
-
-        out
-    }
-
-    fn build_flight_hud(&self, craft: &Craft, res: (f32, f32)) -> Vec<OverlayVertex> {
-        let mut out: Vec<OverlayVertex> = Vec::new();
-        let dim = [0.55, 0.75, 0.85];
-        let val = [0.92, 0.96, 1.0];
-        let amber = [1.0, 0.78, 0.30];
-        let x = 16.0;
-        let step = hud::LINE_H;
-        let row = |out: &mut Vec<OverlayVertex>, label: &str, value: &str, y: f32| {
-            let cx = self.hud.text(out, label, x, y, dim, res);
-            self.hud.text(out, value, cx, y, val, res);
-        };
-
-        let mut y = 16.0;
-        self.hud.text(&mut out, "MANUAL FLIGHT", x, y, amber, res);
-        y += step * 1.5;
-
-        let status = craft.status();
-        let scol = match status {
-            "CRASHED" => [1.0, 0.3, 0.25],
-            "LANDED" => [0.4, 1.0, 0.5],
-            _ => [1.0, 0.8, 0.3],
-        };
-        let cx = self.hud.text(&mut out, "STATUS   ", x, y, dim, res);
-        self.hud.text(&mut out, status, cx, y, scol, res);
-        y += step;
-
-        row(&mut out, "ALT      ", &format!("{:.1} KM", craft.altitude(&self.body) / 1000.0), y);
-        y += step;
-        row(&mut out, "VEL      ", &format!("{:.0} M/S", craft.speed()), y);
-        y += step;
-        row(&mut out, "VSPD     ", &format!("{:.0} M/S", craft.vertical_speed()), y);
-        y += step;
-        row(&mut out, "THROTTLE ", &format!("{:.0}", craft.throttle * 100.0), y);
-        y += step;
-        row(&mut out, "PROP     ", &format!("{:.0}", craft.prop_frac() * 100.0), y);
-        y += step;
-        row(&mut out, "MODE     ", craft.mode.label(), y);
-
-        // controls hint, bottom-left
-        let mut hy = res.1 - step * 4.0 - 12.0;
-        for line in [
-            "W / S  THROTTLE",
-            "1 PRO  2 RETRO  3 OUT  4 IN",
-            "F  RELEASE CONTROL",
-            "[ ] TIME WARP",
-        ] {
-            self.hud.text(&mut out, line, x, hy, dim, res);
-            hy += step;
-        }
-
-        out
-    }
 }
+
+// ---------------------------------------------------------------------------
+// Headless screenshot (native only): render one framed shot to a PNG.
+// ---------------------------------------------------------------------------
+
+#[cfg(not(target_arch = "wasm32"))]
+fn screenshot(path: &str, width: u32, height: u32) {
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+    }))
+    .expect("no adapter");
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("shot-device"),
+        required_features: wgpu::Features::empty(),
+        required_limits: wgpu::Limits::default(),
+        memory_hints: wgpu::MemoryHints::Performance,
+        experimental_features: wgpu::ExperimentalFeatures::disabled(),
+        trace: wgpu::Trace::Off,
+    }))
+    .expect("device");
+
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let gpu = Gpu::new(&device, &queue, format);
+    let hud = Hud::new();
+
+    // A framed scene: launched, craft coasting in its parking orbit, the
+    // spaceport rotated to the limb so the ascent arc + orbit ring read clearly,
+    // and the sun ~90 degrees off-view so the night side (city lights) shows.
+    let mut world = World::new();
+    world.launched = true;
+    world.clock = world.mission.meco_t + 240.0;
+    world.az = world.mission.spaceport_lon + 1.15;
+    world.el = world.mission.spaceport_lat + 0.25;
+    world.scale = 1.35;
+    // Sun ~95 deg off the view azimuth so a terminator crosses the disk and the
+    // dark-side city lights show. (sun azimuth = time*0.03 + spaceport_lon.)
+    let time = (world.az + 1.66 - world.mission.spaceport_lon) / 0.03;
+
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("shot-target"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+    let (n, hn) = gpu.prepare(&queue, &world, &hud, width, height, time);
+
+    // 256-byte aligned row pitch for the readback copy.
+    let unpadded = width * 4;
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded = unpadded.div_ceil(align) * align;
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size: (padded * height) as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder =
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("shot-enc") });
+    {
+        let mut pass = render_pass(&mut encoder, &view);
+        gpu.draw(&mut pass, n, hn);
+    }
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &target,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(Some(encoder.finish()));
+
+    let slice = readback.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |r| r.expect("map"));
+    device.poll(wgpu::PollType::wait_indefinitely()).ok();
+    let data = slice.get_mapped_range();
+
+    let mut pixels = Vec::with_capacity((unpadded * height) as usize);
+    for row in 0..height {
+        let start = (row * padded) as usize;
+        pixels.extend_from_slice(&data[start..start + unpadded as usize]);
+    }
+    drop(data);
+    readback.unmap();
+
+    let img: image::RgbaImage =
+        image::ImageBuffer::from_raw(width, height, pixels).expect("image buffer");
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    img.save(path).expect("write png");
+    println!("wrote {path} ({width}x{height})");
+}
+
+// ---------------------------------------------------------------------------
+// winit app + entry point.
+// ---------------------------------------------------------------------------
 
 enum UserEvent {
     Ready(State),
@@ -837,7 +970,7 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         let UserEvent::Ready(state) = event;
         log::info!(
-            "Controls: drag = orbit camera, scroll = zoom, Space = launch/reset, [ / ] = time warp"
+            "Controls: drag orbit, scroll zoom, Space launch, F manual flight, [ ] warp"
         );
         state.window.request_redraw();
         self.state = Some(state);
@@ -868,8 +1001,8 @@ impl ApplicationHandler<UserEvent> for App {
                 if state.dragging {
                     let dx = (x - state.last_cursor.0) as f32;
                     let dy = (y - state.last_cursor.1) as f32;
-                    state.az -= dx * 0.005;
-                    state.el = (state.el + dy * 0.005).clamp(-1.5, 1.5);
+                    state.world.az -= dx * 0.005;
+                    state.world.el = (state.world.el + dy * 0.005).clamp(-1.5, 1.5);
                 }
                 state.last_cursor = (x, y);
             }
@@ -878,7 +1011,7 @@ impl ApplicationHandler<UserEvent> for App {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => (p.y as f32) / 60.0,
                 };
-                state.scale = (state.scale * (1.0 - dy * 0.12)).clamp(0.12, 3.0);
+                state.world.scale = (state.world.scale * (1.0 - dy * 0.12)).clamp(0.12, 3.0);
             }
             WindowEvent::KeyboardInput { event: key_event, .. } => {
                 if key_event.state == ElementState::Pressed {
@@ -886,15 +1019,10 @@ impl ApplicationHandler<UserEvent> for App {
                         PhysicalKey::Code(c) => c,
                         _ => return,
                     };
-                    // throttle ramps while held (responds to key repeat)
-                    if let Some(craft) = state.flight.as_mut() {
+                    if let Some(craft) = state.world.flight.as_mut() {
                         match code {
-                            KeyCode::KeyW => {
-                                craft.throttle = (craft.throttle + 0.08).min(1.0)
-                            }
-                            KeyCode::KeyS => {
-                                craft.throttle = (craft.throttle - 0.08).max(0.0)
-                            }
+                            KeyCode::KeyW => craft.throttle = (craft.throttle + 0.08).min(1.0),
+                            KeyCode::KeyS => craft.throttle = (craft.throttle - 0.08).max(0.0),
                             _ => {}
                         }
                     }
@@ -902,31 +1030,33 @@ impl ApplicationHandler<UserEvent> for App {
                         return;
                     }
                     match code {
-                        KeyCode::KeyF => state.toggle_flight(),
-                        KeyCode::Space if state.flight.is_none() => state.toggle_launch(),
+                        KeyCode::KeyF => state.world.toggle_flight(),
+                        KeyCode::Space if state.world.flight.is_none() => {
+                            state.world.toggle_launch()
+                        }
                         KeyCode::BracketRight => {
-                            state.warp = (state.warp * 2.0).min(256.0);
+                            state.world.warp = (state.world.warp * 2.0).min(256.0);
                         }
                         KeyCode::BracketLeft => {
-                            state.warp = (state.warp * 0.5).max(1.0);
+                            state.world.warp = (state.world.warp * 0.5).max(1.0);
                         }
                         KeyCode::Digit1 => {
-                            if let Some(c) = state.flight.as_mut() {
+                            if let Some(c) = state.world.flight.as_mut() {
                                 c.mode = Mode::Prograde;
                             }
                         }
                         KeyCode::Digit2 => {
-                            if let Some(c) = state.flight.as_mut() {
+                            if let Some(c) = state.world.flight.as_mut() {
                                 c.mode = Mode::Retrograde;
                             }
                         }
                         KeyCode::Digit3 => {
-                            if let Some(c) = state.flight.as_mut() {
+                            if let Some(c) = state.world.flight.as_mut() {
                                 c.mode = Mode::RadialOut;
                             }
                         }
                         KeyCode::Digit4 => {
-                            if let Some(c) = state.flight.as_mut() {
+                            if let Some(c) = state.world.flight.as_mut() {
                                 c.mode = Mode::RadialIn;
                             }
                         }
@@ -944,6 +1074,23 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 fn main() {
+    // Native: `app shot [out.png]` renders one headless frame and exits.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if args.iter().any(|a| a == "shot" || a == "--shot") {
+            env_logger::init();
+            let path = args
+                .iter()
+                .skip(1)
+                .find(|a| a.ends_with(".png"))
+                .cloned()
+                .unwrap_or_else(|| "out/client.png".to_string());
+            screenshot(&path, 1280, 800);
+            return;
+        }
+    }
+
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .expect("event loop");

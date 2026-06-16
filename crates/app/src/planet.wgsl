@@ -97,7 +97,9 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         }
     }
 
-    col = vec3<f32>(1.0) - exp(-col * 1.1);
-    col = pow(col, vec3<f32>(1.0 / 2.2));
+    // Exposure/tonemap only. The render target is sRGB, so it applies the
+    // gamma encode on store - do NOT also gamma-correct here (that double-
+    // encodes and washes the image out).
+    col = vec3<f32>(1.0) - exp(-col * 1.2);
     return vec4<f32>(col, 1.0);
 }
