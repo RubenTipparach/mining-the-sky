@@ -3,12 +3,12 @@
 //! wgpu/WebGPU app; the math here (albedo, day/night terminator, city lights,
 //! atmosphere limb) is the reference the GPU shaders will match.
 
-use crate::grid::{dir_to_lonlat, lonlat_to_pixel, pixel_to_lonlat};
+use crate::grid::{dir_to_lonlat, lonlat_to_dir, lonlat_to_pixel, pixel_to_lonlat};
 use crate::planet::{albedo_at, mix3};
 use crate::sites::CityKind;
 use crate::World;
 use glam::{DMat3, DQuat, DVec3};
-use image::{Rgb, RgbImage};
+use image::{Rgb, Rgba, RgbImage, RgbaImage};
 use rayon::prelude::*;
 
 #[inline]
@@ -280,6 +280,31 @@ pub fn render_globe(world: &World, p: &GlobeParams) -> RgbImage {
         .collect();
 
     RgbImage::from_raw(size, size, rows).expect("globe buffer size mismatch")
+}
+
+/// Bake an equirectangular RGBA texture for the GPU client:
+/// RGB = sRGB-encoded surface albedo, A = city-light emission (0..1). The app
+/// samples this so the real-time planet shows the same generated world, with
+/// city lights on the dark side.
+pub fn write_planet_texture(world: &World, path: &str, tw: usize, th: usize) {
+    let enc = |v: f32| (v.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0).round() as u8;
+    let mut img = RgbaImage::new(tw as u32, th as u32);
+    for y in 0..th {
+        for x in 0..tw {
+            let (lon, lat) = pixel_to_lonlat(x, y, tw, th);
+            let d = lonlat_to_dir(lon, lat);
+            let e = world.elevation.sample_dir(d);
+            let f = world.hydro.flow.sample_dir(d);
+            let alb = albedo_at(e, world.sea_level, lat, f);
+            let em = world.lights.sample_dir(d).clamp(0.0, 1.0);
+            img.put_pixel(
+                x as u32,
+                y as u32,
+                Rgba([enc(alb[0]), enc(alb[1]), enc(alb[2]), (em * 255.0).round() as u8]),
+            );
+        }
+    }
+    img.save(path).unwrap();
 }
 
 pub fn write_globe_day(world: &World, path: &str, size: u32) {

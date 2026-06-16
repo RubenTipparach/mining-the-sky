@@ -20,3 +20,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "preview"
 path = "src/bin/preview.rs"
+
+[[bin]]
+name = "bake"
+path = "src/bin/bake.rs"
