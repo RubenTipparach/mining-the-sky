@@ -1,1 +1,1 @@
-# minin-the-sky
+# mining-the-sky
