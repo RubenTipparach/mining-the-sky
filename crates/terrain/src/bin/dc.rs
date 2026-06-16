@@ -10,41 +10,54 @@
 use glam::{Mat4, Vec3, Vec4Swizzles};
 use image::{Rgb, RgbImage};
 use noise::{Fbm, MultiFractal, NoiseFn, Perlin};
-use terrain::surfacenets::{surface_nets, Mesh};
+use terrain::surfacenets::{drop_small_components, surface_nets, Mesh};
 
 fn main() {
-    // --- density field: heightfield + 3D overhang warp ---
-    let hills = Fbm::<Perlin>::new(7).set_octaves(5).set_frequency(1.0).set_persistence(0.5).set_lacunarity(2.1);
-    let warp = Fbm::<Perlin>::new(23).set_octaves(4).set_frequency(1.0).set_persistence(0.55).set_lacunarity(2.2);
+    // --- density field: a 3D domain-warped heightfield ---
+    // Base terrain is a solid heightfield (monotonic in y = one connected body,
+    // no floaters). We then bend the horizontal lookup by a y-dependent 3D warp,
+    // which tilts/folds columns into overhangs and arches while keeping the
+    // surface a single connected sheet - a "proper" way to get overhangs.
+    let hills = Fbm::<Perlin>::new(7).set_octaves(6).set_frequency(1.0).set_persistence(0.5).set_lacunarity(2.1);
+    let ridge = Fbm::<Perlin>::new(101).set_octaves(5).set_frequency(1.0).set_persistence(0.5).set_lacunarity(2.2);
+    let warp = Fbm::<Perlin>::new(23).set_octaves(4).set_frequency(1.0).set_persistence(0.5).set_lacunarity(2.2);
 
-    // domain box, in metres; surface sits near y = 0
     let span = 120.0f32;
-    let dim = 96usize; // grid points per axis
+    let dim = 96usize;
     let cell = span / (dim as f32 - 1.0);
     let origin = Vec3::new(-span * 0.5, -span * 0.5, -span * 0.5);
 
+    let height = |x: f32, z: f32| -> f32 {
+        let hf = 0.020;
+        let h = (hills.get([(x * hf) as f64, (z * hf) as f64]) as f32) * 16.0;
+        // ridged detail for sharper relief
+        let r = 1.0 - (ridge.get([(x * 0.05) as f64, (z * 0.05) as f64]) as f32).abs();
+        h + r * r * 10.0
+    };
     let density = |p: Vec3| -> f32 {
-        let f = 0.02;
-        let h = (hills.get([(p.x * f) as f64, (p.z * f) as f64]) as f32) * 16.0;
-        let mut d = p.y - h;
-        // strong y-dependent 3D warp: folds the surface into overhangs and
-        // arches (density goes non-monotonic along y - impossible for a
-        // heightmap, the whole reason for dual contouring).
-        let cf = 0.04;
-        let cave = warp.get([(p.x * cf) as f64, (p.y * cf) as f64, (p.z * cf) as f64]) as f32;
-        d -= cave * 48.0;
-        d
+        // y-dependent horizontal warp -> occasional overhangs, surface stays
+        // connected. Gentler amplitude reads as terrain, not melted blobs.
+        let wf = 0.03;
+        let amt = 14.0;
+        let wx = (warp.get([(p.x * wf) as f64, (p.y * wf) as f64, (p.z * wf) as f64]) as f32) * amt;
+        let wz = (warp.get([(p.x * wf + 5.1) as f64, (p.y * wf + 2.3) as f64, (p.z * wf - 1.7) as f64]) as f32) * amt;
+        p.y - height(p.x + wx, p.z + wz)
     };
 
     let t0 = std::time::Instant::now();
-    let mesh = surface_nets(&density, origin, cell, dim);
+    let raw = surface_nets(&density, origin, cell, dim);
+    let mesh = drop_small_components(&raw, 250);
     let gen = t0.elapsed();
 
-    println!("Surface Nets dual-contouring experiment");
+    println!("Surface Nets dual-contouring (domain-warped heightfield)");
     println!("grid:        {dim}^3 ({} cells)", (dim - 1).pow(3));
     println!("cell size:   {cell:.2} m");
-    println!("vertices:    {}", mesh.positions.len());
-    println!("triangles:   {}", mesh.indices.len() / 3);
+    println!("vertices:    {} ({} before floater removal)", mesh.positions.len(), raw.positions.len());
+    println!(
+        "triangles:   {} ({} dropped as floaters)",
+        mesh.indices.len() / 3,
+        (raw.indices.len() - mesh.indices.len()) / 3
+    );
     println!("gen time:    {gen:?}");
 
     std::fs::create_dir_all("out").unwrap();

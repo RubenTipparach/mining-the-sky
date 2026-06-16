@@ -160,3 +160,49 @@ pub fn surface_nets<F: Fn(Vec3) -> f32>(f: &F, origin: Vec3, cell: f32, dim: usi
 
     Mesh { positions, normals, indices }
 }
+
+fn uf_find(parent: &mut [u32], mut x: u32) -> u32 {
+    while parent[x as usize] != x {
+        parent[x as usize] = parent[parent[x as usize] as usize];
+        x = parent[x as usize];
+    }
+    x
+}
+
+/// Drop disconnected components smaller than `min_tris` triangles - i.e. remove
+/// floating bits, keeping only the connected terrain. A standard, robust way to
+/// clean a dual-contoured field instead of hoping the density never floats.
+pub fn drop_small_components(mesh: &Mesh, min_tris: usize) -> Mesh {
+    let n = mesh.positions.len();
+    let mut parent: Vec<u32> = (0..n as u32).collect();
+    for t in mesh.indices.chunks(3) {
+        let (a, b, c) = (t[0], t[1], t[2]);
+        let (ra, rb) = (uf_find(&mut parent, a), uf_find(&mut parent, b));
+        parent[ra as usize] = rb;
+        let (rb, rc) = (uf_find(&mut parent, b), uf_find(&mut parent, c));
+        parent[rb as usize] = rc;
+    }
+    // triangle count per component root
+    let mut count = vec![0u32; n];
+    for t in mesh.indices.chunks(3) {
+        let r = uf_find(&mut parent, t[0]);
+        count[r as usize] += 1;
+    }
+    let mut map = vec![u32::MAX; n];
+    let (mut positions, mut normals, mut indices) = (Vec::new(), Vec::new(), Vec::new());
+    for t in mesh.indices.chunks(3) {
+        let r = uf_find(&mut parent, t[0]);
+        if (count[r as usize] as usize) < min_tris {
+            continue;
+        }
+        for &vi in t {
+            if map[vi as usize] == u32::MAX {
+                map[vi as usize] = positions.len() as u32;
+                positions.push(mesh.positions[vi as usize]);
+                normals.push(mesh.normals[vi as usize]);
+            }
+            indices.push(map[vi as usize]);
+        }
+    }
+    Mesh { positions, normals, indices }
+}
