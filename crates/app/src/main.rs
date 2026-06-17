@@ -2512,6 +2512,15 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.sys_el = 0.20;
             6.0
         }
+        "binary" => {
+            // frame both stars of the binary so both coronas are visible together
+            world.view = View::Map;
+            world.sys_focus = DVec3::ZERO; // barycentre
+            world.sys_dist = 17000.0;
+            world.sys_az = 1.57;
+            world.sys_el = 0.16;
+            6.0
+        }
         "starb" => {
             // close-up of the red companion star to show its ruddy corona.
             world.view = View::Map;
@@ -3020,6 +3029,8 @@ fn main() {
                 "rocket"
             } else if args.iter().any(|a| a == "starb") {
                 "starb"
+            } else if args.iter().any(|a| a == "binary") {
+                "binary"
             } else if args.iter().any(|a| a == "system") {
                 "system"
             } else if args.iter().any(|a| a == "pad") {
