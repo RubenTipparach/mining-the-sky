@@ -168,14 +168,16 @@ struct MeshUniforms {
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct SkyUniforms {
+    /// Camera basis in WORLD (planet-centred) coords for per-pixel view rays.
     right: [f32; 4],
     up: [f32; 4],
     fwd: [f32; 4],
+    /// World sun direction (xyz).
     sun: [f32; 4],
-    /// x = tan(fov/2), y = aspect, z/w unused.
+    /// Camera position relative to the planet centre (world metres).
+    cam: [f32; 4],
+    /// x = tan(fov/2), y = aspect, z = planet radius, w = atmosphere top radius.
     params: [f32; 4],
-    /// rgb = horizon haze colour (matches the terrain fog).
-    horizon: [f32; 4],
 }
 
 /// Far plane for the rocket-view log-depth buffer (m): beyond planet diameter.
@@ -479,17 +481,31 @@ impl World {
         }
     }
 
-    /// Sky uniforms for the rocket view.
+    /// Sky/atmosphere uniforms for the rocket view: the camera basis and
+    /// position in planet-centred world coords so the shader can ray-march the
+    /// atmosphere shell.
     fn sky_uniforms(&self, res: [f32; 2]) -> SkyUniforms {
         let aspect = res[0] / res[1].max(1.0);
         let (_eye, _target, right, up, fwd, tan) = self.rocket_camera(aspect);
+        // local camera basis -> world (planet-centred) via the launch frame.
+        let to_world_dir = |d: Vec3| -> [f32; 4] {
+            let w = self.launch_east * d.x as f64
+                + self.launch_up * d.y as f64
+                + self.launch_north * d.z as f64;
+            [w.x as f32, w.y as f32, w.z as f32, 0.0]
+        };
+        let cam_world = self.cam_world(self.camera_eye_local());
+        // Sun in world coords (the mesh shader's local (0.40,0.72,0.55)).
+        let sun = (self.launch_east * 0.40 + self.launch_up * 0.72 + self.launch_north * 0.55)
+            .normalize();
+        let r_atm = self.body.radius + 90_000.0;
         SkyUniforms {
-            right: [right.x, right.y, right.z, 0.0],
-            up: [up.x, up.y, up.z, 0.0],
-            fwd: [fwd.x, fwd.y, fwd.z, 0.0],
-            sun: [0.40, 0.72, 0.55, 0.0],
-            params: [tan, aspect, 0.0, 0.0],
-            horizon: [HORIZON[0], HORIZON[1], HORIZON[2], 0.0],
+            right: to_world_dir(right),
+            up: to_world_dir(up),
+            fwd: to_world_dir(fwd),
+            sun: [sun.x as f32, sun.y as f32, sun.z as f32, 0.0],
+            cam: [cam_world.x as f32, cam_world.y as f32, cam_world.z as f32, 0.0],
+            params: [tan, aspect, self.body.radius as f32, r_atm as f32],
         }
     }
 
@@ -2237,6 +2253,16 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             fly_to_staging(&mut world); // spent booster tumbling away
             0.0
         }
+        "orbit" => {
+            // high up: pull the camera back to frame the planet against space.
+            world.view = View::Rocket;
+            world.rocket_az = 3.4;
+            world.rocket_el = 0.30;
+            world.ignite_launch();
+            fly(&mut world, 130.0);
+            world.rocket_dist = 900.0;
+            0.0
+        }
         "launchmap" => {
             // a player launch shown on the orbital map: live marker + predicted
             // conic as the upper stage builds its parking orbit.
@@ -2781,6 +2807,8 @@ fn main() {
                 "staging"
             } else if args.iter().any(|a| a == "launchmap") {
                 "launchmap"
+            } else if args.iter().any(|a| a == "orbit") {
+                "orbit"
             } else if args.iter().any(|a| a == "ascent") {
                 "ascent"
             } else if args.iter().any(|a| a == "flight") {
