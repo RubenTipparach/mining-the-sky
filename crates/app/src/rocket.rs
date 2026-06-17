@@ -152,40 +152,48 @@ pub fn pad_and_mount() -> Mesh {
     m
 }
 
-/// The Vehicle Assembly Building: a gantry/hangar the rocket is assembled in,
-/// centred at `c` (local metres). Four corner towers, cross beams, a back
-/// service tower and a floor pad - recognisable as a building, open at the
-/// front so the rocket can roll out.
+/// The Vehicle Assembly Building: a large enclosed hangar (floor, back + side
+/// walls, roof, an open front facing the pad, and internal gantry towers) the
+/// rocket is assembled inside. Centred at `c` (local metres), big enough that
+/// the camera orbits around inside it.
 pub fn hangar(c: Vec3) -> Mesh {
     let mut m = Mesh::default();
-    let frame = [0.30, 0.32, 0.36];
-    let dark = [0.20, 0.21, 0.24];
-    let h = 64.0f32; // tower height
-    // floor pad
-    m.bx(c + Vec3::new(0.0, 0.4, 0.0), Vec3::new(16.0, 0.4, 16.0), [0.34, 0.34, 0.38]);
-    // four corner towers
-    for (sx, sz) in [(1.0f32, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)] {
-        m.bx(
-            c + Vec3::new(sx * 13.0, h * 0.5, sz * 13.0),
-            Vec3::new(0.8, h * 0.5, 0.8),
-            frame,
-        );
+    let wall = [0.33, 0.35, 0.39];
+    let inner = [0.27, 0.29, 0.33];
+    let frame = [0.21, 0.22, 0.26];
+    let w = 62.0f32; // half-width (X); open front at +X toward the pad
+    let d = 56.0f32; // half-depth (Z)
+    let h = 150.0f32; // height
+    let t = 1.4f32; // wall/floor thickness
+
+    // floor
+    m.bx(c + Vec3::new(0.0, 0.6, 0.0), Vec3::new(w, 0.6, d), [0.30, 0.31, 0.35]);
+    // back wall (-X)
+    m.bx(c + Vec3::new(-w + t, h * 0.5, 0.0), Vec3::new(t, h * 0.5, d), wall);
+    // side walls (+/-Z)
+    for sz in [-1.0f32, 1.0] {
+        m.bx(c + Vec3::new(0.0, h * 0.5, sz * (d - t)), Vec3::new(w, h * 0.5, t), wall);
     }
-    // cross beams at three heights (X and Z spanning bars on all four sides)
-    for lvl in [0.32f32, 0.62, 0.92] {
+    // front: a tall doorway - header beam across the top + jambs at the corners,
+    // leaving a wide opening so the rocket can roll out toward the pad.
+    m.bx(c + Vec3::new(w - t, h - 7.0, 0.0), Vec3::new(t, 7.0, d), inner);
+    for sz in [-1.0f32, 1.0] {
+        m.bx(c + Vec3::new(w - t, h * 0.5, sz * (d - 7.0)), Vec3::new(t, h * 0.5, 7.0), inner);
+    }
+    // roof + a few beams visible from inside
+    m.bx(c + Vec3::new(0.0, h, 0.0), Vec3::new(w, t, d), inner);
+    for k in -3..=3 {
+        m.bx(c + Vec3::new(k as f32 * 18.0, h - 2.5, 0.0), Vec3::new(0.6, 1.2, d), frame);
+    }
+    // internal gantry towers flanking the rocket + service platforms
+    for (sx, sz) in [(1.0f32, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)] {
+        m.bx(c + Vec3::new(sx * 12.0, h * 0.46, sz * 12.0), Vec3::new(0.9, h * 0.46, 0.9), frame);
+    }
+    for lvl in [0.18f32, 0.42, 0.66] {
         let y = h * lvl;
         for sz in [-1.0f32, 1.0] {
-            m.bx(c + Vec3::new(0.0, y, sz * 13.0), Vec3::new(13.0, 0.4, 0.4), dark);
+            m.bx(c + Vec3::new(0.0, y, sz * 12.0), Vec3::new(12.0, 0.4, 0.6), frame);
         }
-        for sx in [-1.0f32, 1.0] {
-            m.bx(c + Vec3::new(sx * 13.0, y, 0.0), Vec3::new(0.4, 0.4, 13.0), dark);
-        }
-    }
-    // back service tower wall (the -Z side, away from the pad which is at +X)
-    m.bx(c + Vec3::new(-13.5, h * 0.5, 0.0), Vec3::new(0.5, h * 0.5, 13.0), [0.26, 0.27, 0.30]);
-    // roof beams
-    for sz in [-1.0f32, 1.0] {
-        m.bx(c + Vec3::new(0.0, h, sz * 13.0), Vec3::new(13.0, 0.5, 0.5), frame);
     }
     m
 }

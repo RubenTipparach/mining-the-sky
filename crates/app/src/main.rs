@@ -142,8 +142,8 @@ const MM: f32 = 1.0e6;
 
 /// Local-frame position (metres) of the assembly building, beside the pad
 /// (which is at the origin). The rocket assembles here and rolls out (+X) to it.
-const HANGAR_POS: Vec3 = Vec3::new(-72.0, 0.0, 0.0);
-const RACK_POS: Vec3 = Vec3::new(-72.0, 0.0, 17.0);
+const HANGAR_POS: Vec3 = Vec3::new(-90.0, 0.0, 0.0);
+const RACK_POS: Vec3 = Vec3::new(-90.0, 0.0, 42.0);
 
 /// Depth format for the rocket view's mesh pass.
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -469,9 +469,9 @@ impl World {
             moon_center_m,
             moon_mu,
             moon_radius_m,
-            rocket_az: 4.97,
-            rocket_el: 0.12,
-            rocket_dist: rocket_frame.1,
+            rocket_az: 0.7, // start inside the assembly building, facing the rocket
+            rocket_el: 0.18,
+            rocket_dist: 52.0,
             rocket_focus_y: rocket_frame.0,
             universe: Universe { bodies: Vec::new() },
             nav: Vec::new(),
@@ -2632,13 +2632,13 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             0.0
         }
         "vab" => {
-            // assembling in the hangar (the default start state)
+            // inside the assembly building, looking at the rocket (default start)
             world.view = View::Rocket;
             world.vab_mode = true;
             world.rollout = 0.0;
-            world.rocket_az = 5.7;
-            world.rocket_el = 0.10;
-            world.rocket_dist = 78.0;
+            world.rocket_az = 0.7;
+            world.rocket_el = 0.18;
+            world.rocket_dist = 52.0;
             0.0
         }
         "grabdemo" => {
@@ -2648,9 +2648,9 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.view = View::Rocket;
             world.vab_mode = true;
             world.rollout = 0.0;
-            world.rocket_az = 5.4;
-            world.rocket_el = 0.12;
-            world.rocket_dist = 95.0;
+            world.rocket_az = 0.7;
+            world.rocket_el = 0.16;
+            world.rocket_dist = 70.0;
             world.grab = world
                 .rack_slots
                 .iter()
@@ -2664,10 +2664,10 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             // mid roll-out: the rocket part-way between hangar and pad
             world.view = View::Rocket;
             world.vab_mode = false;
-            world.rollout = 0.5;
-            world.rocket_az = 5.0;
-            world.rocket_el = 0.14;
-            world.rocket_dist = 130.0;
+            world.rollout = 0.84; // just clear of the building, nearing the pad
+            world.rocket_az = 5.2;
+            world.rocket_el = 0.16;
+            world.rocket_dist = 120.0;
             0.0
         }
         "liftoff" => {
