@@ -7,7 +7,8 @@
 //! it is seamless across LOD transitions and gains detail as you zoom in.
 
 use glam::DVec3;
-use noise::{Fbm, MultiFractal, NoiseFn, Perlin};
+use noise::core::worley::{distance_functions, ReturnType};
+use noise::{Fbm, MultiFractal, NoiseFn, Perlin, Worley};
 
 /// A region flattened toward a target height (launch pad, city sites). `inner`
 /// and `outer` are angular radii (radians); fully flat within inner, blending
@@ -33,6 +34,18 @@ pub struct Elevation {
     /// Vertical scale: raw noise unit -> metres.
     relief_m: f64,
     flat_zones: Vec<FlatZone>,
+    /// Lunar mode: replace the earth-like macro field with a cratered regolith
+    /// field (no oceans, no mountains; impact basins instead).
+    lunar: bool,
+    /// Per-scale crater fields: F1 distance to the nearest crater centre and a
+    /// per-crater random value (same seed+frequency, so they share cells).
+    crater_dist: Vec<Worley>,
+    crater_val: Vec<Worley>,
+    /// Crater layer parameters: (radius in cell units, depth in metres).
+    crater_cfg: Vec<(f64, f64)>,
+    /// A constant height offset (metres) applied last (used to align the lunar
+    /// landing site with the rocket-view origin).
+    offset_m: f64,
 }
 
 fn smoothstep(e0: f64, e1: f64, x: f64) -> f64 {
@@ -83,6 +96,35 @@ impl Elevation {
             .set_persistence(0.5)
             .set_lacunarity(2.2);
 
+        // Crater fields, large -> small. Each scale gets a distance Worley (bowl
+        // shape) and a value Worley with the SAME seed + frequency so the random
+        // value identifies the same crater the distance is measured from.
+        let mk_dist = |s: u32, f: f64| {
+            Worley::new(s)
+                .set_return_type(ReturnType::Distance)
+                .set_distance_function(distance_functions::euclidean)
+                .set_frequency(f)
+        };
+        let mk_val = |s: u32, f: f64| {
+            Worley::new(s)
+                .set_return_type(ReturnType::Value)
+                .set_distance_function(distance_functions::euclidean)
+                .set_frequency(f)
+        };
+        let freqs = [900.0_f64, 3000.0, 9000.0];
+        let crater_dist = freqs
+            .iter()
+            .enumerate()
+            .map(|(i, &f)| mk_dist(seed.wrapping_add(4000 + i as u32), f))
+            .collect();
+        let crater_val = freqs
+            .iter()
+            .enumerate()
+            .map(|(i, &f)| mk_val(seed.wrapping_add(4000 + i as u32), f))
+            .collect();
+        // (radius in cell units, depth in metres) per scale.
+        let crater_cfg = vec![(0.55, 1200.0), (0.5, 430.0), (0.5, 110.0)];
+
         Elevation {
             continents,
             detail,
@@ -96,7 +138,60 @@ impl Elevation {
             sea: 0.070,
             relief_m: 9000.0,
             flat_zones: Vec::new(),
+            lunar: false,
+            crater_dist,
+            crater_val,
+            crater_cfg,
+            offset_m: 0.0,
         }
+    }
+
+    /// A cratered, airless regolith field (the moon): no oceans or mountains,
+    /// just impact basins of several scales over gentle mare undulation.
+    pub fn lunar(seed: u32) -> Self {
+        let mut e = Elevation::new(seed);
+        e.lunar = true;
+        e
+    }
+
+    /// Shift the whole field vertically (metres). Used to seat the lunar landing
+    /// site at the rocket-view origin height.
+    pub fn set_offset(&mut self, off: f64) {
+        self.offset_m = off;
+    }
+
+    /// One crater layer's contribution at `dir` (metres, signed).
+    fn crater_layer(&self, dir: DVec3, i: usize) -> f64 {
+        let p = [dir.x, dir.y, dir.z];
+        let rv = self.crater_val[i].get(p); // 0..1 per crater
+        if rv < 0.18 {
+            return 0.0; // smooth mare patch: no crater in this cell
+        }
+        let d = self.crater_dist[i].get(p); // F1 distance, cell units
+        let (cr, depth) = self.crater_cfg[i];
+        let size = cr * (0.45 + 1.1 * rv); // vary crater radius
+        let dep = depth * (0.5 + 0.9 * rv); // and depth
+        let rn = d / size;
+        // depressed bowl: flattish floor, steepening to the rim at rn = 1
+        let floor = if rn < 1.0 { -dep * (1.0 - rn * rn * rn) } else { 0.0 };
+        // a modest raised rim/lip + ejecta blanket (real craters: rim height is
+        // small next to the bowl depth, so the feature reads as a pit)
+        let rim = 0.26 * dep * (-(((rn - 1.0) / 0.22).powi(2))).exp();
+        floor + rim
+    }
+
+    /// Cratered lunar elevation (metres, signed) before flatten zones / offset.
+    fn crater_height(&self, dir: DVec3) -> f64 {
+        let d = dir.normalize();
+        let mut h = 0.0;
+        for i in 0..self.crater_cfg.len() {
+            h += self.crater_layer(d, i);
+        }
+        // broad mare undulation + fine regolith roughness (kept low so the
+        // craters stay the dominant relief)
+        h += self.hills.get([d.x * 3.0, d.y * 3.0, d.z * 3.0]) * 90.0;
+        h += self.fine.get([d.x * 40.0, d.y * 40.0, d.z * 40.0]) * 14.0;
+        h
     }
 
     /// Flatten a circular region (e.g. the launch pad or a city) to its natural
@@ -134,6 +229,9 @@ impl Elevation {
     /// Natural elevation (metres, signed) before any flatten zones.
     fn base_height(&self, dir: DVec3) -> f64 {
         let d = dir.normalize();
+        if self.lunar {
+            return self.crater_height(d);
+        }
         let above = self.raw(d) - self.sea;
         let land = above.max(0.0);
         // ridged mountains, gated to land and much stronger inland
@@ -156,7 +254,7 @@ impl Elevation {
             let t = 1.0 - smoothstep(z.inner, z.outer, ang); // 1 inside, 0 outside
             h += (z.target - h) * t;
         }
-        h
+        h + self.offset_m
     }
 
     /// Clamped land height (>= 0) for displacing the visible surface.

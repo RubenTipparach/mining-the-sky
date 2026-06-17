@@ -439,6 +439,22 @@ fn launch_elevation() -> Elevation {
     elev
 }
 
+/// The cratered lunar elevation, with a small flat landing site at the
+/// rocket-view origin so a touched-down lander rests on the surface (and is
+/// offset vertically to align that site with the home-frame origin height).
+fn lunar_elevation() -> Elevation {
+    let dir = spaceport_dir();
+    let mut elev = Elevation::lunar(47);
+    // signed crater height at the site (no flat zone / offset applied yet)
+    let site = elev.height_m(dir);
+    let h0 = launch_elevation().land_height_m(dir);
+    // flatten a small touchdown pad, then shift the field so the pad sits at the
+    // same height the rocket-view origin assumes.
+    elev.add_flat_zone(dir, 140.0, 480.0, PLANET_RADIUS);
+    elev.set_offset(h0 - site);
+    elev
+}
+
 /// The rocket-view local tangent frame at the spaceport: the surface origin
 /// (home-centred metres) plus the up / east / north basis. The launch physics
 /// and the terrain share this so the flying rocket lines up with the ground.
@@ -465,11 +481,13 @@ fn hashf(p: Vec3) -> f32 {
 
 fn terrain_color(signed_h: f64, slope: f32, jitter: f32, abs_lat: f64, lunar: bool) -> [f32; 3] {
     if lunar {
-        // grey regolith: lighter highlands, darker mare, brighter on slopes
+        // dark grey regolith (low albedo, so the relief from lighting reads
+        // strongly): darker mare in the basins, lighter highland rims, a touch
+        // brighter on steep slopes where fresh material is exposed.
         let h = (signed_h as f32 / 4000.0).clamp(-1.0, 1.0);
-        let base = mix3([0.34, 0.33, 0.32], [0.52, 0.51, 0.50], (h * 0.5 + 0.5).clamp(0.0, 1.0));
-        let bright = mix3(base, [0.62, 0.61, 0.60], (slope * 1.4).clamp(0.0, 1.0));
-        let b = 0.82 + 0.3 * jitter;
+        let base = mix3([0.18, 0.18, 0.19], [0.40, 0.40, 0.40], (h * 0.5 + 0.5).clamp(0.0, 1.0));
+        let bright = mix3(base, [0.50, 0.49, 0.48], (slope * 1.5).clamp(0.0, 1.0));
+        let b = 0.88 + 0.22 * jitter;
         return [bright[0] * b, bright[1] * b, bright[2] * b];
     }
     if signed_h <= 0.0 {
@@ -519,7 +537,7 @@ pub fn planet_terrain(
     lunar: bool,
 ) -> Mesh {
     let planet = Planet { radius: PLANET_RADIUS };
-    let elev = launch_elevation();
+    let elev = if lunar { lunar_elevation() } else { launch_elevation() };
     let to_local = |w: DVec3| -> DVec3 {
         let d = w - origin;
         DVec3::new(d.dot(east), d.dot(up), d.dot(north))

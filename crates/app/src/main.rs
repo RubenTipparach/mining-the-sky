@@ -210,6 +210,11 @@ const LOG_DEPTH_FAR: f32 = 2.0e7;
 /// Horizon haze colour shared by the sky and the terrain aerial-perspective fog.
 const HORIZON: [f32; 3] = [0.74, 0.82, 0.93];
 
+/// Sun direction in the launch tangent frame (east, up, north). The home world
+/// uses a fairly high sun; the moon uses a low, grazing sun for long shadows.
+const SUN_LOCAL: Vec3 = Vec3::new(0.40, 0.72, 0.55);
+const SUN_LOCAL_MOON: Vec3 = Vec3::new(0.62, 0.17, 0.77);
+
 /// A perspective camera for the orbital map. The position is f64 (Mm) so the
 /// full-scale system stays precise; projection is camera-relative.
 struct SystemCamera {
@@ -651,13 +656,24 @@ impl World {
             }
         }
 
+        // On the airless moon there is no sky ambient or aerial haze: flag the
+        // shader (sun.w = 1) and kill the fog so the surface reads dark with
+        // hard, high-contrast crater shadows.
+        let lunar = if self.lunar { 1.0 } else { 0.0 };
+        let fog = if self.lunar {
+            [0.0, 0.0, 0.0, 0.0]
+        } else {
+            [HORIZON[0], HORIZON[1], HORIZON[2], 1.0 / 160_000.0]
+        };
+        // A low, grazing sun on the moon throws long shadows off the crater rims.
+        let sun_l = if self.lunar { SUN_LOCAL_MOON } else { SUN_LOCAL };
         MeshUniforms {
             viewproj: vp.to_cols_array_2d(),
-            sun: [0.40, 0.72, 0.55, 0.0],
+            sun: [sun_l.x, sun_l.y, sun_l.z, lunar],
             params: [fcoef, self.anim, nlights as f32, scale],
             // Light aerial haze only; the atmosphere shader does the real work so
             // the planet keeps its colour from altitude.
-            fog: [HORIZON[0], HORIZON[1], HORIZON[2], 1.0 / 160_000.0],
+            fog,
             lights,
             light_col,
         }
@@ -678,8 +694,12 @@ impl World {
             [w.x as f32, w.y as f32, w.z as f32, 0.0]
         };
         let cam_world = self.cam_world(self.camera_eye_local());
-        // Sun in world coords (the mesh shader's local (0.40,0.72,0.55)).
-        let sun = (self.launch_east * 0.40 + self.launch_up * 0.72 + self.launch_north * 0.55)
+        // Sun in world coords, matching the mesh shader's local sun direction
+        // (a low, grazing sun on the moon).
+        let sl = if self.lunar { SUN_LOCAL_MOON } else { SUN_LOCAL };
+        let sun = (self.launch_east * sl.x as f64
+            + self.launch_up * sl.y as f64
+            + self.launch_north * sl.z as f64)
             .normalize();
         let r_atm = self.body.radius + 90_000.0;
         SkyUniforms {
@@ -3071,6 +3091,22 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.sys_dist = 240.0;
             6.0
         }
+        "m5_approach" => {
+            // high on final approach: the lander hangs over a cratered regolith
+            // field, descent engine lit, craters running out to the horizon.
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.lunar = true;
+            world.show_lander = true;
+            world.lander_alt = 700.0;
+            world.lander_firing = true;
+            world.rocket_az = 5.5;
+            world.rocket_el = 0.62; // look down over the cratered field
+            world.rocket_dist = 170.0;
+            world.rocket_focus_y = 700.0;
+            0.0
+        }
         "m5_descent" => {
             // powered descent over the lunar surface: grey regolith, black airless
             // sky, the lander firing its descent engine just above the ground.
@@ -3606,6 +3642,8 @@ fn main() {
                 "m3_orbit"
             } else if args.iter().any(|a| a == "m4_transfer") {
                 "m4_transfer"
+            } else if args.iter().any(|a| a == "m5_approach") {
+                "m5_approach"
             } else if args.iter().any(|a| a == "m5_descent") {
                 "m5_descent"
             } else if args.iter().any(|a| a == "m6_landed") {
@@ -3662,6 +3700,7 @@ fn main() {
                 "m2_liftoff" => "out/m2_liftoff.png",
                 "m3_orbit" => "out/m3_orbit.png",
                 "m4_transfer" => "out/m4_transfer.png",
+                "m5_approach" => "out/m5_approach.png",
                 "m5_descent" => "out/m5_descent.png",
                 "m6_landed" => "out/m6_landed.png",
                 "moons" => "out/moons.png",
