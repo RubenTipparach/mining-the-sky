@@ -166,8 +166,23 @@ pub fn hangar(c: Vec3, light_offsets: &[Vec3]) -> Mesh {
     let h = 150.0f32; // height
     let t = 1.4f32; // wall/floor thickness
 
-    // floor
-    m.bx(c + Vec3::new(0.0, 0.6, 0.0), Vec3::new(w, 0.6, d), [0.30, 0.31, 0.35]);
+    // Solid floor + a paved apron extending well past the walls, so no grass
+    // shows inside or just outside the open front. Top (y +1.7) is just under
+    // the rocket's engines; it pokes below ground to cover the gentle curvature.
+    // Paved floor + apron as a tiled grid of moderate slabs (a single huge quad
+    // mis-rasterises against the fine terrain at these km-scale coords). Covers
+    // the interior and a margin out the front door so no grass shows near the
+    // rocket.
+    for ix in -1..=2 {
+        for iz in -2..=2 {
+            let col = if ix <= 0 { [0.32, 0.33, 0.37] } else { [0.30, 0.31, 0.35] };
+            m.bx(
+                c + Vec3::new(ix as f32 * (w * 0.95), -2.0, iz as f32 * (d * 0.62)),
+                Vec3::new(w * 0.55, 3.7, d * 0.36),
+                col,
+            );
+        }
+    }
     // back wall (-X)
     m.bx(c + Vec3::new(-w + t, h * 0.5, 0.0), Vec3::new(t, h * 0.5, d), wall);
     // side walls (+/-Z)
@@ -180,20 +195,10 @@ pub fn hangar(c: Vec3, light_offsets: &[Vec3]) -> Mesh {
     for sz in [-1.0f32, 1.0] {
         m.bx(c + Vec3::new(w - t, h * 0.5, sz * (d - 7.0)), Vec3::new(t, h * 0.5, 7.0), inner);
     }
-    // roof + a few beams visible from inside
+    // roof + a few beams visible from inside (kept clear of the rocket)
     m.bx(c + Vec3::new(0.0, h, 0.0), Vec3::new(w, t, d), inner);
     for k in -3..=3 {
         m.bx(c + Vec3::new(k as f32 * 18.0, h - 2.5, 0.0), Vec3::new(0.6, 1.2, d), frame);
-    }
-    // internal gantry towers flanking the rocket + service platforms
-    for (sx, sz) in [(1.0f32, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)] {
-        m.bx(c + Vec3::new(sx * 12.0, h * 0.46, sz * 12.0), Vec3::new(0.9, h * 0.46, 0.9), frame);
-    }
-    for lvl in [0.18f32, 0.42, 0.66] {
-        let y = h * lvl;
-        for sz in [-1.0f32, 1.0] {
-            m.bx(c + Vec3::new(0.0, y, sz * 12.0), Vec3::new(12.0, 0.4, 0.6), frame);
-        }
     }
     // light fixtures at the work-light positions (bright; they sit at a point
     // light so they read as glowing lamps)
@@ -353,7 +358,9 @@ fn spaceport_dir() -> DVec3 {
 fn launch_elevation() -> Elevation {
     let mut elev = Elevation::new(47);
     if std::env::var("MTS_TERRAIN_NOFLAT").is_err() {
-        elev.add_flat_zone(spaceport_dir(), 2500.0, 8000.0, PLANET_RADIUS);
+        // flat out far enough to hold the pad, the assembly building ~5 km away,
+        // and the rollout corridor between them.
+        elev.add_flat_zone(spaceport_dir(), 6500.0, 13000.0, PLANET_RADIUS);
     }
     elev
 }

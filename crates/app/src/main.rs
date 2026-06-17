@@ -140,10 +140,10 @@ const TERRAIN_CAP: u64 = 500_000;
 /// Render-space length unit for the system view: 1000 km.
 const MM: f32 = 1.0e6;
 
-/// Local-frame position (metres) of the assembly building, beside the pad
-/// (which is at the origin). The rocket assembles here and rolls out (+X) to it.
-const HANGAR_POS: Vec3 = Vec3::new(-90.0, 0.0, 0.0);
-const RACK_POS: Vec3 = Vec3::new(-90.0, 0.0, 42.0);
+/// Local-frame position (metres) of the assembly building. It sits ~5 km from
+/// the pad (which is at the origin); the rocket rolls out across the flats to it.
+const HANGAR_POS: Vec3 = Vec3::new(-5000.0, 0.0, 0.0);
+const RACK_POS: Vec3 = Vec3::new(-5000.0, 0.0, 42.0);
 
 /// Interior work lights of the assembly building: (offset from HANGAR_POS,
 /// colour*intensity, range metres). Cool corner lamps + warm overhead lamps.
@@ -775,9 +775,9 @@ impl World {
             self.clock += frame_dt * self.warp;
         }
 
-        // roll the assembled rocket out of the hangar to the pad
+        // roll the assembled rocket out of the hangar across the flats to the pad
         if self.rolling_out {
-            self.rollout = (self.rollout + frame_dt / 6.0).min(1.0);
+            self.rollout = (self.rollout + frame_dt / 16.0).min(1.0);
             if self.rollout >= 1.0 {
                 self.rolling_out = false;
                 self.vab_mode = false; // now on the pad, ready to launch
@@ -1243,6 +1243,22 @@ impl World {
         );
         self.terrain_count = (m.verts.len() as u64).min(TERRAIN_CAP) as u32;
         self.terrain_verts = m.verts;
+        if std::env::var("MTS_DEBUG_VAB").is_ok() {
+            let rb = self.resting_base_local().as_vec3();
+            let r = self.ref_local.as_vec3();
+            let near: Vec<f32> = self
+                .terrain_verts
+                .iter()
+                .filter(|v| {
+                    let p = Vec3::from(v.pos) + r;
+                    (p.x - rb.x).abs() < 40.0 && (p.z - rb.z).abs() < 40.0
+                })
+                .map(|v| Vec3::from(v.pos).y + r.y)
+                .collect();
+            let lo = near.iter().cloned().fold(f32::MAX, f32::min);
+            let hi = near.iter().cloned().fold(f32::MIN, f32::max);
+            eprintln!("VAB resting_base.y={:.2} terrain near VAB y in [{:.2},{:.2}] ({} verts)", rb.y, lo, hi, near.len());
+        }
     }
 
     /// Per-frame dynamic rocket-view geometry, camera-relative (floating origin):
