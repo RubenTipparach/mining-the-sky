@@ -107,31 +107,34 @@ impl Mesh {
 
 }
 
-pub struct Scene {
+/// The flyable rocket body, built about its base at y=0 and pointing +Y. The
+/// pad and mount are separate (they stay behind on liftoff). `booster` and
+/// `upper` are the vertex ranges of the first stage and everything above it, so
+/// the spent booster can be split off and tumbled away at staging.
+pub struct RocketBody {
     pub mesh: Mesh,
-    /// Y to aim the camera at (mid-stack), in metres.
+    pub booster: std::ops::Range<usize>,
+    pub upper: std::ops::Range<usize>,
+    /// Height (m) the base sits above the pad slab when resting on the mount.
+    pub base_y: f32,
+    /// Total stack height (m).
+    pub height: f32,
+    /// Y to aim the camera at (mid-stack), and a good default distance.
     pub focus_y: f32,
-    /// A good default camera distance, in metres.
     pub cam_dist: f32,
+    /// Radius of the first stage's engine cluster (for plume placement).
+    pub engine_r: f32,
 }
 
-const PAD_TOP: f32 = 1.2;
-const MOUNT_H: f32 = 2.2; // rocket base sits this far above the pad slab
+pub const PAD_TOP: f32 = 1.2;
+pub const MOUNT_H: f32 = 2.2; // rocket base sits this far above the pad slab
 const PROP_DENSITY: f32 = 1000.0; // kg/m^3, sizes stage height from propellant
 
-/// Build the rocket-view scene from the Pioneer vehicle.
-pub fn scene() -> Scene {
-    let veh = Vehicle::pioneer();
+/// The static launch pad slab + mount legs (the planet terrain is the ground;
+/// see `build_terrain`). The rocket itself is the separate `rocket_body`.
+pub fn pad_and_mount() -> Mesh {
     let mut m = Mesh::default();
-
-    // pad slab (the planet terrain is the ground; see build_terrain)
     m.bx(Vec3::new(0.0, PAD_TOP * 0.5, 0.0), Vec3::new(9.0, PAD_TOP * 0.5, 9.0), [0.42, 0.42, 0.45]);
-
-    let base_y = PAD_TOP + MOUNT_H;
-    let radii = [1.85f32, 1.7];
-    let body_cols = [[0.90f32, 0.90, 0.93], [0.72, 0.74, 0.78]];
-
-    // launch mount legs
     for (sx, sz) in [(1.0f32, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)] {
         m.bx(
             Vec3::new(sx * 2.3, PAD_TOP + MOUNT_H * 0.5, sz * 2.3),
@@ -139,8 +142,19 @@ pub fn scene() -> Scene {
             [0.28, 0.29, 0.32],
         );
     }
+    m
+}
 
-    let mut y = base_y;
+/// Build the Pioneer rocket body about its base at y=0.
+pub fn rocket_body() -> RocketBody {
+    let veh = Vehicle::pioneer();
+    let mut m = Mesh::default();
+    let radii = [1.85f32, 1.7];
+    let body_cols = [[0.90f32, 0.90, 0.93], [0.72, 0.74, 0.78]];
+    let mut engine_r = radii[0];
+
+    let mut y = 0.0f32;
+    let mut booster_end = 0usize;
     for (i, stage) in veh.stages.iter().enumerate() {
         let r = radii[i.min(radii.len() - 1)];
         let col = body_cols[i.min(body_cols.len() - 1)];
@@ -154,6 +168,7 @@ pub fn scene() -> Scene {
 
         // engines below this stage's base
         if i == 0 {
+            engine_r = r * 0.5;
             for k in 0..5 {
                 let (ex, ez) = if k < 4 {
                     let a = k as f32 * std::f32::consts::FRAC_PI_2;
@@ -183,6 +198,11 @@ pub fn scene() -> Scene {
         let next_r = radii.get(i + 1).copied().unwrap_or(r * 0.92);
         m.frustum(0.0, 0.0, y, y + 0.6, r, next_r, 24, [0.18, 0.18, 0.21], false, false);
         y += 0.6;
+
+        // the booster (stage 0) and its interstage drop together at staging
+        if i == 0 {
+            booster_end = m.verts.len();
+        }
     }
 
     // payload section + nose cone
@@ -192,12 +212,38 @@ pub fn scene() -> Scene {
     m.frustum(0.0, 0.0, y, y + 4.5, pr, 0.0, 24, [0.93, 0.93, 0.96], false, false);
     y += 4.5;
 
-    let top = y;
-    Scene {
+    let total = m.verts.len();
+    RocketBody {
         mesh: m,
-        focus_y: top * 0.45,
-        cam_dist: top * 1.7,
+        booster: 0..booster_end,
+        upper: booster_end..total,
+        base_y: PAD_TOP + MOUNT_H,
+        height: y,
+        focus_y: y * 0.45,
+        cam_dist: y * 1.7,
+        engine_r,
     }
+}
+
+/// Append an exhaust plume below the base (mesh-local: a bright flickering cone
+/// hanging from y=0 down to -length), so it follows the rocket's pose transform.
+pub fn append_plume(m: &mut Mesh, engine_r: f32, length: f32, t: f32) {
+    if length <= 0.1 {
+        return;
+    }
+    let flick = 0.85 + 0.15 * (t * 37.0).sin();
+    let len = length * flick;
+    let core = [1.0, 0.95, 0.75];
+    let outer = [1.0, 0.55, 0.18];
+    // bright inner core
+    m.frustum(0.0, 0.0, -len * 0.55, 0.2, 0.15, engine_r * 1.05, 14, core, true, false);
+    // translucent-looking orange flare (opaque, just darker/redder)
+    m.frustum(0.0, 0.0, -len, 0.1, 0.05, engine_r * 1.5, 14, outer, true, false);
+}
+
+/// Append a smoke puff (a shaded cube), used for the pad/launch effects.
+pub fn append_puff(m: &mut Mesh, center: Vec3, size: f32, col: [f32; 3]) {
+    m.bx(center, Vec3::splat(size * 0.5), col);
 }
 
 // ---------------------------------------------------------------------------
@@ -218,6 +264,24 @@ use terrain::{Elevation, Planet};
 /// Spaceport (matches sim / worldgen seed 47).
 const SPACEPORT_LAT_DEG: f64 = -1.7;
 const SPACEPORT_LON_DEG: f64 = -102.9;
+pub const PLANET_RADIUS: f64 = 6.2e6;
+
+/// The rocket-view local tangent frame at the spaceport: the surface origin
+/// (home-centred metres) plus the up / east / north basis. The launch physics
+/// and the terrain share this so the flying rocket lines up with the ground.
+pub fn launch_frame() -> (DVec3, DVec3, DVec3, DVec3) {
+    let mut elev = Elevation::new(47);
+    let lat = SPACEPORT_LAT_DEG.to_radians();
+    let lon = SPACEPORT_LON_DEG.to_radians();
+    let dir = DVec3::new(lat.cos() * lon.cos(), lat.sin(), lat.cos() * lon.sin()).normalize();
+    elev.add_flat_zone(dir, 2500.0, 8000.0, PLANET_RADIUS);
+    let h0 = elev.land_height_m(dir);
+    let origin = dir * (PLANET_RADIUS + h0);
+    let up = dir;
+    let north = (DVec3::Y - up * up.dot(DVec3::Y)).normalize();
+    let east = north.cross(up).normalize();
+    (origin, up, east, north)
+}
 
 fn mix3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
     let t = t.clamp(0.0, 1.0);

@@ -15,7 +15,13 @@ const DIM: egui::Color32 = egui::Color32::from_rgb(150, 175, 200);
 pub fn build(ctx: &egui::Context, world: &mut World) {
     apply_theme(ctx);
     match world.view {
-        View::Rocket => vehicle_panel(ctx, world),
+        View::Rocket => {
+            if world.launch.is_some() {
+                launch_panel(ctx, world);
+            } else {
+                vehicle_panel(ctx, world);
+            }
+        }
         View::Map => {
             body_browser(ctx, world);
             status_panel(ctx, world);
@@ -93,23 +99,129 @@ fn vehicle_panel(ctx: &egui::Context, world: &mut World) {
                 kv(ui, "Target orbit", &format!("{target:.0} km"));
             });
             ui.separator();
-            if !launched {
-                let btn = egui::Button::new(egui::RichText::new("LAUNCH").strong().color(egui::Color32::BLACK))
-                    .fill(GOOD)
-                    .min_size(egui::vec2(120.0, 26.0));
-                if ui.add(btn).clicked() {
-                    do_launch = true;
-                }
-                ui.label(egui::RichText::new("or press Space").color(DIM));
-            } else {
-                ui.label(egui::RichText::new("Lifted off - Tab to the map to watch the ascent").color(GOOD));
+            let _ = launched;
+            let btn = egui::Button::new(egui::RichText::new("LAUNCH").strong().color(egui::Color32::BLACK))
+                .fill(GOOD)
+                .min_size(egui::vec2(120.0, 26.0));
+            if ui.add(btn).clicked() {
+                do_launch = true;
             }
+            ui.label(egui::RichText::new("or press Space to ignite").color(DIM));
             ui.separator();
-            ui.label(egui::RichText::new("Drag: orbit   Scroll: zoom   Tab: map").color(DIM));
+            ui.label(egui::RichText::new("Fly it yourself:").color(DIM));
+            ui.label(egui::RichText::new("Shift / Ctrl  throttle").color(DIM));
+            ui.label(egui::RichText::new("W / S  pitch over").color(DIM));
+            ui.label(egui::RichText::new("Space  stage    R  reset").color(DIM));
         });
 
     if do_launch {
-        world.toggle_launch();
+        world.ignite_launch();
+    }
+}
+
+/// KSP-style launch telemetry + controls shown while a player-flown launch is
+/// in progress (rocket view).
+fn launch_panel(ctx: &egui::Context, world: &mut World) {
+    let tel = match world.launch.as_ref() {
+        Some(rk) => rk.telemetry(&world.body),
+        None => return,
+    };
+    let phase_col = match tel.phase {
+        "CRASHED" => egui::Color32::from_rgb(255, 80, 70),
+        "ORBIT" => egui::Color32::from_rgb(120, 200, 255),
+        "POWERED" => WARN,
+        _ => DIM,
+    };
+    let twr_col = if tel.twr < 1.0 && tel.phase == "POWERED" { WARN } else { GOOD };
+
+    enum Act {
+        Throttle(f64),
+        Stage,
+        Reset,
+    }
+    let mut act: Option<Act> = None;
+
+    egui::Window::new("LAUNCH CONTROL")
+        .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 12.0))
+        .default_width(250.0)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("PHASE").color(DIM));
+                ui.label(egui::RichText::new(tel.phase).strong().color(phase_col));
+            });
+            egui::Grid::new("ltel").num_columns(2).show(ui, |ui| {
+                kv(ui, "Altitude", &format!("{:.1} km", tel.alt_km));
+                kv(ui, "Speed", &format!("{:.0} m/s", tel.speed));
+                kv(ui, "Vert speed", &format!("{:.0} m/s", tel.vspeed));
+                ui.label(egui::RichText::new("TWR").color(DIM));
+                ui.label(egui::RichText::new(format!("{:.2}", tel.twr)).color(twr_col));
+                ui.end_row();
+                kv(ui, "Apoapsis", &fmt_alt(tel.apo_km));
+                kv(ui, "Periapsis", &fmt_alt(tel.peri_km));
+                kv(ui, "Pitch", &format!("{:.0} deg", tel.pitch_deg));
+                kv(
+                    ui,
+                    "Stage",
+                    &format!("{} ({}/{})", tel.stage_name, tel.stage_idx + 1, tel.stage_total),
+                );
+            });
+            ui.separator();
+            // throttle bar
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Throttle").color(DIM));
+                ui.add(
+                    egui::ProgressBar::new(tel.throttle)
+                        .desired_width(110.0)
+                        .text(format!("{:.0}%", tel.throttle * 100.0)),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Propellant").color(DIM));
+                ui.add(
+                    egui::ProgressBar::new(tel.prop_frac)
+                        .desired_width(110.0)
+                        .fill(egui::Color32::from_rgb(90, 150, 90)),
+                );
+            });
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("- thr").clicked() {
+                    act = Some(Act::Throttle(-0.1));
+                }
+                if ui.button("+ thr").clicked() {
+                    act = Some(Act::Throttle(0.1));
+                }
+                if ui.button("STAGE").clicked() {
+                    act = Some(Act::Stage);
+                }
+                if ui.button("Reset").clicked() {
+                    act = Some(Act::Reset);
+                }
+            });
+            ui.label(
+                egui::RichText::new("Shift/Ctrl throttle  W/S pitch  Space stage")
+                    .color(DIM),
+            );
+        });
+
+    match act {
+        Some(Act::Throttle(d)) => {
+            if let Some(rk) = world.launch.as_mut() {
+                rk.throttle = (rk.throttle + d).clamp(0.0, 1.0);
+            }
+        }
+        Some(Act::Stage) => world.stage_launch(),
+        Some(Act::Reset) => world.reset_launch(),
+        None => {}
+    }
+}
+
+fn fmt_alt(km: f32) -> String {
+    if km.is_finite() {
+        format!("{km:.0} km")
+    } else {
+        "--".to_string()
     }
 }
 

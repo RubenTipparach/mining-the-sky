@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use glam::{DVec3, Mat4, Vec3};
+use glam::{DVec3, Mat4, Quat, Vec3};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
@@ -23,6 +23,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 mod flight;
+mod launch;
 mod mission;
 mod rocket;
 mod ui;
@@ -118,6 +119,8 @@ struct OverlayVertex {
 
 const OVERLAY_CAP: u64 = 8192;
 const HUD_CAP: u64 = 40000;
+/// Dynamic rocket-view geometry (rocket + plume + smoke + spent booster).
+const DYN_MESH_CAP: u64 = 40000;
 
 /// Render-space length unit for the system view: 1000 km.
 const MM: f32 = 1.0e6;
@@ -198,6 +201,16 @@ impl SystemCamera {
 // per-frame geometry/uniform builders so both render paths share them.
 // ---------------------------------------------------------------------------
 
+/// A jettisoned booster tumbling away after staging, integrated ballistically
+/// in the rocket-view local frame (metres) for a few seconds of spectacle.
+struct SepBooster {
+    pos: Vec3,
+    vel: Vec3,
+    rot: Quat,
+    spin: Vec3,
+    age: f32,
+}
+
 struct World {
     mission: Mission,
     body: CentralBody,
@@ -205,6 +218,17 @@ struct World {
     launched: bool,
     clock: f32, // mission-elapsed seconds
     warp: f32,
+
+    // player-controlled launch (KSP-style); replaces the on-rails ascent when
+    // the player flies it from the pad in the rocket view.
+    launch: Option<launch::Rocket>,
+    rocket_body: rocket::RocketBody,
+    sep: Option<SepBooster>,
+    // launch-site tangent frame (home-centred metres): origin + up/east/north.
+    launch_origin: DVec3,
+    launch_up: DVec3,
+    launch_east: DVec3,
+    launch_north: DVec3,
 
     // orbital map: a perspective camera framing the focused body.
     view: View,
@@ -241,10 +265,9 @@ impl World {
     fn new() -> World {
         let mission = Mission::pioneer_from_spaceport();
         let body = CentralBody::home();
-        let rocket_frame = {
-            let s = rocket::scene();
-            (s.focus_y, s.cam_dist)
-        };
+        let rocket_body = rocket::rocket_body();
+        let rocket_frame = (rocket_body.focus_y, rocket_body.cam_dist);
+        let (launch_origin, launch_up, launch_east, launch_north) = rocket::launch_frame();
         let home_radius_mm = (body.radius as f32) / MM;
         // A fictional moon: ~0.27 home radii, parked off to one side. Distance is
         // compressed from the real ~60 radii so both bodies frame nicely in one
@@ -265,6 +288,13 @@ impl World {
             mission,
             body,
             flight: None,
+            launch: None,
+            rocket_body,
+            sep: None,
+            launch_origin,
+            launch_up,
+            launch_east,
+            launch_north,
             view: View::Rocket,
             sys_az: 1.4,
             sys_el: 0.30,
@@ -374,7 +404,18 @@ impl World {
 
     /// Rocket-view camera: eye, target, basis, and tan(fov/2).
     fn rocket_camera(&self, aspect: f32) -> (Vec3, Vec3, Vec3, Vec3, Vec3, f32) {
-        let target = Vec3::new(0.0, self.rocket_focus_y, 0.0);
+        // Chase the rocket once it is flying; otherwise frame it on the pad.
+        let target = match self.launch.as_ref() {
+            Some(rk) => {
+                let base = self.to_local(rk.r);
+                let axis = self.dir_to_local(rk.point_dir());
+                // Low and slow: look near the base so the pad + smoke stay framed;
+                // ease up the stack as the rocket climbs away.
+                let f = self.rocket_focus_y * (base.y / 120.0).clamp(0.25, 1.0);
+                base + axis * f
+            }
+            None => Vec3::new(0.0, self.rocket_focus_y, 0.0),
+        };
         let dir = Vec3::new(
             self.rocket_el.cos() * self.rocket_az.cos(),
             self.rocket_el.sin(),
@@ -533,6 +574,193 @@ impl World {
         } else if self.launched {
             self.clock += frame_dt * self.warp;
         }
+
+        // player-controlled launch + any tumbling spent booster
+        if let Some(rk) = self.launch.as_mut() {
+            rk.just_staged = None;
+            let dt = (frame_dt * self.warp).min(2.0);
+            rk.integrate(&self.body, dt as f64);
+        }
+        self.advance_sep(frame_dt * self.warp.min(8.0));
+    }
+
+    /// World->local point in the rocket-view tangent frame (metres).
+    fn to_local(&self, w: DVec3) -> Vec3 {
+        let d = w - self.launch_origin;
+        Vec3::new(
+            d.dot(self.launch_east) as f32,
+            d.dot(self.launch_up) as f32,
+            d.dot(self.launch_north) as f32,
+        )
+    }
+
+    /// World->local direction (no translation).
+    fn dir_to_local(&self, d: DVec3) -> Vec3 {
+        Vec3::new(
+            d.dot(self.launch_east) as f32,
+            d.dot(self.launch_up) as f32,
+            d.dot(self.launch_north) as f32,
+        )
+        .normalize_or_zero()
+    }
+
+    /// Ignite the full stack on the pad and begin a player-controlled launch.
+    fn ignite_launch(&mut self) {
+        let veh = sim::vehicle::Vehicle::pioneer();
+        // base of the rocket sits `base_y` above the pad surface, on the mount.
+        let r = self.launch_origin + self.launch_up * self.rocket_body.base_y as f64;
+        let v = self.body.omega() * DVec3::Y.cross(r); // surface (eastward) velocity
+        let mut rk = launch::Rocket::on_pad(&veh, r, v, self.launch_up, self.launch_east);
+        rk.throttle = 1.0;
+        self.launch = Some(rk);
+        self.sep = None;
+        log::info!("Ignition: Pioneer I - throttle up, pitch over, stage when dry");
+    }
+
+    /// Jettison the active stage; spawn the spent booster tumbling away.
+    fn stage_launch(&mut self) {
+        // capture the booster pose + velocity (immutable borrow) before removal
+        let (r, pd, v, can_stage) = match self.launch.as_ref() {
+            Some(rk) => (rk.r, rk.point_dir(), rk.v, rk.stages.len() > 1),
+            None => return,
+        };
+        if !can_stage {
+            return;
+        }
+        let base_local = self.to_local(r);
+        let pd_local = self.dir_to_local(pd);
+        let rot = Quat::from_rotation_arc(Vec3::Y, pd_local);
+        let vel_local = self.dir_to_local_vec(v);
+        self.launch.as_mut().unwrap().jettison();
+        self.sep = Some(SepBooster {
+            pos: base_local,
+            // a gentle retro push so it falls back below the climbing upper stage
+            vel: vel_local - pd_local * 12.0,
+            rot,
+            spin: Vec3::new(0.7, 0.15, 1.1),
+            age: 0.0,
+        });
+    }
+
+    /// World->local velocity vector (unnormalised).
+    fn dir_to_local_vec(&self, d: DVec3) -> Vec3 {
+        Vec3::new(
+            d.dot(self.launch_east) as f32,
+            d.dot(self.launch_up) as f32,
+            d.dot(self.launch_north) as f32,
+        )
+    }
+
+    fn reset_launch(&mut self) {
+        self.launch = None;
+        self.sep = None;
+    }
+
+    /// Transform a vertex range of the rocket body by `q`/`t` into `out`.
+    fn xform_into(
+        &self,
+        out: &mut Vec<rocket::MeshVertex>,
+        range: std::ops::Range<usize>,
+        q: Quat,
+        t: Vec3,
+    ) {
+        for v in &self.rocket_body.mesh.verts[range] {
+            let p = t + q * Vec3::from(v.pos);
+            let n = q * Vec3::from(v.normal);
+            out.push(rocket::MeshVertex { pos: p.into(), normal: n.into(), color: v.color });
+        }
+    }
+
+    /// Per-frame dynamic rocket-view geometry: the rocket at its current pose,
+    /// exhaust plume, launch smoke, and any tumbling spent booster. The static
+    /// pad + terrain live in their own buffer.
+    fn build_dynamic_mesh(&self) -> Vec<rocket::MeshVertex> {
+        let rb = &self.rocket_body;
+        let mut out: Vec<rocket::MeshVertex> = Vec::new();
+
+        // current rocket pose (resting on the pad when not launched)
+        let (base_local, quat, on_booster, thrust_frac, met) = match self.launch.as_ref() {
+            Some(rk) => {
+                let base = self.to_local(rk.r);
+                let q = Quat::from_rotation_arc(Vec3::Y, self.dir_to_local(rk.point_dir()));
+                let tf = if rk.live_thrust() > 0.0 { rk.throttle as f32 } else { 0.0 };
+                (base, q, rk.stage_base == 0, tf, rk.met as f32)
+            }
+            None => (Vec3::new(0.0, rb.base_y, 0.0), Quat::IDENTITY, true, 0.0, 0.0),
+        };
+
+        self.xform_into(&mut out, rb.upper.clone(), quat, base_local);
+        if on_booster {
+            self.xform_into(&mut out, rb.booster.clone(), quat, base_local);
+        }
+
+        // exhaust plume (built mesh-local, carried by the same pose). Scale it to
+        // the active stage so the small upper engine doesn't get a booster plume.
+        if thrust_frac > 0.0 {
+            let mut pm = rocket::Mesh::default();
+            let (er, len) = if on_booster {
+                (rb.engine_r, 6.0 + 16.0 * thrust_frac)
+            } else {
+                (rb.engine_r * 0.45, 3.0 + 7.0 * thrust_frac)
+            };
+            rocket::append_plume(&mut pm, er, len, met);
+            for v in &pm.verts {
+                let p = base_local + quat * Vec3::from(v.pos);
+                let n = quat * Vec3::from(v.normal);
+                out.push(rocket::MeshVertex { pos: p.into(), normal: n.into(), color: v.color });
+            }
+        }
+
+        // launch smoke: a billowing ground cloud the exhaust kicks up, anchored
+        // under the rocket's ground track so it stays near the action and rises
+        // and spreads over the first few seconds.
+        if let Some(rk) = self.launch.as_ref() {
+            if rk.met < 7.0 {
+                let met = rk.met as f32;
+                let ground = Vec3::new(base_local.x, 0.0, base_local.z);
+                let mut sm = rocket::Mesh::default();
+                let puffs = 26;
+                for k in 0..puffs {
+                    let a = k as f32 / puffs as f32 * std::f32::consts::TAU * 2.3 + met * 0.4;
+                    let ring = ((k * 5) % 7) as f32 / 7.0;
+                    let spread = 4.0 + met * 6.0 * (0.4 + ring);
+                    let rise = 0.5 + met * 2.2 + (k % 4) as f32 * 1.0;
+                    let size = 4.0 + met * 2.0 + ((k * 7) % 5) as f32 * 1.2;
+                    let g = (0.92 - met * 0.07).max(0.45) - 0.07 * ((k % 3) as f32);
+                    rocket::append_puff(
+                        &mut sm,
+                        ground + Vec3::new(a.cos() * spread, rocket::PAD_TOP + rise, a.sin() * spread),
+                        size,
+                        [g, g, g * 1.02],
+                    );
+                }
+                out.extend(sm.verts);
+            }
+        }
+
+        // tumbling spent booster
+        if let Some(s) = self.sep.as_ref() {
+            for v in &rb.mesh.verts[rb.booster.clone()] {
+                let p = s.pos + s.rot * Vec3::from(v.pos);
+                let n = s.rot * Vec3::from(v.normal);
+                out.push(rocket::MeshVertex { pos: p.into(), normal: n.into(), color: v.color });
+            }
+        }
+
+        out
+    }
+
+    /// Integrate the jettisoned booster (local frame, ~9.2 m/s^2 down).
+    fn advance_sep(&mut self, dt: f32) {
+        if let Some(s) = self.sep.as_mut() {
+            s.age += dt;
+            s.vel.y -= 9.2 * dt;
+            s.pos += s.vel * dt;
+            s.rot = (Quat::from_scaled_axis(s.spin * dt) * s.rot).normalize();
+            if s.age > 9.0 {
+                self.sep = None;
+            }
+        }
     }
 
     fn toggle_launch(&mut self) {
@@ -559,6 +787,18 @@ impl World {
 
     /// World position (unit-sphere) + colour of the map craft/rocket marker.
     fn surface_marker(&self) -> (Vec3, [f32; 3]) {
+        if let Some(rk) = self.launch.as_ref() {
+            let u = rk.r / self.body.radius;
+            let pos = Vec3::new(u.x as f32, u.y as f32, u.z as f32);
+            let col = if rk.crashed {
+                [1.0, 0.25, 0.2]
+            } else if rk.orbit_reached {
+                [0.5, 0.9, 1.0]
+            } else {
+                [1.0, 0.55, 0.15]
+            };
+            return (pos, col);
+        }
         if let Some(craft) = self.flight.as_ref() {
             let col = if craft.crashed {
                 [1.0, 0.25, 0.2]
@@ -609,7 +849,11 @@ impl World {
 
         polyline(&self.mission.pad_ring, [0.9, 0.6, 0.2], &mut out);
 
-        if let Some(craft) = self.flight.as_ref() {
+        if let Some(rk) = self.launch.as_ref() {
+            // the player launch's predicted conic (empty while still suborbital)
+            let pred = rk.predicted_orbit(&self.body);
+            polyline(&pred, [1.0, 0.7, 0.25], &mut out);
+        } else if let Some(craft) = self.flight.as_ref() {
             let pred = craft.predicted_orbit(&self.body);
             polyline(&pred, [0.5, 0.55, 0.25], &mut out);
         } else {
@@ -716,6 +960,9 @@ struct Gpu {
     mesh_bind_group: wgpu::BindGroup,
     mesh_vbuf: wgpu::Buffer,
     mesh_vertex_count: u32,
+    /// Dynamic rocket-view geometry (rocket pose, plume, smoke, spent booster),
+    /// rebuilt every frame.
+    dyn_vbuf: wgpu::Buffer,
     sky_pipeline: wgpu::RenderPipeline,
     sky_uniform_buf: wgpu::Buffer,
     sky_bind_group: wgpu::BindGroup,
@@ -1084,8 +1331,9 @@ impl Gpu {
             cache: None,
         });
 
-        let mut scene_mesh = rocket::scene().mesh;
-        // Append the real planet LOD terrain (same local tangent frame).
+        // Static rocket-view geometry: the pad + mount and the planet terrain
+        // (same local tangent frame). The rocket itself is dynamic (dyn_vbuf).
+        let mut scene_mesh = rocket::pad_and_mount();
         scene_mesh.verts.extend(rocket::build_terrain().verts);
         let mesh_vertex_count = scene_mesh.verts.len() as u32;
         let mesh_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1095,6 +1343,13 @@ impl Gpu {
             mapped_at_creation: false,
         });
         queue.write_buffer(&mesh_vbuf, 0, bytemuck::cast_slice(&scene_mesh.verts));
+
+        let dyn_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dyn-mesh-vbuf"),
+            size: DYN_MESH_CAP * std::mem::size_of::<rocket::MeshVertex>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         Gpu {
             scene_pipeline,
@@ -1109,13 +1364,15 @@ impl Gpu {
             mesh_bind_group,
             mesh_vbuf,
             mesh_vertex_count,
+            dyn_vbuf,
             sky_pipeline,
             sky_uniform_buf,
             sky_bind_group,
         }
     }
 
-    /// Upload this frame's uniforms + geometry. Returns (overlay verts, hud verts).
+    /// Upload this frame's uniforms + geometry. Returns (overlay verts, hud
+    /// verts, dynamic rocket-mesh verts).
     fn prepare(
         &self,
         queue: &wgpu::Queue,
@@ -1123,8 +1380,9 @@ impl Gpu {
         w: u32,
         h: u32,
         time: f32,
-    ) -> (usize, usize) {
+    ) -> (usize, usize, u32) {
         let res = [w as f32, h.max(1) as f32];
+        let mut dyn_n = 0u32;
         match world.view {
             View::Map => {
                 let su = world.scene_uniforms(res, time);
@@ -1135,6 +1393,15 @@ impl Gpu {
                 queue.write_buffer(&self.mesh_uniform_buf, 0, bytemuck::bytes_of(&mu));
                 let sk = world.sky_uniforms(res);
                 queue.write_buffer(&self.sky_uniform_buf, 0, bytemuck::bytes_of(&sk));
+                let dyn_verts = world.build_dynamic_mesh();
+                dyn_n = (dyn_verts.len() as u64).min(DYN_MESH_CAP) as u32;
+                if dyn_n > 0 {
+                    queue.write_buffer(
+                        &self.dyn_vbuf,
+                        0,
+                        bytemuck::cast_slice(&dyn_verts[..dyn_n as usize]),
+                    );
+                }
             }
         }
 
@@ -1149,7 +1416,7 @@ impl Gpu {
         if hn > 0 {
             queue.write_buffer(&self.hud_buf, 0, bytemuck::cast_slice(&hud_verts[..hn]));
         }
-        (n, hn)
+        (n, hn, dyn_n)
     }
 
     /// Map view: fullscreen multi-body raymarch + 2D overlay/HUD. The rocket
@@ -1178,11 +1445,15 @@ impl Gpu {
     }
 
     /// The 3D rocket/pad/terrain mesh (depth-tested). Used in its own pass.
-    fn draw_meshes(&self, pass: &mut wgpu::RenderPass) {
+    fn draw_meshes(&self, pass: &mut wgpu::RenderPass, dyn_count: u32) {
         pass.set_pipeline(&self.mesh_pipeline);
         pass.set_bind_group(0, &self.mesh_bind_group, &[]);
         pass.set_vertex_buffer(0, self.mesh_vbuf.slice(..));
         pass.draw(0..self.mesh_vertex_count, 0..1);
+        if dyn_count > 0 {
+            pass.set_vertex_buffer(0, self.dyn_vbuf.slice(..));
+            pass.draw(0..dyn_count, 0..1);
+        }
     }
 
     /// Fullscreen sky behind the terrain (no depth write).
@@ -1429,7 +1700,7 @@ impl State {
         self.last_t = t;
         self.world.advance(frame_dt);
 
-        let (n, hn) = self
+        let (n, hn, dyn_n) = self
             .gpu
             .prepare(&self.queue, &self.world, self.config.width, self.config.height, t);
 
@@ -1473,7 +1744,7 @@ impl State {
             {
                 let mut pass = mesh_pass(&mut encoder, &view, &depth);
                 self.gpu.draw_sky(&mut pass);
-                self.gpu.draw_meshes(&mut pass);
+                self.gpu.draw_meshes(&mut pass, dyn_n);
             }
             {
                 let mut pass = overlay_pass(&mut encoder, &view);
@@ -1538,6 +1809,47 @@ fn make_shot_device() -> (wgpu::Device, wgpu::Queue) {
 fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
     let _ = (width, height);
     let mut world = World::new();
+
+    // Fly a scripted player-style launch (open-loop gravity turn, auto-stage)
+    // for `dur` seconds, so the rocket-view launch is verifiable headlessly.
+    fn fly(w: &mut World, dur: f32) {
+        let mut t = 0.0;
+        while t < dur {
+            if let Some(rk) = w.launch.as_mut() {
+                rk.pitch = (((rk.met - 10.0) / 120.0).clamp(0.0, 1.0) * 78f64.to_radians()).min(1.5);
+                if rk.prop_frac() <= 0.0 && rk.stages.len() > 1 && rk.stage_base == 0 {
+                    w.stage_launch();
+                }
+            }
+            w.advance(0.1);
+            t += 0.1;
+        }
+    }
+    // Fly until the first booster is dry, stage it, then coast a moment so the
+    // jettisoned booster is visibly tumbling away.
+    fn fly_to_staging(w: &mut World) {
+        for _ in 0..4000 {
+            let dry = w
+                .launch
+                .as_ref()
+                .map(|rk| rk.stage_base == 0 && rk.prop_frac() <= 0.0)
+                .unwrap_or(true);
+            if dry {
+                break;
+            }
+            if let Some(rk) = w.launch.as_mut() {
+                rk.pitch = (((rk.met - 10.0) / 120.0).clamp(0.0, 1.0) * 78f64.to_radians()).min(1.5);
+            }
+            w.advance(0.2);
+        }
+        w.stage_launch();
+        // throttle the upper stage down a touch so its plume doesn't crowd the
+        // jettisoned booster, then coast so the booster drifts clear.
+        for _ in 0..30 {
+            w.advance(0.1);
+        }
+    }
+
     // Frame the map on the home world (where the launch/orbit is drawn).
     let frame_map = |w: &mut World| {
         w.view = View::Map;
@@ -1552,6 +1864,44 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.rocket_az = 4.97; // face inland (land), coast to the sides
             world.rocket_el = 0.12;
             0.0
+        }
+        "liftoff" => {
+            world.view = View::Rocket;
+            world.rocket_az = 4.97;
+            world.rocket_el = 0.07;
+            world.rocket_dist = 60.0;
+            world.rocket_el = 0.12;
+            world.ignite_launch();
+            fly(&mut world, 1.4); // ignition: plume + billowing pad smoke
+            0.0
+        }
+        "liftoff2" => {
+            world.view = View::Rocket;
+            world.rocket_az = 4.6;
+            world.rocket_el = 0.16;
+            world.rocket_dist = 110.0;
+            world.ignite_launch();
+            fly(&mut world, 55.0); // pitched into the gravity turn, climbing
+            0.0
+        }
+        "staging" => {
+            world.view = View::Rocket;
+            world.rocket_az = 3.6;
+            world.rocket_el = 0.18;
+            world.rocket_dist = 130.0;
+            world.ignite_launch();
+            fly_to_staging(&mut world); // spent booster tumbling away
+            0.0
+        }
+        "launchmap" => {
+            // a player launch shown on the orbital map: live marker + predicted
+            // conic as the upper stage builds its parking orbit.
+            world.ignite_launch();
+            fly(&mut world, 200.0);
+            frame_map(&mut world);
+            world.sys_dist = 26.0;
+            world.sys_el = 0.5;
+            6.0
         }
         "system" => {
             // wide system shot: the binary + planet orbits, framed on the barycentre
@@ -1657,7 +2007,7 @@ fn render_shot(
     });
     let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
-    let (n, hn) = gpu.prepare(queue, &world, width, height, time);
+    let (n, hn, dyn_n) = gpu.prepare(queue, &world, width, height, time);
 
     // 256-byte aligned row pitch for the readback copy.
     let unpadded = width * 4;
@@ -1677,7 +2027,7 @@ fn render_shot(
         {
             let mut pass = mesh_pass(&mut encoder, &target_view, &depth);
             gpu.draw_sky(&mut pass);
-            gpu.draw_meshes(&mut pass);
+            gpu.draw_meshes(&mut pass, dyn_n);
         }
         {
             let mut pass = overlay_pass(&mut encoder, &target_view);
@@ -1942,6 +2292,28 @@ impl ApplicationHandler<UserEvent> for App {
                             _ => {}
                         }
                     }
+                    // player-controlled launch: pitch (W/S), throttle (Shift/Ctrl,
+                    // Z full / X cut). These repeat while held.
+                    if let Some(rk) = state.world.launch.as_mut() {
+                        let step = 2f64.to_radians();
+                        match code {
+                            KeyCode::KeyW | KeyCode::ArrowUp => {
+                                rk.pitch = (rk.pitch + step).min(110f64.to_radians())
+                            }
+                            KeyCode::KeyS | KeyCode::ArrowDown => {
+                                rk.pitch = (rk.pitch - step).max(0.0)
+                            }
+                            KeyCode::ShiftLeft | KeyCode::ShiftRight => {
+                                rk.throttle = (rk.throttle + 0.06).min(1.0)
+                            }
+                            KeyCode::ControlLeft | KeyCode::ControlRight => {
+                                rk.throttle = (rk.throttle - 0.06).max(0.0)
+                            }
+                            KeyCode::KeyZ => rk.throttle = 1.0,
+                            KeyCode::KeyX => rk.throttle = 0.0,
+                            _ => {}
+                        }
+                    }
                     if key_event.repeat {
                         return;
                     }
@@ -1951,8 +2323,20 @@ impl ApplicationHandler<UserEvent> for App {
                             state.world.cycle_focus()
                         }
                         KeyCode::KeyF => state.world.toggle_flight(),
-                        KeyCode::Space if state.world.flight.is_none() => {
-                            state.world.toggle_launch()
+                        KeyCode::Space => {
+                            if state.world.view == View::Rocket {
+                                // ignite, then Space stages the spent booster.
+                                if state.world.launch.is_none() {
+                                    state.world.ignite_launch();
+                                } else {
+                                    state.world.stage_launch();
+                                }
+                            } else if state.world.flight.is_none() {
+                                state.world.toggle_launch();
+                            }
+                        }
+                        KeyCode::KeyR if state.world.view == View::Rocket => {
+                            state.world.reset_launch()
                         }
                         KeyCode::BracketRight => {
                             state.world.warp = (state.world.warp * 2.0).min(10000.0);
@@ -2043,6 +2427,14 @@ fn main() {
                 "system"
             } else if args.iter().any(|a| a == "pad") {
                 "pad"
+            } else if args.iter().any(|a| a == "liftoff2") {
+                "liftoff2"
+            } else if args.iter().any(|a| a == "liftoff") {
+                "liftoff"
+            } else if args.iter().any(|a| a == "staging") {
+                "staging"
+            } else if args.iter().any(|a| a == "launchmap") {
+                "launchmap"
             } else if args.iter().any(|a| a == "ascent") {
                 "ascent"
             } else if args.iter().any(|a| a == "flight") {
@@ -2056,6 +2448,10 @@ fn main() {
                 "rocket" => "out/rocket.png",
                 "system" => "out/system.png",
                 "pad" => "out/pad.png",
+                "liftoff" => "out/liftoff.png",
+                "liftoff2" => "out/liftoff2.png",
+                "staging" => "out/staging.png",
+                "launchmap" => "out/launchmap.png",
                 "ascent" => "out/ascent.png",
                 "flight" => "out/flight.png",
                 _ => "out/client.png",
