@@ -143,7 +143,7 @@ const MM: f32 = 1.0e6;
 /// Local-frame position (metres) of the assembly building, beside the pad
 /// (which is at the origin). The rocket assembles here and rolls out (+X) to it.
 const HANGAR_POS: Vec3 = Vec3::new(-72.0, 0.0, 0.0);
-const RACK_POS: Vec3 = Vec3::new(-72.0, 0.0, 20.0);
+const RACK_POS: Vec3 = Vec3::new(-72.0, 0.0, 17.0);
 
 /// Depth format for the rocket view's mesh pass.
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -248,6 +248,58 @@ struct OrbitObject {
     epoch: f64,   // sys_time at insertion
 }
 
+/// A grabbable part on the VAB rack: its local position, kind and catalog index.
+#[derive(Clone, Copy)]
+struct RackSlot {
+    pos: Vec3,
+    kind: rocket::PartKind,
+    idx: usize,
+}
+
+/// Build the parts rack beside the hangar from the catalog: rows of engines,
+/// tanks and payloads as 3D models you can grab. Returns the mesh + slot table.
+fn build_rack() -> (rocket::Mesh, Vec<RackSlot>) {
+    let mut m = rocket::Mesh::default();
+    let mut slots = Vec::new();
+    let base = RACK_POS;
+    let rows: [(rocket::PartKind, usize, [f32; 3], f32); 3] = [
+        (rocket::PartKind::Engine, build::ENGINES.len(), [0.55, 0.55, 0.60], 3.0),
+        (rocket::PartKind::Tank, build::TANKS.len(), [0.82, 0.82, 0.86], 6.4),
+        (rocket::PartKind::Payload, build::PAYLOADS.len(), [0.88, 0.80, 0.42], 9.6),
+    ];
+    for (kind, n, col, y) in rows {
+        let w = n as f32 * 3.2;
+        // shelf bar + back panel
+        rocket::append_box(&mut m, base + Vec3::new(0.0, y - 1.4, 0.0), Vec3::new(w * 0.5, 0.2, 1.6), [0.28, 0.29, 0.33]);
+        for k in 0..n {
+            let x = -(w * 0.5) + 1.6 + k as f32 * 3.2;
+            let p = base + Vec3::new(x, y, 0.0);
+            rocket::append_part(&mut m, kind, p, col);
+            slots.push(RackSlot { pos: p, kind, idx: k });
+        }
+    }
+    // back wall of the rack
+    rocket::append_box(&mut m, base + Vec3::new(0.0, 6.0, 1.6), Vec3::new(22.0, 7.0, 0.2), [0.24, 0.25, 0.28]);
+    (m, slots)
+}
+
+/// Nearest ray-sphere hit distance (or None).
+fn ray_sphere_near(o: Vec3, d: Vec3, c: Vec3, r: f32) -> Option<f32> {
+    let oc = o - c;
+    let b = oc.dot(d);
+    let cc = oc.dot(oc) - r * r;
+    let disc = b * b - cc;
+    if disc < 0.0 {
+        return None;
+    }
+    let t = -b - disc.sqrt();
+    if t > 0.0 {
+        Some(t)
+    } else {
+        None
+    }
+}
+
 impl OrbitObject {
     /// World position (Mm) at `sys_time`, given the home world's position.
     fn pos_mm(&self, home_pos: DVec3, sys_time: f64) -> DVec3 {
@@ -289,6 +341,14 @@ struct World {
     pad_mesh: rocket::Mesh,
     hangar_mesh: rocket::Mesh,
     rack_mesh: rocket::Mesh,
+    /// Grabbable parts on the rack (for in-viewport 3D drag-assembly).
+    rack_slots: Vec<RackSlot>,
+    /// The part currently being dragged from the rack, if any.
+    grab: Option<RackSlot>,
+    /// The stack slot the dragged part is hovering (kind + stage), if any.
+    grab_target: Option<(rocket::PartKind, usize)>,
+    /// Drag ghost position (camera-relative) while grabbing.
+    grab_ghost: Vec3,
     sep: Option<SepBooster>,
     /// Payloads delivered to orbit by completed missions (they accumulate).
     orbits: Vec<OrbitObject>,
@@ -348,6 +408,7 @@ impl World {
         let vab = build::Vab::default_build();
         let rocket_body = rocket::rocket_body(&vab.to_vehicle(), vab.payload().color);
         let rocket_frame = (rocket_body.focus_y, rocket_body.cam_dist);
+        let (rack_mesh_init, rack_slots) = build_rack();
         let (launch_origin, launch_up, launch_east, launch_north) = rocket::launch_frame();
         let home_radius_mm = (body.radius as f32) / MM;
         // A fictional moon: ~0.27 home radii, parked off to one side. Distance is
@@ -377,7 +438,11 @@ impl World {
             rocket_body,
             pad_mesh: rocket::pad_and_mount(),
             hangar_mesh: rocket::hangar(HANGAR_POS),
-            rack_mesh: rocket::parts_rack(RACK_POS),
+            rack_mesh: rack_mesh_init,
+            rack_slots,
+            grab: None,
+            grab_target: None,
+            grab_ghost: Vec3::ZERO,
             sep: None,
             orbits: Vec::new(),
             mission_captured: false,
@@ -760,6 +825,104 @@ impl World {
         }
     }
 
+    /// Camera ray (camera-relative origin + direction) through a cursor NDC.
+    fn cursor_ray(&self, ndc: [f32; 2], aspect: f32) -> (Vec3, Vec3) {
+        let (eye, _t, right, up, fwd, tan) = self.rocket_camera(aspect);
+        let dir = (fwd + right * (ndc[0] * tan * aspect) + up * (ndc[1] * tan)).normalize();
+        (eye, dir)
+    }
+
+    /// The rocket's stack attach slots (local pos, kind, stage) for drag-drop.
+    fn stack_slots(&self) -> Vec<(DVec3, rocket::PartKind, usize)> {
+        let base = self.resting_base_local();
+        let rb = &self.rocket_body;
+        let mut v = Vec::new();
+        for i in 0..self.vab.stages.len() {
+            let ny = rb.nozzle_y.get(i).copied().unwrap_or(0.0) as f64;
+            v.push((base + DVec3::new(0.0, ny, 0.0), rocket::PartKind::Engine, i));
+            v.push((base + DVec3::new(0.0, ny + 5.0, 0.0), rocket::PartKind::Tank, i));
+        }
+        v.push((base + DVec3::new(0.0, rb.height as f64 - 4.0, 0.0), rocket::PartKind::Payload, 0));
+        v
+    }
+
+    /// Pick a rack part under the cursor (start of a drag).
+    fn pick_rack(&self, ndc: [f32; 2], aspect: f32) -> Option<RackSlot> {
+        let (o, d) = self.cursor_ray(ndc, aspect);
+        let mut best = f32::MAX;
+        let mut hit = None;
+        for s in &self.rack_slots {
+            let c = self.rel(s.pos.as_dvec3());
+            if let Some(t) = ray_sphere_near(o, d, c, 1.8) {
+                if t < best {
+                    best = t;
+                    hit = Some(*s);
+                }
+            }
+        }
+        hit
+    }
+
+    /// The stack slot (matching `kind`) the cursor is over, with its local pos.
+    fn pick_stack_slot(&self, ndc: [f32; 2], aspect: f32, kind: rocket::PartKind) -> Option<(rocket::PartKind, usize, Vec3)> {
+        let (o, d) = self.cursor_ray(ndc, aspect);
+        let mut best = f32::MAX;
+        let mut hit = None;
+        for (pos, k, stage) in self.stack_slots() {
+            if k != kind {
+                continue;
+            }
+            let c = self.rel(pos);
+            if let Some(t) = ray_sphere_near(o, d, c, 3.2) {
+                if t < best {
+                    best = t;
+                    hit = Some((k, stage, c));
+                }
+            }
+        }
+        hit
+    }
+
+    /// While dragging, update the ghost position + the hovered target slot.
+    fn update_grab(&mut self, ndc: [f32; 2], aspect: f32) {
+        let Some(g) = self.grab else { return };
+        if let Some((k, stage, c)) = self.pick_stack_slot(ndc, aspect, g.kind) {
+            self.grab_target = Some((k, stage));
+            // snap the ghost to the slot, nudged toward the camera so it previews
+            // in front of the existing part instead of hiding inside it.
+            let (eye, _) = self.cursor_ray(ndc, aspect);
+            self.grab_ghost = c + (eye - c).normalize_or_zero() * 4.0;
+        } else {
+            self.grab_target = None;
+            let (o, d) = self.cursor_ray(ndc, aspect);
+            self.grab_ghost = o + d * 14.0; // float in front of the camera
+        }
+    }
+
+    /// Drop the grabbed part: fit it to the hovered slot if compatible.
+    fn drop_grab(&mut self) {
+        if let (Some(g), Some((k, stage))) = (self.grab, self.grab_target) {
+            if g.kind == k {
+                match k {
+                    rocket::PartKind::Engine => {
+                        if let Some(s) = self.vab.stages.get_mut(stage) {
+                            s.engine = g.idx;
+                        }
+                    }
+                    rocket::PartKind::Tank => {
+                        if let Some(s) = self.vab.stages.get_mut(stage) {
+                            s.tank = g.idx;
+                        }
+                    }
+                    rocket::PartKind::Payload => self.vab.payload = g.idx,
+                }
+                self.rebuild_vehicle();
+            }
+        }
+        self.grab = None;
+        self.grab_target = None;
+    }
+
     /// Begin rolling the assembled rocket out of the hangar to the pad.
     fn start_rollout(&mut self) {
         if self.vab_mode {
@@ -1088,6 +1251,15 @@ impl World {
                 let n = s.rot * Vec3::from(v.normal);
                 out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: n.into(), color: v.color });
             }
+        }
+
+        // drag ghost: the part being dragged from the rack (grab_ghost is already
+        // camera-relative). Bright when snapped to a valid slot.
+        if let Some(g) = self.grab {
+            let col = if self.grab_target.is_some() { [0.5, 1.0, 0.7] } else { [0.8, 0.85, 1.0] };
+            let mut gm = rocket::Mesh::default();
+            rocket::append_part(&mut gm, g.kind, self.grab_ghost, col);
+            out.extend(gm.verts);
         }
 
         out
@@ -2464,9 +2636,28 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.view = View::Rocket;
             world.vab_mode = true;
             world.rollout = 0.0;
+            world.rocket_az = 5.7;
+            world.rocket_el = 0.10;
+            world.rocket_dist = 78.0;
+            0.0
+        }
+        "grabdemo" => {
+            // verify the pick -> drop -> rebuild path headlessly: grab the X-Large
+            // tank off the rack, target stage 0's tank slot, and drop it. The
+            // rocket should rebuild with a fat first stage.
+            world.view = View::Rocket;
+            world.vab_mode = true;
+            world.rollout = 0.0;
             world.rocket_az = 5.4;
-            world.rocket_el = 0.16;
+            world.rocket_el = 0.12;
             world.rocket_dist = 95.0;
+            world.grab = world
+                .rack_slots
+                .iter()
+                .find(|s| s.kind == rocket::PartKind::Tank && s.idx == 3) // X-Large
+                .copied();
+            world.grab_target = Some((rocket::PartKind::Tank, 0));
+            world.drop_grab();
             0.0
         }
         "rollout" => {
@@ -2914,24 +3105,50 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseInput { state: btn_state, button, .. } => {
                 if button == MouseButton::Left {
                     let pressed = btn_state == ElementState::Pressed;
-                    // In the map, a click on the body menu jumps focus (and does
-                    // not start an orbit drag).
-                    if pressed && state.world.view == View::Map {
-                        // click a body in the scene to focus it (the egui panel
-                        // handles its own clicks before we get here).
-                        let res = (state.config.width as f32, state.config.height as f32);
-                        let (cx, cy) = (state.last_cursor.0 as f32, state.last_cursor.1 as f32);
-                        if let Some(b) = state.world.pick_body(res, cx, cy) {
-                            state.world.set_focus(b);
-                            return;
+                    let w = state.config.width as f32;
+                    let h = state.config.height.max(1) as f32;
+                    let aspect = w / h;
+                    let (cx, cy) = (state.last_cursor.0 as f32, state.last_cursor.1 as f32);
+                    let ndc = [cx / w * 2.0 - 1.0, 1.0 - cy / h * 2.0];
+                    if pressed {
+                        // map: click a body to focus it
+                        if state.world.view == View::Map {
+                            if let Some(b) = state.world.pick_body((w, h), cx, cy) {
+                                state.world.set_focus(b);
+                                return;
+                            }
                         }
+                        // VAB: grab a 3D part off the rack instead of orbiting
+                        if state.world.view == View::Rocket
+                            && state.world.vab_mode
+                            && state.world.launch.is_none()
+                        {
+                            if let Some(slot) = state.world.pick_rack(ndc, aspect) {
+                                state.world.grab = Some(slot);
+                                state.world.update_grab(ndc, aspect);
+                                state.dragging = false;
+                                return;
+                            }
+                        }
+                        state.dragging = true;
+                    } else {
+                        // release: drop the grabbed part onto the hovered slot
+                        if state.world.grab.is_some() {
+                            state.world.drop_grab();
+                        }
+                        state.dragging = false;
                     }
-                    state.dragging = pressed;
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let (x, y) = (position.x, position.y);
-                if state.dragging {
+                if state.world.grab.is_some() {
+                    let w = state.config.width as f32;
+                    let h = state.config.height.max(1) as f32;
+                    let ndc = [x as f32 / w * 2.0 - 1.0, 1.0 - y as f32 / h * 2.0];
+                    state.world.update_grab(ndc, w / h);
+                    state.window.request_redraw();
+                } else if state.dragging {
                     let dx = (x - state.last_cursor.0) as f32;
                     let dy = (y - state.last_cursor.1) as f32;
                     match state.world.view {
@@ -3116,6 +3333,8 @@ fn main() {
                 "binary"
             } else if args.iter().any(|a| a == "system") {
                 "system"
+            } else if args.iter().any(|a| a == "grabdemo") {
+                "grabdemo"
             } else if args.iter().any(|a| a == "vab") {
                 "vab"
             } else if args.iter().any(|a| a == "rollout") {

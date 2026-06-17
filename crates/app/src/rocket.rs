@@ -190,30 +190,6 @@ pub fn hangar(c: Vec3) -> Mesh {
     m
 }
 
-/// A rack of the catalog parts displayed beside the assembly building, as small
-/// 3D models the player can grab. Returns the mesh; `part_slots` gives the world
-/// (local) centre + kind of each grabbable part for picking.
-pub fn parts_rack(c: Vec3) -> Mesh {
-    let mut m = Mesh::default();
-    // shelf
-    m.bx(c + Vec3::new(0.0, 1.0, 0.0), Vec3::new(10.0, 0.3, 2.5), [0.30, 0.30, 0.34]);
-    for (i, p) in part_slots(c).iter().enumerate() {
-        let _ = i;
-        match p.2 {
-            PartKind::Engine => {
-                m.frustum(p.0.x, p.0.z, p.0.y - 0.9, p.0.y + 0.9, 0.5, 0.9, 12, [0.20, 0.20, 0.23], true, true);
-            }
-            PartKind::Tank => {
-                m.frustum(p.0.x, p.0.z, p.0.y - 1.2, p.0.y + 1.2, 0.9, 0.9, 16, [0.80, 0.80, 0.84], true, true);
-            }
-            PartKind::Payload => {
-                m.frustum(p.0.x, p.0.z, p.0.y - 0.6, p.0.y + 1.4, 0.7, 0.0, 14, [0.85, 0.78, 0.4], false, true);
-            }
-        }
-    }
-    m
-}
-
 #[derive(Clone, Copy, PartialEq)]
 pub enum PartKind {
     Engine,
@@ -221,14 +197,27 @@ pub enum PartKind {
     Payload,
 }
 
-/// Grabbable rack parts: (centre in local metres, vertical half-extent, kind).
-/// Three demo parts (engine / tank / payload) lined up on the shelf at `c`.
-pub fn part_slots(c: Vec3) -> [(Vec3, f32, PartKind); 3] {
-    [
-        (c + Vec3::new(-3.0, 2.4, 0.0), 1.2, PartKind::Engine),
-        (c + Vec3::new(0.0, 2.6, 0.0), 1.5, PartKind::Tank),
-        (c + Vec3::new(3.0, 2.6, 0.0), 1.6, PartKind::Payload),
-    ]
+/// Append an axis-aligned box (public wrapper, for rack shelves etc.).
+pub fn append_box(m: &mut Mesh, center: Vec3, he: Vec3, col: [f32; 3]) {
+    m.bx(center, he, col);
+}
+
+/// Append a small 3D model of a catalog part centred at `c`, for the parts rack
+/// / drag ghost. `col` tints it.
+pub fn append_part(m: &mut Mesh, kind: PartKind, c: Vec3, col: [f32; 3]) {
+    match kind {
+        PartKind::Engine => {
+            // a bell nozzle
+            m.frustum(c.x, c.z, c.y - 0.8, c.y + 0.5, 0.7, 0.35, 12, col, true, true);
+        }
+        PartKind::Tank => {
+            m.frustum(c.x, c.z, c.y - 1.1, c.y + 1.1, 0.8, 0.8, 14, col, true, true);
+        }
+        PartKind::Payload => {
+            m.frustum(c.x, c.z, c.y - 0.7, c.y - 0.1, 0.6, 0.6, 12, col, true, false);
+            m.frustum(c.x, c.z, c.y - 0.1, c.y + 1.2, 0.6, 0.0, 12, col, false, false);
+        }
+    }
 }
 
 /// Build the rocket body for `veh` about its base at y=0, proportional to each
