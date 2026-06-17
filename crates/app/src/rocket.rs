@@ -156,7 +156,7 @@ pub fn pad_and_mount() -> Mesh {
 /// walls, roof, an open front facing the pad, and internal gantry towers) the
 /// rocket is assembled inside. Centred at `c` (local metres), big enough that
 /// the camera orbits around inside it.
-pub fn hangar(c: Vec3) -> Mesh {
+pub fn hangar(c: Vec3, light_offsets: &[Vec3]) -> Mesh {
     let mut m = Mesh::default();
     let wall = [0.33, 0.35, 0.39];
     let inner = [0.27, 0.29, 0.33];
@@ -194,6 +194,11 @@ pub fn hangar(c: Vec3) -> Mesh {
         for sz in [-1.0f32, 1.0] {
             m.bx(c + Vec3::new(0.0, y, sz * 12.0), Vec3::new(12.0, 0.4, 0.6), frame);
         }
+    }
+    // light fixtures at the work-light positions (bright; they sit at a point
+    // light so they read as glowing lamps)
+    for &off in light_offsets {
+        m.bx(c + off, Vec3::new(1.6, 0.5, 1.6), [1.6, 1.55, 1.4]);
     }
     m
 }

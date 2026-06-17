@@ -7,8 +7,10 @@
 struct U {
     viewproj: mat4x4<f32>,
     sun: vec4<f32>,    // world-space sun direction in xyz
-    params: vec4<f32>, // x = log-depth Fcoef
+    params: vec4<f32>, // x = log-depth Fcoef, y = time, z = light count
     fog: vec4<f32>,    // rgb = horizon haze, w = fog density
+    lights: array<vec4<f32>, 8>,    // xyz = position (camera-relative), w = range
+    light_col: array<vec4<f32>, 8>, // rgb = colour * intensity
 };
 
 @group(0) @binding(0) var<uniform> u: U;
@@ -18,6 +20,7 @@ struct VsOut {
     @location(0) normal: vec3<f32>,
     @location(1) color: vec3<f32>,
     @location(2) flogz: f32, // 1 + clip.w, for the fragment depth write
+    @location(3) wpos: vec3<f32>, // camera-relative position, for point lights
 };
 
 struct FsOut {
@@ -41,6 +44,7 @@ fn vs(
     o.flogz = 1.0 + w;
     o.normal = n;
     o.color = c;
+    o.wpos = p;
     return o;
 }
 
@@ -51,7 +55,25 @@ fn fs(in: VsOut) -> FsOut {
     let diff = max(dot(n, s), 0.0);
     let amb = mix(vec3<f32>(0.18, 0.16, 0.14), vec3<f32>(0.40, 0.45, 0.55), clamp(n.y * 0.5 + 0.5, 0.0, 1.0));
     let sun_col = vec3<f32>(1.0, 0.97, 0.9);
-    var lit = in.color * (amb + sun_col * diff * 0.95);
+    // Inside the assembly building (interior -> 1) the roof shades the sun, so
+    // dim sun + ambient and let the work lights carry the scene.
+    let interior = u.params.w;
+    let sf = 1.0 - 0.9 * interior;
+    let af = 1.0 - 0.68 * interior;
+    var lit = in.color * (amb * af + sun_col * diff * 0.95 * sf);
+
+    // interior point lights (work lights in the assembly building): per-fragment
+    // diffuse with inverse-square-ish falloff, so they pool light on nearby
+    // geometry and fade out before reaching the distant terrain.
+    let nlights = i32(u.params.z);
+    for (var i = 0; i < nlights; i = i + 1) {
+        let d = u.lights[i].xyz - in.wpos;
+        let range = u.lights[i].w;
+        let dist = length(d);
+        let ld = d / max(dist, 1e-3);
+        let atten = 1.0 / (1.0 + (dist * dist) / (range * range));
+        lit = lit + in.color * u.light_col[i].rgb * (max(dot(n, ld), 0.0) * atten);
+    }
 
     // aerial perspective: fade toward horizon haze with view distance.
     let dist = in.flogz - 1.0; // = view-space distance (clip.w)

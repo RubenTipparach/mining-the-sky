@@ -145,6 +145,17 @@ const MM: f32 = 1.0e6;
 const HANGAR_POS: Vec3 = Vec3::new(-90.0, 0.0, 0.0);
 const RACK_POS: Vec3 = Vec3::new(-90.0, 0.0, 42.0);
 
+/// Interior work lights of the assembly building: (offset from HANGAR_POS,
+/// colour*intensity, range metres). Cool corner lamps + warm overhead lamps.
+const HANGAR_LIGHTS: [(Vec3, [f32; 3], f32); 6] = [
+    (Vec3::new(24.0, 50.0, 24.0), [0.85, 0.95, 1.25], 42.0),
+    (Vec3::new(-24.0, 50.0, 24.0), [0.85, 0.95, 1.25], 42.0),
+    (Vec3::new(24.0, 50.0, -24.0), [0.85, 0.95, 1.25], 42.0),
+    (Vec3::new(-24.0, 50.0, -24.0), [0.85, 0.95, 1.25], 42.0),
+    (Vec3::new(0.0, 112.0, 20.0), [1.3, 1.05, 0.7], 50.0),
+    (Vec3::new(0.0, 112.0, -20.0), [1.3, 1.05, 0.7], 50.0),
+];
+
 /// Depth format for the rocket view's mesh pass.
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
@@ -164,11 +175,17 @@ use universe::{Body, Kind, Universe};
 struct MeshUniforms {
     viewproj: [[f32; 4]; 4],
     sun: [f32; 4],
-    /// params.x = logarithmic-depth Fcoef = 1 / log2(far + 1).
+    /// params.x = log-depth Fcoef, y = time, z = active point-light count.
     params: [f32; 4],
     /// rgb = horizon haze colour, w = fog density (1/visibility metres).
     fog: [f32; 4],
+    /// Interior point lights: xyz = position (camera-relative), w = range (m).
+    lights: [[f32; 4]; 8],
+    /// rgb = colour * intensity for each light.
+    light_col: [[f32; 4]; 8],
 }
+
+const MAX_LIGHTS: usize = 8;
 
 /// A perspective sky for the rocket view (drawn behind the terrain).
 #[repr(C)]
@@ -437,7 +454,7 @@ impl World {
             launch: None,
             rocket_body,
             pad_mesh: rocket::pad_and_mount(),
-            hangar_mesh: rocket::hangar(HANGAR_POS),
+            hangar_mesh: rocket::hangar(HANGAR_POS, &HANGAR_LIGHTS.map(|l| l.0)),
             rack_mesh: rack_mesh_init,
             rack_slots,
             grab: None,
@@ -587,15 +604,37 @@ impl World {
         let proj = Mat4::perspective_rh(50f32.to_radians(), aspect, 0.1, LOG_DEPTH_FAR);
         let vp = proj * view;
         let fcoef = 1.0 / (LOG_DEPTH_FAR + 1.0).log2();
+
+        // Interior work lights, brightest in the building and fading out as the
+        // rocket rolls onto the pad (so the pad stays sunlit).
+        let mut lights = [[0.0f32; 4]; MAX_LIGHTS];
+        let mut light_col = [[0.0f32; 4]; MAX_LIGHTS];
+        let scale = (1.0 - self.rollout).clamp(0.0, 1.0);
+        let mut nlights = 0usize;
+        if scale > 0.01 {
+            // a subtle flicker so the lighting reads as live
+            let flick = 0.92 + 0.08 * (self.anim * 9.0).sin();
+            for (off, col, range) in HANGAR_LIGHTS {
+                let p = self.rel((HANGAR_POS + off).as_dvec3());
+                lights[nlights] = [p.x, p.y, p.z, range];
+                let s = scale * flick * 1.15; // gentle, so the falloff reads
+                light_col[nlights] = [col[0] * s, col[1] * s, col[2] * s, 0.0];
+                nlights += 1;
+            }
+        }
+
         MeshUniforms {
             viewproj: vp.to_cols_array_2d(),
             sun: [0.40, 0.72, 0.55, 0.0],
-            params: [fcoef, self.anim, 0.0, 0.0],
+            params: [fcoef, self.anim, nlights as f32, scale],
             // Light aerial haze only; the atmosphere shader does the real work so
             // the planet keeps its colour from altitude.
             fog: [HORIZON[0], HORIZON[1], HORIZON[2], 1.0 / 160_000.0],
+            lights,
+            light_col,
         }
     }
+
 
     /// Sky/atmosphere uniforms for the rocket view: the camera basis and
     /// position in planet-centred world coords so the shader can ray-march the
