@@ -63,6 +63,14 @@ fn kv(ui: &mut egui::Ui, k: &str, v: &str) {
 
 fn vehicle_panel(ctx: &egui::Context, world: &mut World) {
     use crate::build;
+    // Drag payload: which catalog part is being dragged.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Drag {
+        Engine(usize),
+        Tank(usize),
+        Payload(usize),
+    }
+
     let mut vab = world.vab.clone();
     let mut changed = false;
     let mut launch = false;
@@ -76,60 +84,84 @@ fn vehicle_panel(ctx: &egui::Context, world: &mut World) {
 
     egui::Window::new("VEHICLE ASSEMBLY")
         .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 12.0))
-        .default_width(310.0)
+        .default_width(330.0)
         .resizable(false)
         .show(ctx, |ui| {
             ui.label(egui::RichText::new("VEHICLE ASSEMBLY").heading().color(AMBER));
+            ui.label(egui::RichText::new("Drag parts onto the stack").color(DIM));
             ui.add_space(2.0);
-            // stages, top of the stack first
-            egui::Grid::new("vab_stages").num_columns(4).spacing([6.0, 4.0]).show(ui, |ui| {
-                for i in (0..vab.stages.len()).rev() {
-                    ui.label(egui::RichText::new(format!("S{}", i + 1)).color(DIM));
-                    egui::ComboBox::from_id_salt(("eng", i))
-                        .selected_text(build::ENGINES[vab.stages[i].engine].name)
-                        .width(96.0)
-                        .show_ui(ui, |ui| {
-                            for (k, e) in build::ENGINES.iter().enumerate() {
-                                if ui.selectable_value(&mut vab.stages[i].engine, k, e.name).clicked() {
-                                    changed = true;
-                                }
-                            }
-                        });
-                    egui::ComboBox::from_id_salt(("tank", i))
-                        .selected_text(build::TANKS[vab.stages[i].tank].name)
-                        .width(82.0)
-                        .show_ui(ui, |ui| {
-                            for (k, t) in build::TANKS.iter().enumerate() {
-                                if ui.selectable_value(&mut vab.stages[i].tank, k, t.name).clicked() {
-                                    changed = true;
-                                }
-                            }
-                        });
-                    if vab.stages.len() > 1 {
-                        if ui.button("x").clicked() {
-                            act = Some(Act::Remove(i));
+
+            // ---- the stack: a drop slot per stage (engine + tank), top first ----
+            for i in (0..vab.stages.len()).rev() {
+                let (ei, ti) = (vab.stages[i].engine, vab.stages[i].tank);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!("S{}", i + 1)).color(DIM).monospace());
+
+                    // engine slot
+                    let (_, drop) = ui.dnd_drop_zone::<Drag, ()>(slot_frame(), |ui| {
+                        ui.set_min_size(egui::vec2(96.0, 22.0));
+                        ui.label(egui::RichText::new(build::ENGINES[ei].name).color(GOOD));
+                    });
+                    if let Some(p) = drop {
+                        if let Drag::Engine(k) = *p {
+                            vab.stages[i].engine = k;
+                            changed = true;
                         }
-                    } else {
-                        ui.label("");
                     }
-                    ui.end_row();
+                    // tank slot
+                    let (_, drop) = ui.dnd_drop_zone::<Drag, ()>(slot_frame(), |ui| {
+                        ui.set_min_size(egui::vec2(86.0, 22.0));
+                        ui.label(egui::RichText::new(build::TANKS[ti].name).color(egui::Color32::from_rgb(150, 200, 255)));
+                    });
+                    if let Some(p) = drop {
+                        if let Drag::Tank(k) = *p {
+                            vab.stages[i].tank = k;
+                            changed = true;
+                        }
+                    }
+                    if vab.stages.len() > 1 && ui.button("x").clicked() {
+                        act = Some(Act::Remove(i));
+                    }
+                });
+            }
+            // payload slot
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("PL").color(DIM).monospace());
+                let pi = vab.payload;
+                let (_, drop) = ui.dnd_drop_zone::<Drag, ()>(slot_frame(), |ui| {
+                    ui.set_min_size(egui::vec2(190.0, 22.0));
+                    ui.label(egui::RichText::new(build::PAYLOADS[pi].name).color(AMBER));
+                });
+                if let Some(p) = drop {
+                    if let Drag::Payload(k) = *p {
+                        vab.payload = k;
+                        changed = true;
+                    }
                 }
             });
-            ui.horizontal(|ui| {
-                if ui.button("+ stage").clicked() {
-                    act = Some(Act::Add);
+            if ui.button("+ stage").clicked() {
+                act = Some(Act::Add);
+            }
+
+            ui.separator();
+            // ---- parts palette: draggable chips ----
+            ui.label(egui::RichText::new("ENGINES").color(DIM).small());
+            ui.horizontal_wrapped(|ui| {
+                for (k, e) in build::ENGINES.iter().enumerate() {
+                    drag_chip(ui, egui::Id::new(("eng", k)), Drag::Engine(k), e.name, GOOD);
                 }
-                ui.label(egui::RichText::new("Payload").color(DIM));
-                egui::ComboBox::from_id_salt("payload")
-                    .selected_text(build::PAYLOADS[vab.payload].name)
-                    .width(120.0)
-                    .show_ui(ui, |ui| {
-                        for (k, p) in build::PAYLOADS.iter().enumerate() {
-                            if ui.selectable_value(&mut vab.payload, k, p.name).clicked() {
-                                changed = true;
-                            }
-                        }
-                    });
+            });
+            ui.label(egui::RichText::new("TANKS").color(DIM).small());
+            ui.horizontal_wrapped(|ui| {
+                for (k, t) in build::TANKS.iter().enumerate() {
+                    drag_chip(ui, egui::Id::new(("tank", k)), Drag::Tank(k), t.name, egui::Color32::from_rgb(150, 200, 255));
+                }
+            });
+            ui.label(egui::RichText::new("PAYLOADS").color(DIM).small());
+            ui.horizontal_wrapped(|ui| {
+                for (k, p) in build::PAYLOADS.iter().enumerate() {
+                    drag_chip(ui, egui::Id::new(("pl", k)), Drag::Payload(k), p.name, AMBER);
+                }
             });
 
             ui.separator();
@@ -141,8 +173,7 @@ fn vehicle_panel(ctx: &egui::Context, world: &mut World) {
             egui::Grid::new("vab_stats").num_columns(2).show(ui, |ui| {
                 kv(ui, "Liftoff mass", &format!("{mass_t:.0} t"));
                 ui.label(egui::RichText::new("Liftoff TWR").color(DIM));
-                let twr_col = if twr < 1.0 { WARN } else { GOOD };
-                ui.label(egui::RichText::new(format!("{twr:.2}")).color(twr_col));
+                ui.label(egui::RichText::new(format!("{twr:.2}")).color(if twr < 1.0 { WARN } else { GOOD }));
                 ui.end_row();
                 kv(ui, "Total delta-v", &format!("{total_dv:.0} m/s"));
                 kv(ui, "Payload", &format!("{:.0} kg", vab.payload().mass));
@@ -160,8 +191,7 @@ fn vehicle_panel(ctx: &egui::Context, world: &mut World) {
             if ui.add(btn).clicked() {
                 launch = true;
             }
-            ui.label(egui::RichText::new("Space ignite/stage  Shift/Ctrl throttle  W/S pitch").color(DIM));
-            ui.separator();
+            ui.label(egui::RichText::new("Drag to rotate the rocket  -  Space to ignite").color(DIM));
             let col = if n_orbit > 0 { GOOD } else { DIM };
             ui.label(egui::RichText::new(format!("Satellites in orbit: {n_orbit}")).color(col));
         });
@@ -174,7 +204,6 @@ fn vehicle_panel(ctx: &egui::Context, world: &mut World) {
             }
         }
         Some(Act::Add) => {
-            // a new vacuum upper stage on top of the stack
             vab.stages.push(build::StageCfg { engine: 3, tank: 0 });
             changed = true;
         }
@@ -187,6 +216,37 @@ fn vehicle_panel(ctx: &egui::Context, world: &mut World) {
     if launch {
         world.ignite_launch();
     }
+}
+
+/// A draggable part chip for the VAB palette.
+fn drag_chip<P: std::any::Any + Send + Sync + Clone>(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    payload: P,
+    label: &str,
+    col: egui::Color32,
+) {
+    let resp = ui
+        .dnd_drag_source(id, payload, |ui| {
+            let frame = egui::Frame::new()
+                .fill(egui::Color32::from_rgb(28, 40, 56))
+                .inner_margin(egui::Margin::symmetric(6, 3))
+                .corner_radius(4);
+            frame.show(ui, |ui| {
+                ui.label(egui::RichText::new(label).color(col));
+            });
+        })
+        .response;
+    resp.on_hover_cursor(egui::CursorIcon::Grab);
+}
+
+/// Outlined frame used for the stack's drop slots.
+fn slot_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(egui::Color32::from_rgb(20, 28, 40))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 90, 120)))
+        .inner_margin(egui::Margin::symmetric(6, 2))
+        .corner_radius(3)
 }
 
 /// KSP-style launch telemetry + controls shown while a player-flown launch is
