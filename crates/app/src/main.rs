@@ -146,14 +146,15 @@ const HANGAR_POS: Vec3 = Vec3::new(-5000.0, 0.0, 0.0);
 const RACK_POS: Vec3 = Vec3::new(-5000.0, 0.0, 42.0);
 
 /// Interior work lights of the assembly building: (offset from HANGAR_POS,
-/// colour*intensity, range metres). Cool corner lamps + warm overhead lamps.
+/// colour*intensity, range metres). Mounted high on the wall corners (cool) and
+/// under the roof (warm) - kept out near the structure, not beside the rocket.
 const HANGAR_LIGHTS: [(Vec3, [f32; 3], f32); 6] = [
-    (Vec3::new(24.0, 50.0, 24.0), [0.85, 0.95, 1.25], 42.0),
-    (Vec3::new(-24.0, 50.0, 24.0), [0.85, 0.95, 1.25], 42.0),
-    (Vec3::new(24.0, 50.0, -24.0), [0.85, 0.95, 1.25], 42.0),
-    (Vec3::new(-24.0, 50.0, -24.0), [0.85, 0.95, 1.25], 42.0),
-    (Vec3::new(0.0, 112.0, 20.0), [1.3, 1.05, 0.7], 50.0),
-    (Vec3::new(0.0, 112.0, -20.0), [1.3, 1.05, 0.7], 50.0),
+    (Vec3::new(50.0, 92.0, 50.0), [0.85, 0.95, 1.25], 80.0),
+    (Vec3::new(-50.0, 92.0, 50.0), [0.85, 0.95, 1.25], 80.0),
+    (Vec3::new(50.0, 92.0, -50.0), [0.85, 0.95, 1.25], 80.0),
+    (Vec3::new(-50.0, 92.0, -50.0), [0.85, 0.95, 1.25], 80.0),
+    (Vec3::new(28.0, 144.0, 0.0), [1.3, 1.05, 0.7], 95.0),
+    (Vec3::new(-28.0, 144.0, 0.0), [1.3, 1.05, 0.7], 95.0),
 ];
 
 /// Depth format for the rocket view's mesh pass.
