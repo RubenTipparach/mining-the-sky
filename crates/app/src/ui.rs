@@ -27,6 +27,7 @@ pub fn build(ctx: &egui::Context, world: &mut World) {
         View::Map => {
             body_browser(ctx, world);
             status_panel(ctx, world);
+            maneuver_node_panel(ctx, world);
         }
     }
 }
@@ -416,6 +417,81 @@ fn launch_panel(ctx: &egui::Context, world: &mut World) {
         Some(Act::Reset) => world.reset_launch(),
         Some(Act::NewMission) => world.back_to_vab(),
         None => {}
+    }
+}
+
+/// The maneuver-node planner (map view, with a craft in flight): place a burn
+/// node on the orbit, dial prograde/normal/radial delta-v, preview the resulting
+/// orbit (drawn cyan on the map), and execute.
+fn maneuver_node_panel(ctx: &egui::Context, world: &mut World) {
+    let Some(craft) = world.flight.as_ref() else { return };
+    let mu = world.body.mu;
+    let mut node = world.node.unwrap_or(crate::ManeuverNode { nu: 0.0, pro: 0.0, nrm: 0.0, rad: 0.0 });
+    let has = world.node.is_some();
+    let (apo, peri) = craft.node_apsides(&world.body, node.nu, node.pro, node.nrm, node.rad);
+    let dv = (node.pro * node.pro + node.nrm * node.nrm + node.rad * node.rad).sqrt();
+
+    let mut set = false;
+    let mut clear = false;
+    let mut execute = false;
+
+    egui::Window::new("MANEUVER NODE")
+        .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-12.0, -12.0))
+        .default_width(250.0)
+        .resizable(false)
+        .show(ctx, |ui| {
+            if !has {
+                ui.label(egui::RichText::new("Plot a burn to change your orbit").color(DIM));
+                if ui.button("+ Plan a burn").clicked() {
+                    set = true;
+                }
+                return;
+            }
+            let mut deg = node.nu.to_degrees();
+            if ui.add(egui::Slider::new(&mut deg, 0.0..=360.0).text("node position")).changed() {
+                node.nu = deg.to_radians();
+                set = true;
+            }
+            for (label, val, col) in [
+                ("Prograde", &mut node.pro, GOOD),
+                ("Normal", &mut node.nrm, egui::Color32::from_rgb(150, 200, 255)),
+                ("Radial", &mut node.rad, AMBER),
+            ] {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(label).color(col));
+                    if ui.add(egui::DragValue::new(val).speed(2.0).suffix(" m/s").range(-5000.0..=5000.0)).changed() {
+                        set = true;
+                    }
+                });
+            }
+            ui.separator();
+            ui.label(format!("Result Ap: {}", fmt_alt(apo)));
+            ui.label(format!("Result Pe: {}", fmt_alt(peri)));
+            ui.label(egui::RichText::new(format!("Burn delta-v: {dv:.0} m/s")).strong());
+            ui.separator();
+            ui.horizontal(|ui| {
+                let exe = egui::Button::new(egui::RichText::new("EXECUTE").strong().color(egui::Color32::BLACK)).fill(GOOD);
+                if ui.add(exe).clicked() {
+                    execute = true;
+                }
+                if ui.button("Clear").clicked() {
+                    clear = true;
+                }
+            });
+            ui.label(egui::RichText::new("cyan = resulting orbit").color(DIM));
+        });
+
+    if set {
+        world.node = Some(node);
+    }
+    if clear {
+        world.node = None;
+    }
+    if execute {
+        if let Some(c) = world.flight.as_mut() {
+            c.execute_node(mu, node.nu, node.pro, node.nrm, node.rad);
+        }
+        world.node = None;
     }
 }
 

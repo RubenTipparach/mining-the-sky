@@ -252,6 +252,16 @@ struct SepBooster {
     range: std::ops::Range<usize>,
 }
 
+/// A planned maneuver (burn node) on the craft's current orbit: where to burn
+/// (true anomaly `nu`) and the prograde / normal / radial delta-v (m/s).
+#[derive(Clone, Copy)]
+struct ManeuverNode {
+    nu: f64,
+    pro: f64,
+    nrm: f64,
+    rad: f64,
+}
+
 /// A payload delivered to orbit by a completed mission. Persists and is drawn
 /// circling the home world in the map view; missions accumulate these.
 struct OrbitObject {
@@ -340,6 +350,8 @@ struct World {
     mission: Mission,
     body: CentralBody,
     flight: Option<Craft>,
+    /// Planned burn node for the craft (the maneuver planner).
+    node: Option<ManeuverNode>,
     launched: bool,
     clock: f32, // mission-elapsed seconds
     warp: f32,
@@ -450,6 +462,7 @@ impl World {
             mission,
             body,
             flight: None,
+            node: None,
             vab,
             vab_mode: true,
             rollout: 0.0,
@@ -1517,6 +1530,11 @@ impl World {
         } else if let Some(craft) = self.flight.as_ref() {
             let pred = craft.predicted_orbit(&self.body);
             polyline(&pred, [0.5, 0.55, 0.25], &mut out);
+            // planned maneuver: the resulting orbit, in cyan
+            if let Some(n) = self.node {
+                let after = craft.node_orbit(&self.body, n.nu, n.pro, n.nrm, n.rad);
+                polyline(&after, [0.3, 0.85, 1.0], &mut out);
+            }
         } else {
             if self.mission.reached {
                 polyline(&self.mission.ring, [0.25, 0.7, 0.45], &mut out);
@@ -1604,6 +1622,15 @@ impl World {
         if let Some(c) = cam.project(home_pos + mpos.as_dvec3() * self.home_radius_mm as f64) {
             push_filled_diamond(&mut out, c, 0.030, aspect, [0.0, 0.0, 0.0]);
             push_filled_diamond(&mut out, c, 0.020, aspect, mcol);
+        }
+
+        // maneuver-node marker (cyan) on the craft's orbit
+        if let (Some(craft), Some(n)) = (self.flight.as_ref(), self.node) {
+            let np = craft.node_marker(&self.body, n.nu);
+            if let Some(c) = cam.project(home_pos + np.as_dvec3() * self.home_radius_mm as f64) {
+                push_filled_diamond(&mut out, c, 0.024, aspect, [0.0, 0.0, 0.0]);
+                push_filled_diamond(&mut out, c, 0.015, aspect, [0.3, 0.85, 1.0]);
+            }
         }
 
         // locator dots for every small body (moons, asteroids, comets) so the
@@ -2908,6 +2935,19 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.flight = Some(craft);
             6.0
         }
+        "node" => {
+            // a craft in low orbit with a planned prograde burn that raises the
+            // apoapsis - the maneuver planner: green current orbit, cyan result.
+            frame_map(&mut world);
+            world.launched = true;
+            world.sys_dist = 22.0;
+            world.sys_el = 0.5;
+            world.clock = world.mission.meco_t + 10.0;
+            let (r, v) = world.mission.orbit_state_at(world.clock);
+            world.flight = Some(Craft::maneuvering(r, v));
+            world.node = Some(ManeuverNode { nu: std::f64::consts::PI, pro: 1600.0, nrm: 0.0, rad: 0.0 });
+            6.0
+        }
         _ => {
             // map view: craft coasting in the parking orbit.
             frame_map(&mut world);
@@ -3443,6 +3483,8 @@ fn main() {
                 "orbit"
             } else if args.iter().any(|a| a == "ascent") {
                 "ascent"
+            } else if args.iter().any(|a| a == "node") {
+                "node"
             } else if args.iter().any(|a| a == "flight") {
                 "flight"
             } else {
