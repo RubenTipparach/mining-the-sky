@@ -2512,6 +2512,21 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.sys_el = 0.20;
             6.0
         }
+        "starb" => {
+            // close-up of the red companion star to show its ruddy corona.
+            world.view = View::Map;
+            let bi = world
+                .universe
+                .bodies
+                .iter()
+                .position(|b| b.kind == Kind::StarB)
+                .unwrap_or(1);
+            world.set_focus(bi);
+            world.sys_dist = world.universe.bodies[bi].radius * 9.0;
+            world.sys_az = 1.0;
+            world.sys_el = 0.10;
+            6.0
+        }
         "ascent" => {
             frame_map(&mut world);
             world.launched = true;
@@ -3003,6 +3018,8 @@ fn main() {
                 "moon"
             } else if args.iter().any(|a| a == "rocket") {
                 "rocket"
+            } else if args.iter().any(|a| a == "starb") {
+                "starb"
             } else if args.iter().any(|a| a == "system") {
                 "system"
             } else if args.iter().any(|a| a == "pad") {

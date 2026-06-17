@@ -192,10 +192,15 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         let star = step(0.9975, hash3(floor(rd * 1400.0)));
         col = vec3<f32>(star) * 0.7;
 
-        // sun corona/glow when looking near the Sun
+        // corona/glow when looking near either star
         let to_sun = normalize(s.sunbody.xyz - ro);
         let sa = max(dot(rd, to_sun), 0.0);
         col = col + vec3<f32>(1.4, 1.1, 0.7) * (pow(sa, 220.0) * 1.5 + pow(sa, 12.0) * 0.10);
+
+        // the red companion (star B) glows with its own ruddy corona
+        let to_sun2 = normalize(s.sunbody2.xyz - ro);
+        let sb = max(dot(rd, to_sun2), 0.0);
+        col = col + vec3<f32>(1.5, 0.45, 0.30) * (pow(sb, 240.0) * 1.3 + pow(sb, 12.0) * 0.09);
 
         let oc = s.home.xyz - ro;
         let tca = dot(oc, rd);
