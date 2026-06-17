@@ -152,6 +152,85 @@ pub fn pad_and_mount() -> Mesh {
     m
 }
 
+/// The Vehicle Assembly Building: a gantry/hangar the rocket is assembled in,
+/// centred at `c` (local metres). Four corner towers, cross beams, a back
+/// service tower and a floor pad - recognisable as a building, open at the
+/// front so the rocket can roll out.
+pub fn hangar(c: Vec3) -> Mesh {
+    let mut m = Mesh::default();
+    let frame = [0.30, 0.32, 0.36];
+    let dark = [0.20, 0.21, 0.24];
+    let h = 64.0f32; // tower height
+    // floor pad
+    m.bx(c + Vec3::new(0.0, 0.4, 0.0), Vec3::new(16.0, 0.4, 16.0), [0.34, 0.34, 0.38]);
+    // four corner towers
+    for (sx, sz) in [(1.0f32, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)] {
+        m.bx(
+            c + Vec3::new(sx * 13.0, h * 0.5, sz * 13.0),
+            Vec3::new(0.8, h * 0.5, 0.8),
+            frame,
+        );
+    }
+    // cross beams at three heights (X and Z spanning bars on all four sides)
+    for lvl in [0.32f32, 0.62, 0.92] {
+        let y = h * lvl;
+        for sz in [-1.0f32, 1.0] {
+            m.bx(c + Vec3::new(0.0, y, sz * 13.0), Vec3::new(13.0, 0.4, 0.4), dark);
+        }
+        for sx in [-1.0f32, 1.0] {
+            m.bx(c + Vec3::new(sx * 13.0, y, 0.0), Vec3::new(0.4, 0.4, 13.0), dark);
+        }
+    }
+    // back service tower wall (the -Z side, away from the pad which is at +X)
+    m.bx(c + Vec3::new(-13.5, h * 0.5, 0.0), Vec3::new(0.5, h * 0.5, 13.0), [0.26, 0.27, 0.30]);
+    // roof beams
+    for sz in [-1.0f32, 1.0] {
+        m.bx(c + Vec3::new(0.0, h, sz * 13.0), Vec3::new(13.0, 0.5, 0.5), frame);
+    }
+    m
+}
+
+/// A rack of the catalog parts displayed beside the assembly building, as small
+/// 3D models the player can grab. Returns the mesh; `part_slots` gives the world
+/// (local) centre + kind of each grabbable part for picking.
+pub fn parts_rack(c: Vec3) -> Mesh {
+    let mut m = Mesh::default();
+    // shelf
+    m.bx(c + Vec3::new(0.0, 1.0, 0.0), Vec3::new(10.0, 0.3, 2.5), [0.30, 0.30, 0.34]);
+    for (i, p) in part_slots(c).iter().enumerate() {
+        let _ = i;
+        match p.2 {
+            PartKind::Engine => {
+                m.frustum(p.0.x, p.0.z, p.0.y - 0.9, p.0.y + 0.9, 0.5, 0.9, 12, [0.20, 0.20, 0.23], true, true);
+            }
+            PartKind::Tank => {
+                m.frustum(p.0.x, p.0.z, p.0.y - 1.2, p.0.y + 1.2, 0.9, 0.9, 16, [0.80, 0.80, 0.84], true, true);
+            }
+            PartKind::Payload => {
+                m.frustum(p.0.x, p.0.z, p.0.y - 0.6, p.0.y + 1.4, 0.7, 0.0, 14, [0.85, 0.78, 0.4], false, true);
+            }
+        }
+    }
+    m
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum PartKind {
+    Engine,
+    Tank,
+    Payload,
+}
+
+/// Grabbable rack parts: (centre in local metres, vertical half-extent, kind).
+/// Three demo parts (engine / tank / payload) lined up on the shelf at `c`.
+pub fn part_slots(c: Vec3) -> [(Vec3, f32, PartKind); 3] {
+    [
+        (c + Vec3::new(-3.0, 2.4, 0.0), 1.2, PartKind::Engine),
+        (c + Vec3::new(0.0, 2.6, 0.0), 1.5, PartKind::Tank),
+        (c + Vec3::new(3.0, 2.6, 0.0), 1.6, PartKind::Payload),
+    ]
+}
+
 /// Build the rocket body for `veh` about its base at y=0, proportional to each
 /// stage's tank (radius/height) and engine (cluster). `payload_col` tints the
 /// payload section.

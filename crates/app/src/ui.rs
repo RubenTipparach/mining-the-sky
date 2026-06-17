@@ -18,8 +18,10 @@ pub fn build(ctx: &egui::Context, world: &mut World) {
         View::Rocket => {
             if world.launch.is_some() {
                 launch_panel(ctx, world);
+            } else if world.vab_mode {
+                vehicle_panel(ctx, world); // assembling in the building
             } else {
-                vehicle_panel(ctx, world);
+                pad_panel(ctx, world); // rolled out, ready to launch
             }
         }
         View::Map => {
@@ -184,14 +186,14 @@ fn vehicle_panel(ctx: &egui::Context, world: &mut World) {
 
             ui.separator();
             let btn = egui::Button::new(
-                egui::RichText::new("LAUNCH").strong().color(egui::Color32::BLACK),
+                egui::RichText::new("ROLL OUT TO PAD").strong().color(egui::Color32::BLACK),
             )
-            .fill(GOOD)
-            .min_size(egui::vec2(120.0, 26.0));
+            .fill(AMBER)
+            .min_size(egui::vec2(150.0, 26.0));
             if ui.add(btn).clicked() {
-                launch = true;
+                launch = true; // (roll-out, handled below)
             }
-            ui.label(egui::RichText::new("Drag to rotate the rocket  -  Space to ignite").color(DIM));
+            ui.label(egui::RichText::new("Drag parts onto the stack  -  drag to rotate").color(DIM));
             let col = if n_orbit > 0 { GOOD } else { DIM };
             ui.label(egui::RichText::new(format!("Satellites in orbit: {n_orbit}")).color(col));
         });
@@ -214,7 +216,58 @@ fn vehicle_panel(ctx: &egui::Context, world: &mut World) {
         world.rebuild_vehicle();
     }
     if launch {
+        world.start_rollout();
+    }
+}
+
+/// Shown once the vehicle has rolled out to the pad: final stats + LAUNCH.
+fn pad_panel(ctx: &egui::Context, world: &mut World) {
+    let veh = world.vab.to_vehicle();
+    let g = world.body.surface_gravity();
+    let mass_t = veh.liftoff_mass() / 1000.0;
+    let twr = veh.stages[0].thrust / (veh.liftoff_mass() * g);
+    let total_dv: f64 = (0..veh.stages.len()).map(|i| veh.stages[i].dv(veh.mass_above(i))).sum();
+    let rolling = world.rolling_out;
+    let mut launch = false;
+    let mut back = false;
+
+    egui::Window::new("LAUNCH PAD")
+        .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 12.0))
+        .default_width(240.0)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.label(egui::RichText::new("LAUNCH PAD").heading().color(AMBER));
+            egui::Grid::new("pad_stats").num_columns(2).show(ui, |ui| {
+                kv(ui, "Vehicle", veh.name);
+                kv(ui, "Liftoff mass", &format!("{mass_t:.0} t"));
+                kv(ui, "Liftoff TWR", &format!("{twr:.2}"));
+                kv(ui, "Total delta-v", &format!("{total_dv:.0} m/s"));
+                kv(ui, "Payload", &format!("{:.0} kg", world.vab.payload().mass));
+            });
+            ui.separator();
+            if rolling {
+                ui.label(egui::RichText::new("Rolling out...").color(WARN));
+            } else {
+                let btn = egui::Button::new(
+                    egui::RichText::new("LAUNCH").strong().color(egui::Color32::BLACK),
+                )
+                .fill(GOOD)
+                .min_size(egui::vec2(120.0, 26.0));
+                if ui.add(btn).clicked() {
+                    launch = true;
+                }
+                ui.label(egui::RichText::new("Space ignite  Shift/Ctrl throttle  W/S pitch").color(DIM));
+                if ui.button("Back to VAB").clicked() {
+                    back = true;
+                }
+            }
+        });
+
+    if launch {
         world.ignite_launch();
+    }
+    if back {
+        world.back_to_vab();
     }
 }
 
@@ -270,6 +323,7 @@ fn launch_panel(ctx: &egui::Context, world: &mut World) {
         Throttle(f64),
         Stage,
         Reset,
+        NewMission,
     }
     let mut act: Option<Act> = None;
 
@@ -328,7 +382,7 @@ fn launch_panel(ctx: &egui::Context, world: &mut World) {
                 .fill(GOOD)
                 .min_size(egui::vec2(140.0, 24.0));
                 if ui.add(btn).clicked() {
-                    act = Some(Act::Reset);
+                    act = Some(Act::NewMission);
                 }
                 ui.label(egui::RichText::new("(R to return to the VAB)").color(DIM));
             } else {
@@ -360,6 +414,7 @@ fn launch_panel(ctx: &egui::Context, world: &mut World) {
         }
         Some(Act::Stage) => world.stage_launch(),
         Some(Act::Reset) => world.reset_launch(),
+        Some(Act::NewMission) => world.back_to_vab(),
         None => {}
     }
 }

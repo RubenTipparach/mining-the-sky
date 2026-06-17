@@ -140,6 +140,11 @@ const TERRAIN_CAP: u64 = 500_000;
 /// Render-space length unit for the system view: 1000 km.
 const MM: f32 = 1.0e6;
 
+/// Local-frame position (metres) of the assembly building, beside the pad
+/// (which is at the origin). The rocket assembles here and rolls out (+X) to it.
+const HANGAR_POS: Vec3 = Vec3::new(-72.0, 0.0, 0.0);
+const RACK_POS: Vec3 = Vec3::new(-72.0, 0.0, 20.0);
+
 /// Depth format for the rocket view's mesh pass.
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
@@ -275,8 +280,15 @@ struct World {
     launch: Option<launch::Rocket>,
     /// The current vehicle design (Vehicle Assembly Building).
     vab: build::Vab,
+    /// In the assembly building (true) vs out on the pad (false).
+    vab_mode: bool,
+    /// Roll-out progress: 0 = in the hangar, 1 = on the pad. Animates.
+    rollout: f32,
+    rolling_out: bool,
     rocket_body: rocket::RocketBody,
     pad_mesh: rocket::Mesh,
+    hangar_mesh: rocket::Mesh,
+    rack_mesh: rocket::Mesh,
     sep: Option<SepBooster>,
     /// Payloads delivered to orbit by completed missions (they accumulate).
     orbits: Vec<OrbitObject>,
@@ -358,9 +370,14 @@ impl World {
             body,
             flight: None,
             vab,
+            vab_mode: true,
+            rollout: 0.0,
+            rolling_out: false,
             launch: None,
             rocket_body,
             pad_mesh: rocket::pad_and_mount(),
+            hangar_mesh: rocket::hangar(HANGAR_POS),
+            rack_mesh: rocket::parts_rack(RACK_POS),
             sep: None,
             orbits: Vec::new(),
             mission_captured: false,
@@ -654,6 +671,15 @@ impl World {
             self.clock += frame_dt * self.warp;
         }
 
+        // roll the assembled rocket out of the hangar to the pad
+        if self.rolling_out {
+            self.rollout = (self.rollout + frame_dt / 6.0).min(1.0);
+            if self.rollout >= 1.0 {
+                self.rolling_out = false;
+                self.vab_mode = false; // now on the pad, ready to launch
+            }
+        }
+
         // player-controlled launch + any tumbling spent booster
         if let Some(rk) = self.launch.as_mut() {
             rk.just_staged = None;
@@ -703,11 +729,19 @@ impl World {
         (local - self.ref_local).as_vec3()
     }
 
+    /// The resting rocket base in local metres: in the hangar during assembly,
+    /// sliding to the pad (origin) as roll-out animates.
+    fn resting_base_local(&self) -> DVec3 {
+        let hangar = HANGAR_POS.as_dvec3();
+        let pos = hangar.lerp(DVec3::ZERO, self.rollout as f64);
+        pos + DVec3::new(0.0, self.rocket_body.base_y as f64, 0.0)
+    }
+
     /// The rocket the camera frames (its local position, f64).
     fn cam_target_local(&self) -> DVec3 {
         match self.launch.as_ref() {
             Some(rk) => self.to_local_d(rk.r),
-            None => DVec3::new(0.0, self.rocket_body.base_y as f64, 0.0),
+            None => self.resting_base_local(),
         }
     }
 
@@ -719,11 +753,27 @@ impl World {
                 // Low and slow: look near the base so the pad + smoke stay framed;
                 // ease up the stack as the rocket climbs away.
                 let axis = self.dir_to_local_d(rk.point_dir());
-                let f = self.rocket_focus_y as f64 * (target.y / 120.0).clamp(0.25, 1.0);
+                let f = self.rocket_focus_y as f64 * (self.to_local_d(rk.r).y / 120.0).clamp(0.25, 1.0);
                 target + axis * f
             }
-            None => DVec3::new(0.0, self.rocket_focus_y as f64, 0.0),
+            None => target + DVec3::new(0.0, self.rocket_focus_y as f64, 0.0),
         }
+    }
+
+    /// Begin rolling the assembled rocket out of the hangar to the pad.
+    fn start_rollout(&mut self) {
+        if self.vab_mode {
+            self.rebuild_vehicle();
+            self.rolling_out = true;
+        }
+    }
+
+    /// Send the rocket back into the assembly building (between missions).
+    fn back_to_vab(&mut self) {
+        self.reset_launch();
+        self.vab_mode = true;
+        self.rolling_out = false;
+        self.rollout = 0.0;
     }
 
     /// Camera eye in launch-tangent metres (f64).
@@ -866,6 +916,10 @@ impl World {
         self.sep = None;
         self.smoke.clear();
         self.mission_captured = false;
+        // you launch from the pad: ensure we're rolled out.
+        self.vab_mode = false;
+        self.rolling_out = false;
+        self.rollout = 1.0;
         log::info!("Ignition: {} - throttle up, pitch over, stage when dry", veh.name);
     }
 
@@ -996,24 +1050,29 @@ impl World {
         let rb = &self.rocket_body;
         let mut out: Vec<rocket::MeshVertex> = Vec::new();
 
-        // static pad + mount (camera-relative)
-        for v in &self.pad_mesh.verts {
-            let local = Vec3::from(v.pos).as_dvec3();
-            out.push(rocket::MeshVertex {
-                pos: self.rel(local).into(),
-                normal: v.normal,
-                color: v.color,
-            });
-        }
+        // static structures (camera-relative): pad + mount, the assembly hangar,
+        // and the parts rack beside it.
+        let push_static = |out: &mut Vec<rocket::MeshVertex>, mesh: &rocket::Mesh| {
+            for v in &mesh.verts {
+                out.push(rocket::MeshVertex {
+                    pos: self.rel(Vec3::from(v.pos).as_dvec3()).into(),
+                    normal: v.normal,
+                    color: v.color,
+                });
+            }
+        };
+        push_static(&mut out, &self.pad_mesh);
+        push_static(&mut out, &self.hangar_mesh);
+        push_static(&mut out, &self.rack_mesh);
 
-        // current rocket pose (resting on the pad when not launched)
+        // current rocket pose: in the hangar / rolling out when not launched
         let (base_local, quat, active) = match self.launch.as_ref() {
             Some(rk) => {
                 let base = self.to_local_d(rk.r);
                 let q = Quat::from_rotation_arc(Vec3::Y, self.dir_to_local(rk.point_dir()));
                 (base, q, rk.stage_base)
             }
-            None => (DVec3::new(0.0, rb.base_y as f64, 0.0), Quat::IDENTITY, 0),
+            None => (self.resting_base_local(), Quat::IDENTITY, 0),
         };
 
         // draw the payload + every still-attached stage (active stage and above)
@@ -2392,9 +2451,32 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
     };
     let time = match scenario {
         "rocket" | "pad" => {
+            // rolled out, standing on the pad
             world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
             world.rocket_az = 4.97; // face inland (land), coast to the sides
             world.rocket_el = 0.12;
+            0.0
+        }
+        "vab" => {
+            // assembling in the hangar (the default start state)
+            world.view = View::Rocket;
+            world.vab_mode = true;
+            world.rollout = 0.0;
+            world.rocket_az = 5.4;
+            world.rocket_el = 0.16;
+            world.rocket_dist = 95.0;
+            0.0
+        }
+        "rollout" => {
+            // mid roll-out: the rocket part-way between hangar and pad
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 0.5;
+            world.rocket_az = 5.0;
+            world.rocket_el = 0.14;
+            world.rocket_dist = 130.0;
             0.0
         }
         "liftoff" => {
@@ -2929,8 +3011,9 @@ impl ApplicationHandler<UserEvent> for App {
                         KeyCode::KeyF => state.world.toggle_flight(),
                         KeyCode::Space => {
                             if state.world.view == View::Rocket {
-                                // ignite, then Space stages the spent booster.
-                                if state.world.launch.is_none() {
+                                if state.world.vab_mode {
+                                    state.world.start_rollout(); // roll out to the pad
+                                } else if state.world.launch.is_none() {
                                     state.world.ignite_launch();
                                 } else {
                                     state.world.stage_launch();
@@ -2940,7 +3023,7 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                         }
                         KeyCode::KeyR if state.world.view == View::Rocket => {
-                            state.world.reset_launch()
+                            state.world.back_to_vab()
                         }
                         KeyCode::BracketRight => {
                             state.world.warp = (state.world.warp * 2.0).min(10000.0);
@@ -3033,6 +3116,10 @@ fn main() {
                 "binary"
             } else if args.iter().any(|a| a == "system") {
                 "system"
+            } else if args.iter().any(|a| a == "vab") {
+                "vab"
+            } else if args.iter().any(|a| a == "rollout") {
+                "rollout"
             } else if args.iter().any(|a| a == "pad") {
                 "pad"
             } else if args.iter().any(|a| a == "liftoff2") {
