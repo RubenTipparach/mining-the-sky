@@ -31,6 +31,18 @@ impl Mesh {
         }
     }
 
+    /// A triangle with independent per-vertex normals and colours (for smooth
+    /// Gouraud-shaded terrain).
+    fn tri3(&mut self, p: [Vec3; 3], n: [Vec3; 3], col: [[f32; 3]; 3]) {
+        for i in 0..3 {
+            self.verts.push(MeshVertex {
+                pos: [p[i].x, p[i].y, p[i].z],
+                normal: [n[i].x, n[i].y, n[i].z],
+                color: col[i],
+            });
+        }
+    }
+
     fn quad(&mut self, a: Vec3, b: Vec3, c: Vec3, d: Vec3, n: Vec3, col: [f32; 3]) {
         self.tri(a, b, c, n, col);
         self.tri(a, c, d, n, col);
@@ -519,27 +531,69 @@ pub fn planet_terrain(
     let lod = select(&planet, cam_world, 1.5, max_depth);
     let mut m = Mesh::default();
     let n = 9;
+    let grid = n * n; // first `grid` positions are the surface; the rest are skirts
     for patch in &lod.patches {
         // Skirt depth scales with the patch so coarse far patches still seal.
         let skirt = (patch.edge * 0.3).clamp(80.0, 80_000.0);
         let pm = build_mesh(&planet, patch, n, &elev, skirt);
+        let nv = pm.positions.len();
+
+        // Per-vertex local position and outward (radial) direction in local axes.
+        let local: Vec<Vec3> = pm
+            .positions
+            .iter()
+            .map(|&w| (to_local(w) - ref_local).as_vec3())
+            .collect();
+        let radial: Vec<Vec3> = pm
+            .positions
+            .iter()
+            .map(|&w| dir_local(w.normalize()))
+            .collect();
+
+        // Smooth normals: accumulate area-weighted face normals from the surface
+        // triangles only (skip skirt walls so they don't tilt the rim). Each
+        // shared grid vertex then averages its neighbouring faces.
+        let mut nrm = vec![Vec3::ZERO; nv];
         for tri in pm.indices.chunks(3) {
-            let w0 = pm.positions[tri[0] as usize];
-            let w1 = pm.positions[tri[1] as usize];
-            let w2 = pm.positions[tri[2] as usize];
-            let a = (to_local(w0) - ref_local).as_vec3();
-            let b = (to_local(w1) - ref_local).as_vec3();
-            let c = (to_local(w2) - ref_local).as_vec3();
-            let cdir = ((w0 + w1 + w2) / 3.0).normalize();
-            let cdir_l = dir_local(cdir); // outward (radial) in local axes
-            let mut nrm = (b - a).cross(c - a).normalize_or_zero();
-            if nrm.dot(cdir_l) < 0.0 {
-                nrm = -nrm; // face away from the planet centre
+            let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+            if i0 >= grid || i1 >= grid || i2 >= grid {
+                continue; // skirt triangle
             }
-            let slope = (1.0 - nrm.dot(cdir_l)).clamp(0.0, 1.0);
-            let abs_lat = cdir.y.clamp(-1.0, 1.0).asin().abs();
-            let col = terrain_color(elev.height_m(cdir), slope, hashf(a), abs_lat, lunar);
-            m.tri(a, b, c, nrm, col);
+            let mut fnv = (local[i1] - local[i0]).cross(local[i2] - local[i0]);
+            let rc = radial[i0] + radial[i1] + radial[i2];
+            if fnv.dot(rc) < 0.0 {
+                fnv = -fnv;
+            }
+            nrm[i0] += fnv;
+            nrm[i1] += fnv;
+            nrm[i2] += fnv;
+        }
+        for i in 0..nv {
+            let mut nn = nrm[i].normalize_or_zero();
+            if nn.length_squared() < 1e-6 || nn.dot(radial[i]) < 0.0 {
+                nn = radial[i]; // skirt verts and degenerate cases face outward
+            }
+            nrm[i] = nn;
+        }
+
+        // Per-vertex colour (height/slope/lat), with a small position-hashed
+        // jitter that now interpolates smoothly instead of per-triangle.
+        let col: Vec<[f32; 3]> = (0..nv)
+            .map(|i| {
+                let cdir = pm.positions[i].normalize();
+                let slope = (1.0 - nrm[i].dot(radial[i])).clamp(0.0, 1.0);
+                let abs_lat = cdir.y.clamp(-1.0, 1.0).asin().abs();
+                terrain_color(elev.height_m(cdir), slope, hashf(local[i]), abs_lat, lunar)
+            })
+            .collect();
+
+        for tri in pm.indices.chunks(3) {
+            let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+            m.tri3(
+                [local[i0], local[i1], local[i2]],
+                [nrm[i0], nrm[i1], nrm[i2]],
+                [col[i0], col[i1], col[i2]],
+            );
         }
     }
     m
