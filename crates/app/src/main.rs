@@ -374,6 +374,12 @@ struct World {
     lander_mesh: rocket::Mesh,
     /// Show the lunar lander standing on the ground (instead of the rocket).
     show_lander: bool,
+    /// Render the surface as the moon: grey regolith + black airless sky.
+    lunar: bool,
+    /// Height (m) the lander floats above the surface (0 = landed).
+    lander_alt: f32,
+    /// Fire the lander's descent engine (plume under the bell).
+    lander_firing: bool,
     /// Grabbable parts on the rack (for in-viewport 3D drag-assembly).
     rack_slots: Vec<RackSlot>,
     /// The part currently being dragged from the rack, if any.
@@ -475,6 +481,9 @@ impl World {
             rack_mesh: rack_mesh_init,
             lander_mesh: rocket::lander(),
             show_lander: false,
+            lunar: false,
+            lander_alt: 0.0,
+            lander_firing: false,
             rack_slots,
             grab: None,
             grab_target: None,
@@ -678,7 +687,12 @@ impl World {
             up: to_world_dir(up),
             fwd: to_world_dir(fwd),
             sun: [sun.x as f32, sun.y as f32, sun.z as f32, 0.0],
-            cam: [cam_world.x as f32, cam_world.y as f32, cam_world.z as f32, 0.0],
+            cam: [
+                cam_world.x as f32,
+                cam_world.y as f32,
+                cam_world.z as f32,
+                if self.lunar { 1.0 } else { 0.0 },
+            ],
             params: [tan, aspect, self.body.radius as f32, r_atm as f32],
         }
     }
@@ -1259,6 +1273,7 @@ impl World {
             self.launch_east,
             self.launch_north,
             19,
+            self.lunar,
         );
         self.terrain_count = (m.verts.len() as u64).min(TERRAIN_CAP) as u32;
         self.terrain_verts = m.verts;
@@ -1300,7 +1315,7 @@ impl World {
         };
         // the lunar lander on the surface (preview / landed), instead of the launch stack
         if self.show_lander {
-            let base = DVec3::new(0.0, 0.0, 0.0);
+            let base = DVec3::new(0.0, self.lander_alt as f64, 0.0);
             for v in &self.lander_mesh.verts {
                 let local = base + Vec3::from(v.pos).as_dvec3();
                 out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: v.normal, color: v.color });
@@ -1396,6 +1411,38 @@ impl World {
                 card(len, er * 1.9, 0.10, tf); // wide orange body
                 card(len * 0.5, er * 1.0, 0.63, tf * 1.3); // white-hot core
             }
+        }
+
+        // ---- lunar descent-engine plume (under the lander's bell) ----
+        if self.show_lander && self.lander_firing {
+            let down = Vec3::new(0.0, -1.0, 0.0);
+            // the descent bell exits near y=0.9 in the lander mesh; the lander
+            // itself floats at lander_alt.
+            let mount = DVec3::new(0.0, self.lander_alt as f64 + 0.9, 0.0);
+            let nozzle = self.rel(mount);
+            let view = (nozzle - eye).normalize_or_zero();
+            let mut w_axis = down.cross(view).normalize_or_zero();
+            if w_axis.length_squared() < 1e-4 {
+                w_axis = right;
+            }
+            let mut card = |length: f32, half_w: f32, seed: f32, inten: f32| {
+                let tip = nozzle + down * length;
+                let wn = w_axis * half_w;
+                let wt = w_axis * (half_w * 0.18);
+                let col = [seed, inten, 0.0, 0.0];
+                let q = [
+                    (nozzle - wn, [0.0f32, 0.0]),
+                    (nozzle + wn, [1.0, 0.0]),
+                    (tip + wt, [1.0, 1.0]),
+                    (tip - wt, [0.0, 1.0]),
+                ];
+                for &i in &[0usize, 1, 2, 0, 2, 3] {
+                    out.push(FxVertex { pos: q[i].0.into(), uv: q[i].1, color: col, kind: 0.0 });
+                }
+            };
+            // a short, translucent-blue-ish vacuum plume: orange-ish edge, hot core
+            card(7.0, 1.5, 0.18, 0.9);
+            card(4.0, 0.7, 0.70, 1.2);
         }
 
         // ---- smoke-particle trail (camera-facing billboards) ----
@@ -2949,6 +2996,113 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.node = Some(ManeuverNode { nu: std::f64::consts::PI, pro: 1600.0, nrm: 0.0, rad: 0.0 });
             6.0
         }
+        // ---- Lunar-lander mission, stage by stage ----
+        "m1_vab" => {
+            // the assembled rocket in the VAB, carrying the Lunar Lander payload.
+            world.vab.payload = 4; // Lunar Lander
+            world.rebuild_vehicle();
+            world.view = View::Rocket;
+            world.vab_mode = true;
+            world.rollout = 0.0;
+            world.rocket_az = 0.7;
+            world.rocket_el = 0.16;
+            world.rocket_dist = 56.0;
+            0.0
+        }
+        "m2_liftoff" => {
+            // lift off from the home world with the lander folded inside the fairing.
+            world.vab.payload = 4;
+            world.rebuild_vehicle();
+            world.view = View::Rocket;
+            world.rocket_az = 4.97;
+            world.rocket_el = 0.10;
+            world.rocket_dist = 70.0;
+            world.ignite_launch();
+            fly(&mut world, 6.0);
+            0.0
+        }
+        "m3_orbit" => {
+            // parking orbit around the home world with a trans-lunar injection
+            // burn planned at the node (green current orbit, cyan result).
+            world.vab.payload = 4;
+            frame_map(&mut world);
+            world.launched = true;
+            world.sys_dist = 30.0;
+            world.sys_el = 0.5;
+            world.clock = world.mission.meco_t + 10.0;
+            let (r, v) = world.mission.orbit_state_at(world.clock);
+            world.flight = Some(Craft::maneuvering(r, v));
+            world.node = Some(ManeuverNode { nu: std::f64::consts::PI, pro: 3050.0, nrm: 0.0, rad: 0.0 });
+            6.0
+        }
+        "m4_transfer" => {
+            // coasting along the trans-lunar transfer ellipse: the conic reaches
+            // out to the moon. Framed to show home, the transfer, and the moon.
+            world.view = View::Map;
+            let hi = world
+                .nav
+                .iter()
+                .position(|&i| world.universe.bodies[i].is_home)
+                .unwrap_or(0);
+            world.set_focus(hi);
+            world.launched = true;
+            // a transfer ellipse: periapsis just above home, apoapsis at the moon.
+            let mu = world.body.mu;
+            let rp = world.body.radius + 250_000.0;
+            let moon_dir = world.moon_center_m.normalize();
+            let ra = world.moon_center_m.length();
+            let a = 0.5 * (rp + ra);
+            let vp = (mu * (2.0 / rp - 1.0 / a)).sqrt();
+            // periapsis on the opposite side, velocity perpendicular toward the moon
+            let r0 = -moon_dir * rp;
+            let tangent = DVec3::new(-moon_dir.z, 0.0, moon_dir.x).normalize();
+            let v0 = tangent * vp;
+            let mut craft = Craft::maneuvering(r0, v0);
+            // coast partway out along the transfer so the craft sits mid-flight.
+            for _ in 0..4000 {
+                craft.integrate(&world.body, &world.grav_bodies(), 5.0);
+                if craft.r.length() > ra * 0.55 {
+                    break;
+                }
+            }
+            world.flight = Some(craft);
+            world.sys_az = 1.4;
+            world.sys_el = 0.55;
+            world.sys_dist = 240.0;
+            6.0
+        }
+        "m5_descent" => {
+            // powered descent over the lunar surface: grey regolith, black airless
+            // sky, the lander firing its descent engine just above the ground.
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.lunar = true;
+            world.show_lander = true;
+            world.lander_alt = 18.0;
+            world.lander_firing = true;
+            world.rocket_az = 5.4;
+            world.rocket_el = 0.10;
+            world.rocket_dist = 38.0;
+            world.rocket_focus_y = 10.0;
+            0.0
+        }
+        "m6_landed" => {
+            // touched down on the moon: the lander standing on grey regolith under
+            // a black, star-flecked sky.
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.lunar = true;
+            world.show_lander = true;
+            world.lander_alt = 0.0;
+            world.lander_firing = false;
+            world.rocket_az = 5.4;
+            world.rocket_el = 0.13;
+            world.rocket_dist = 22.0;
+            world.rocket_focus_y = 3.0;
+            0.0
+        }
         _ => {
             // map view: craft coasting in the parking orbit.
             frame_map(&mut world);
@@ -3444,7 +3598,19 @@ fn main() {
                 screenshot_all(1280, 800);
                 return;
             }
-            let scenario = if args.iter().any(|a| a == "moons") {
+            let scenario = if args.iter().any(|a| a == "m1_vab") {
+                "m1_vab"
+            } else if args.iter().any(|a| a == "m2_liftoff") {
+                "m2_liftoff"
+            } else if args.iter().any(|a| a == "m3_orbit") {
+                "m3_orbit"
+            } else if args.iter().any(|a| a == "m4_transfer") {
+                "m4_transfer"
+            } else if args.iter().any(|a| a == "m5_descent") {
+                "m5_descent"
+            } else if args.iter().any(|a| a == "m6_landed") {
+                "m6_landed"
+            } else if args.iter().any(|a| a == "moons") {
                 "moons"
             } else if args.iter().any(|a| a == "moon") {
                 "moon"
@@ -3492,6 +3658,12 @@ fn main() {
                 "surface"
             };
             let default = match scenario {
+                "m1_vab" => "out/m1_vab.png",
+                "m2_liftoff" => "out/m2_liftoff.png",
+                "m3_orbit" => "out/m3_orbit.png",
+                "m4_transfer" => "out/m4_transfer.png",
+                "m5_descent" => "out/m5_descent.png",
+                "m6_landed" => "out/m6_landed.png",
                 "moons" => "out/moons.png",
                 "moon" => "out/moon.png",
                 "rocket" => "out/rocket.png",

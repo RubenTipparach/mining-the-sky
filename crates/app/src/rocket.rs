@@ -451,7 +451,15 @@ fn hashf(p: Vec3) -> f32 {
     h
 }
 
-fn terrain_color(signed_h: f64, slope: f32, jitter: f32, abs_lat: f64) -> [f32; 3] {
+fn terrain_color(signed_h: f64, slope: f32, jitter: f32, abs_lat: f64, lunar: bool) -> [f32; 3] {
+    if lunar {
+        // grey regolith: lighter highlands, darker mare, brighter on slopes
+        let h = (signed_h as f32 / 4000.0).clamp(-1.0, 1.0);
+        let base = mix3([0.34, 0.33, 0.32], [0.52, 0.51, 0.50], (h * 0.5 + 0.5).clamp(0.0, 1.0));
+        let bright = mix3(base, [0.62, 0.61, 0.60], (slope * 1.4).clamp(0.0, 1.0));
+        let b = 0.82 + 0.3 * jitter;
+        return [bright[0] * b, bright[1] * b, bright[2] * b];
+    }
     if signed_h <= 0.0 {
         // shallow to deep sea
         let t = ((-signed_h) / 1200.0).clamp(0.0, 1.0) as f32;
@@ -496,6 +504,7 @@ pub fn planet_terrain(
     east: DVec3,
     north: DVec3,
     max_depth: u32,
+    lunar: bool,
 ) -> Mesh {
     let planet = Planet { radius: PLANET_RADIUS };
     let elev = launch_elevation();
@@ -529,7 +538,7 @@ pub fn planet_terrain(
             }
             let slope = (1.0 - nrm.dot(cdir_l)).clamp(0.0, 1.0);
             let abs_lat = cdir.y.clamp(-1.0, 1.0).asin().abs();
-            let col = terrain_color(elev.height_m(cdir), slope, hashf(a), abs_lat);
+            let col = terrain_color(elev.height_m(cdir), slope, hashf(a), abs_lat, lunar);
             m.tri(a, b, c, nrm, col);
         }
     }

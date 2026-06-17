@@ -16,7 +16,9 @@ pub fn build(ctx: &egui::Context, world: &mut World) {
     apply_theme(ctx);
     match world.view {
         View::Rocket => {
-            if world.launch.is_some() {
+            if world.show_lander {
+                lander_panel(ctx, world); // on the lunar surface
+            } else if world.launch.is_some() {
                 launch_panel(ctx, world);
             } else if world.vab_mode {
                 vehicle_panel(ctx, world); // assembling in the building
@@ -270,6 +272,34 @@ fn pad_panel(ctx: &egui::Context, world: &mut World) {
     if back {
         world.back_to_vab();
     }
+}
+
+/// Shown on the lunar surface: a compact lander status readout. No launch
+/// controls (this is the descent/landed view, not the pad).
+fn lander_panel(ctx: &egui::Context, world: &mut World) {
+    let landed = world.lander_alt <= 0.1;
+    egui::Window::new("LUNAR LANDER")
+        .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 12.0))
+        .default_width(220.0)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.label(egui::RichText::new("LUNAR LANDER").heading().color(AMBER));
+            egui::Grid::new("lander_stats").num_columns(2).show(ui, |ui| {
+                kv(ui, "Body", "Moon");
+                kv(ui, "Altitude", &format!("{:.1} m", world.lander_alt.max(0.0)));
+                kv(
+                    ui,
+                    "Descent engine",
+                    if world.lander_firing { "FIRING" } else { "OFF" },
+                );
+            });
+            ui.separator();
+            if landed && !world.lander_firing {
+                ui.label(egui::RichText::new("TOUCHDOWN").strong().color(GOOD));
+            } else {
+                ui.label(egui::RichText::new("Powered descent").color(WARN));
+            }
+        });
 }
 
 /// A draggable part chip for the VAB palette.

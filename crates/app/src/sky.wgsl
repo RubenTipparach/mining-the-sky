@@ -126,6 +126,33 @@ fn atmosphere(orig: vec3<f32>, dir: vec3<f32>, sun: vec3<f32>, rp: f32, ra: f32)
     return SUN_I * (sum_r * BETA_R * phase_r + sum_m * BETA_M * phase_m);
 }
 
+// Cheap hash-based starfield: quantise the ray direction into cells and light a
+// pixel when it lands near a per-cell random star position. Airless (lunar) sky.
+fn hash21(p: vec2<f32>) -> f32 {
+    var h = dot(p, vec2<f32>(127.1, 311.7));
+    return fract(sin(h) * 43758.5453);
+}
+
+fn starfield(dir: vec3<f32>) -> vec3<f32> {
+    // Map the direction to spherical-ish UV cells.
+    let uv = vec2<f32>(atan2(dir.z, dir.x), asin(clamp(dir.y, -1.0, 1.0)));
+    let scale = 180.0;
+    let cell = floor(uv * scale);
+    let f = fract(uv * scale);
+    let r1 = hash21(cell);
+    let r2 = hash21(cell + vec2<f32>(41.3, 7.7));
+    let r3 = hash21(cell + vec2<f32>(13.1, 91.7));
+    // Only some cells contain a star.
+    if (r3 > 0.93) {
+        let star = vec2<f32>(r1, r2);
+        let d = length(f - star);
+        let b = smoothstep(0.06, 0.0, d) * (0.4 + 0.6 * r3);
+        let tint = mix(vec3<f32>(0.8, 0.85, 1.0), vec3<f32>(1.0, 0.95, 0.85), r1);
+        return tint * b;
+    }
+    return vec3<f32>(0.0);
+}
+
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let tan = u.params.x;
@@ -139,6 +166,19 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     );
     let sun = normalize(u.sun.xyz);
     let cam = u.cam.xyz;
+
+    // Airless body (the moon): pure black space, a starfield, and a hard sun
+    // disk. No atmospheric scattering, no limb glow.
+    if (u.cam.w >= 0.5) {
+        let pl = ray_sphere(cam, ray, rp);
+        let space = select(1.0, 0.0, pl.x > 0.0);
+        var lc = starfield(ray) * space;
+        let sd = max(dot(ray, sun), 0.0);
+        let disk = smoothstep(0.9994, 0.9998, sd) * 1.0;
+        let glow = pow(sd, 3000.0) * 0.4;
+        lc = lc + vec3<f32>(1.0, 0.98, 0.92) * (disk + glow) * space;
+        return vec4<f32>(lc, 1.0);
+    }
 
     var col = atmosphere(cam, ray, sun, rp, ra);
 

@@ -49,6 +49,7 @@ pub const PAYLOADS: &[Payload] = &[
     Payload { name: "ComSat", mass: 1_400.0, color: [0.9, 0.8, 0.3] },
     Payload { name: "Station Module", mass: 5_000.0, color: [0.6, 0.85, 1.0] },
     Payload { name: "Fuel Depot", mass: 9_000.0, color: [1.0, 0.6, 0.3] },
+    Payload { name: "Lunar Lander", mass: 6_500.0, color: [0.82, 0.66, 0.26] },
 ];
 
 #[derive(Clone, Copy)]
