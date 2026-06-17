@@ -738,7 +738,10 @@ impl World {
         let on_pad = alt < 30.0;
         let base = self.to_local(rk.r);
         let down = -self.dir_to_local(rk.point_dir()); // exhaust direction
-        let nozzle = base + down * 1.5;
+        // emit from the ACTIVE stage's nozzle (up the mesh by nozzle_y)
+        let q = Quat::from_rotation_arc(Vec3::Y, self.dir_to_local(rk.point_dir()));
+        let ny = self.rocket_body.nozzle_y.get(rk.stage_base).copied().unwrap_or(0.0);
+        let nozzle = base + q * Vec3::new(0.0, ny - 1.2, 0.0);
         let er = self.rocket_body.engine_r * if rk.stage_base == 0 { 1.0 } else { 0.45 };
 
         // spawn rate: heavy at the pad (the ground billow), thinning with density.
@@ -949,11 +952,17 @@ impl World {
         if let Some(rk) = self.launch.as_ref() {
             let tf = if rk.live_thrust() > 0.0 { rk.throttle as f32 } else { 0.0 };
             if tf > 0.0 {
+                let booster = rk.stage_base == 0;
                 let down = -self.dir_to_local(rk.point_dir()); // flame opposes thrust
-                let er = self.rocket_body.engine_r * if rk.stage_base == 0 { 1.0 } else { 0.5 };
-                // nozzle, camera-relative (floating origin)
-                let nozzle = self.rel(self.to_local_d(rk.r) + down.as_dvec3() * 1.2);
-                let len = (if rk.stage_base == 0 { 7.0 } else { 3.6 }) * (0.6 + 0.4 * tf);
+                let er = self.rocket_body.engine_r * if booster { 1.2 } else { 0.7 };
+                // Anchor at the ACTIVE stage's engine: its nozzle sits up the mesh
+                // by `nozzle_y`, so after the booster drops the upper-stage flame
+                // stays at its own engine instead of the old booster base.
+                let q = Quat::from_rotation_arc(Vec3::Y, self.dir_to_local(rk.point_dir()));
+                let ny = self.rocket_body.nozzle_y.get(rk.stage_base).copied().unwrap_or(0.0);
+                let mount = self.to_local_d(rk.r) + (q * Vec3::new(0.0, ny - 1.2, 0.0)).as_dvec3();
+                let nozzle = self.rel(mount);
+                let len = (if booster { 17.0 } else { 9.5 }) * (0.55 + 0.45 * tf);
                 // axis billboard: width axis is perpendicular to the flame and to
                 // the view ray, so the card faces the camera.
                 let view = (nozzle - eye).normalize_or_zero();
@@ -976,8 +985,8 @@ impl World {
                         out.push(FxVertex { pos: q[i].0.into(), uv: q[i].1, color: col, kind: 0.0 });
                     }
                 };
-                card(len, er * 1.35, 0.10, tf); // orange body
-                card(len * 0.55, er * 0.7, 0.63, tf * 1.3); // white-hot core
+                card(len, er * 1.9, 0.10, tf); // wide orange body
+                card(len * 0.5, er * 1.0, 0.63, tf * 1.3); // white-hot core
             }
         }
 
@@ -2253,6 +2262,18 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             fly_to_staging(&mut world); // spent booster tumbling away
             0.0
         }
+        "upperflame" => {
+            // close-up of the upper stage firing, to check the flame sits at its
+            // own nozzle (not the dropped booster's).
+            world.view = View::Rocket;
+            world.rocket_az = 4.2;
+            world.rocket_el = 0.08;
+            world.ignite_launch();
+            fly_to_staging(&mut world);
+            fly(&mut world, 4.0);
+            world.rocket_dist = 42.0;
+            0.0
+        }
         "orbit" => {
             // high up: pull the camera back to frame the planet against space.
             world.view = View::Rocket;
@@ -2807,6 +2828,8 @@ fn main() {
                 "staging"
             } else if args.iter().any(|a| a == "launchmap") {
                 "launchmap"
+            } else if args.iter().any(|a| a == "upperflame") {
+                "upperflame"
             } else if args.iter().any(|a| a == "orbit") {
                 "orbit"
             } else if args.iter().any(|a| a == "ascent") {

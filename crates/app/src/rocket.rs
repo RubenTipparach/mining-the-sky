@@ -124,6 +124,9 @@ pub struct RocketBody {
     pub cam_dist: f32,
     /// Radius of the first stage's engine cluster (for plume placement).
     pub engine_r: f32,
+    /// Mesh-Y of each stage's engine mount (where its exhaust exits), so the
+    /// flame can sit at the active stage's nozzle even after the booster drops.
+    pub nozzle_y: Vec<f32>,
 }
 
 pub const PAD_TOP: f32 = 1.2;
@@ -155,11 +158,13 @@ pub fn rocket_body() -> RocketBody {
 
     let mut y = 0.0f32;
     let mut booster_end = 0usize;
+    let mut nozzle_y: Vec<f32> = Vec::new();
     for (i, stage) in veh.stages.iter().enumerate() {
         let r = radii[i.min(radii.len() - 1)];
         let col = body_cols[i.min(body_cols.len() - 1)];
         let vol = stage.prop as f32 / PROP_DENSITY;
         let h = (vol / (std::f32::consts::PI * r * r)).max(3.0);
+        nozzle_y.push(y); // this stage's engine mounts at its base
 
         // body
         m.frustum(0.0, 0.0, y, y + h, r, r, 24, col, false, false);
@@ -222,6 +227,7 @@ pub fn rocket_body() -> RocketBody {
         focus_y: y * 0.45,
         cam_dist: y * 1.7,
         engine_r,
+        nozzle_y,
     }
 }
 
