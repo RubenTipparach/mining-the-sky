@@ -2999,7 +2999,7 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             let (r, v) = world.mission.orbit_state_at(world.clock);
             let mut craft = Craft::maneuvering(r, v);
             craft.throttle = 0.6;
-            craft.mode = Mode::Retrograde;
+            craft.aim(Mode::Retrograde, &world.body); // already pointed retro
             world.flight = Some(craft);
             6.0
         }
@@ -3588,11 +3588,15 @@ impl ApplicationHandler<UserEvent> for App {
                                     state.world.set_focus(bi);
                                 }
                             } else if let Some(c) = state.world.flight.as_mut() {
+                                // 1..6 select the six orbital attitudes; 7 frees the autopilot.
                                 c.mode = match idx {
                                     0 => Mode::Prograde,
                                     1 => Mode::Retrograde,
-                                    2 => Mode::RadialOut,
-                                    3 => Mode::RadialIn,
+                                    2 => Mode::Normal,
+                                    3 => Mode::AntiNormal,
+                                    4 => Mode::RadialOut,
+                                    5 => Mode::RadialIn,
+                                    6 => Mode::Free,
                                     _ => c.mode,
                                 };
                             }

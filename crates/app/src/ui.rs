@@ -66,6 +66,13 @@ fn kv(ui: &mut egui::Ui, k: &str, v: &str) {
     ui.end_row();
 }
 
+/// Key/value row with a coloured value (for status that changes colour).
+fn kv_c(ui: &mut egui::Ui, k: &str, v: &str, col: egui::Color32) {
+    ui.label(egui::RichText::new(k).color(DIM));
+    ui.label(egui::RichText::new(v).color(col));
+    ui.end_row();
+}
+
 fn vehicle_panel(ctx: &egui::Context, world: &mut World) {
     use crate::build;
     // Drag payload: which catalog part is being dragged.
@@ -610,6 +617,13 @@ fn flight_panel(ctx: &egui::Context, world: &mut World) {
         craft.prop_frac() * 100.0,
         craft.mode,
     );
+    // attitude / effector telemetry
+    let (perr, rate, wsat, rcsf) = (
+        craft.pointing_error_deg(),
+        craft.rate_deg_s(),
+        craft.wheel_saturation() * 100.0,
+        craft.rcs_frac() * 100.0,
+    );
     let warp = world.warp;
 
     #[derive(PartialEq)]
@@ -638,6 +652,21 @@ fn flight_panel(ctx: &egui::Context, world: &mut World) {
                 kv(ui, "Propellant", &format!("{prop:.0} %"));
             });
             ui.separator();
+            // attitude / rotational-control readout
+            ui.label(egui::RichText::new("ATTITUDE").color(AMBER));
+            egui::Grid::new("att").num_columns(2).show(ui, |ui| {
+                let ecol = if perr < 2.0 { GOOD } else if perr < 15.0 { AMBER } else { WARN };
+                kv_c(ui, "Point error", &format!("{perr:.1} deg"), ecol);
+                kv(ui, "Rate", &format!("{rate:.2} deg/s"));
+                kv_c(
+                    ui,
+                    "Wheels",
+                    &format!("{wsat:.0} % sat"),
+                    if wsat > 80.0 { WARN } else { DIM },
+                );
+                kv(ui, "RCS prop", &format!("{rcsf:.0} %"));
+            });
+            ui.separator();
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Throttle").color(DIM));
                 if ui.button("-").clicked() {
@@ -647,18 +676,24 @@ fn flight_panel(ctx: &egui::Context, world: &mut World) {
                     act = Some(Act::Thr(0.08));
                 }
             });
+            ui.label(egui::RichText::new("Hold attitude (1-6, 7 = free)").color(DIM));
             ui.horizontal(|ui| {
                 for (lbl, m) in [
                     ("Pro", Mode::Prograde),
                     ("Retro", Mode::Retrograde),
-                    ("Out", Mode::RadialOut),
-                    ("In", Mode::RadialIn),
+                    ("Nml", Mode::Normal),
+                    ("Anml", Mode::AntiNormal),
+                    ("RadO", Mode::RadialOut),
+                    ("RadI", Mode::RadialIn),
                 ] {
                     if ui.selectable_label(mode == m, lbl).clicked() {
                         act = Some(Act::Mode(m));
                     }
                 }
             });
+            if ui.selectable_label(mode == Mode::Free, "Free drift").clicked() {
+                act = Some(Act::Mode(Mode::Free));
+            }
             ui.separator();
             time_controls(ui, warp, &mut warp_mul);
             if ui.button("Release control (F)").clicked() {

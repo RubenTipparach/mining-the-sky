@@ -6,6 +6,9 @@
 //! thrusting, otherwise stay on rails" rule).
 
 use glam::{DVec3, Vec3};
+use sim::attitude::{
+    allocate, AttitudeController, AttitudeMode, Gimbal, Rcs, ReactionWheels, RigidBody, TorqueReport,
+};
 use sim::body::CentralBody;
 use sim::orbit::orbit_from_state;
 use sim::vehicle::G0;
@@ -13,24 +16,10 @@ use sim::vehicle::G0;
 const CDA: f64 = 6.0; // Cd * frontal area (m^2), matches the ascent model
 const LAND_SPEED: f64 = 18.0; // m/s surface-relative: under this you land, over it you crash
 
-#[derive(Clone, Copy, PartialEq)]
-pub enum Mode {
-    Prograde,
-    Retrograde,
-    RadialOut,
-    RadialIn,
-}
-
-impl Mode {
-    pub fn label(self) -> &'static str {
-        match self {
-            Mode::Prograde => "PROGRADE",
-            Mode::Retrograde => "RETRO",
-            Mode::RadialOut => "RADIAL OUT",
-            Mode::RadialIn => "RADIAL IN",
-        }
-    }
-}
+/// The attitude reference modes are the six orbital directions from the
+/// rotational-dynamics module (prograde/retro, normal/anti-normal, radial
+/// in/out), plus Free.
+pub use sim::attitude::AttitudeMode as Mode;
 
 pub struct Craft {
     pub r: DVec3,
@@ -46,6 +35,17 @@ pub struct Craft {
     pub crashed: bool,
     /// Which body the craft last touched ("HOME" / "MOON" / "").
     pub landed_on: &'static str,
+
+    // ---- rotational dynamics + attitude control ----
+    /// Rigid-body orientation + angular velocity (the ship actually has to turn
+    /// before its thrust points where you want).
+    pub rb: RigidBody,
+    pub wheels: ReactionWheels,
+    pub rcs: Rcs,
+    pub gimbal: Gimbal,
+    pub ctrl: AttitudeController,
+    /// Per-effector torque contribution on the last control step (for the HUD).
+    pub torque_report: TorqueReport,
 }
 
 /// An extra point-mass gravity source (e.g. the moon), positioned in the same
@@ -62,6 +62,11 @@ impl Craft {
     /// A modest maneuvering ship: enough delta-v to deorbit and fly a powered
     /// landing once atmospheric drag has bled off most of the orbital speed.
     pub fn maneuvering(r: DVec3, v: DVec3) -> Craft {
+        // ~14 t wet, roughly a 2 m radius, 8 m long can. Reaction wheels for
+        // fine, propellant-free pointing; RCS for fast slews + wheel dumping; a
+        // gimbaled main engine for control authority while burning.
+        let mut rb = RigidBody::cylinder(14_000.0, 2.0, 4.0);
+        rb.point_at(v); // start pointed prograde
         Craft {
             r,
             v,
@@ -75,6 +80,22 @@ impl Craft {
             landed: false,
             crashed: false,
             landed_on: "",
+            rb,
+            wheels: ReactionWheels::new(800.0, 250.0),
+            rcs: Rcs::new(4_000.0, 230.0, 2.5, 200.0),
+            gimbal: Gimbal::new(5.0, 6.0),
+            ctrl: AttitudeController::new(),
+            torque_report: TorqueReport::default(),
+        }
+    }
+
+    /// Set the attitude mode and snap the orientation straight onto it (no slew)
+    /// - for scenario/test setup where the ship is already aligned.
+    pub fn aim(&mut self, mode: Mode, body: &CentralBody) {
+        self.mode = mode;
+        let _ = body;
+        if let Some(t) = sim::attitude::target_dir(mode, self.r, self.v) {
+            self.rb.point_at(t);
         }
     }
 
@@ -86,13 +107,58 @@ impl Craft {
         (self.prop / self.prop_full).clamp(0.0, 1.0) as f32
     }
 
+    /// Thrust acts along the ship's actual nose direction (it has to be turned
+    /// there by the autopilot first - thrust is no longer magically aligned).
     fn thrust_dir(&self) -> DVec3 {
-        match self.mode {
-            Mode::Prograde => self.v.normalize_or_zero(),
-            Mode::Retrograde => -self.v.normalize_or_zero(),
-            Mode::RadialOut => self.r.normalize_or_zero(),
-            Mode::RadialIn => -self.r.normalize_or_zero(),
+        self.rb.nose()
+    }
+
+    /// The world direction the autopilot is currently trying to point at.
+    pub fn target_dir(&self) -> Option<DVec3> {
+        sim::attitude::target_dir(self.mode, self.r, self.v)
+    }
+
+    /// Pointing error of the nose from the commanded attitude (degrees).
+    pub fn pointing_error_deg(&self) -> f64 {
+        match self.target_dir() {
+            Some(t) => AttitudeController::error(&self.rb, t).length().to_degrees(),
+            None => 0.0,
         }
+    }
+
+    /// Body angular rate magnitude (deg/s).
+    pub fn rate_deg_s(&self) -> f64 {
+        self.rb.omega.length().to_degrees()
+    }
+
+    /// Reaction-wheel saturation (0..1) and RCS propellant fraction (0..1).
+    pub fn wheel_saturation(&self) -> f64 {
+        self.wheels.saturation()
+    }
+    pub fn rcs_frac(&self) -> f64 {
+        self.rcs.prop_frac()
+    }
+
+    /// Nose direction in world coordinates (for rendering the craft's heading).
+    pub fn nose(&self) -> DVec3 {
+        self.rb.nose()
+    }
+
+    /// Run one attitude-control step: autopilot -> torque allocation across
+    /// gimbal/wheels/RCS -> rigid-body rotation update.
+    fn step_attitude(&mut self, thrust_n: f64, dt: f64) {
+        let target = sim::attitude::target_dir(self.mode, self.r, self.v);
+        let cmd = self.ctrl.command_torque(&self.rb, target, dt);
+        let (tau, report) = allocate(
+            cmd,
+            &mut self.wheels,
+            &mut self.rcs,
+            self.gimbal,
+            thrust_n,
+            dt,
+        );
+        self.rb.integrate(tau, dt);
+        self.torque_report = report;
     }
 
     fn accel(
@@ -143,6 +209,10 @@ impl Craft {
             } else {
                 0.0
             };
+
+            // Turn the ship first (real rotational dynamics), then thrust along
+            // wherever the nose actually ends up this step.
+            self.step_attitude(thrust_n, h);
             let tdir = self.thrust_dir();
 
             let r = self.r;
@@ -363,7 +433,7 @@ mod tests {
         let body = CentralBody::home();
         let mut c = circular(&body, 300_000.0);
         let before = orbit_from_state(c.r, c.v, body.mu).rp;
-        c.mode = Mode::Retrograde;
+        c.aim(Mode::Retrograde, &body); // already pointed retro
         c.throttle = 1.0;
         for _ in 0..20 {
             c.integrate(&body, &[], 1.0); // 20 s retro burn
@@ -371,6 +441,31 @@ mod tests {
         let after = orbit_from_state(c.r, c.v, body.mu).rp;
         assert!(after < before - 1_000.0, "periapsis {} -> {}", before, after);
         assert!(c.prop < c.prop_full, "burn consumed no propellant");
+    }
+
+    #[test]
+    fn autopilot_slews_then_burn_is_effective() {
+        // With the ship starting prograde, commanding retrograde must turn it
+        // (real rotation, not instant) and then the burn lowers periapsis.
+        let body = CentralBody::home();
+        let mut c = circular(&body, 300_000.0);
+        let before = orbit_from_state(c.r, c.v, body.mu).rp;
+        c.mode = Mode::Retrograde; // slew, do NOT snap
+        // first let it turn around (no throttle), then burn
+        for _ in 0..40 {
+            c.integrate(&body, &[], 1.0);
+        }
+        assert!(
+            c.pointing_error_deg() < 3.0,
+            "autopilot failed to slew to retrograde: {} deg",
+            c.pointing_error_deg()
+        );
+        c.throttle = 1.0;
+        for _ in 0..20 {
+            c.integrate(&body, &[], 1.0);
+        }
+        let after = orbit_from_state(c.r, c.v, body.mu).rp;
+        assert!(after < before - 1_000.0, "periapsis {} -> {}", before, after);
     }
 
     #[test]
