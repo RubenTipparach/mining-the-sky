@@ -131,8 +131,10 @@ const OVERLAY_CAP: u64 = 8192;
 const HUD_CAP: u64 = 40000;
 /// Thruster-FX billboards (flame + smoke particles).
 const FX_CAP: u64 = 60000;
-/// Dynamic rocket-view geometry (rocket + spent booster).
+/// Dynamic rocket-view geometry (pad + rocket + spent booster).
 const DYN_MESH_CAP: u64 = 40000;
+/// Full-planet LOD terrain (rebuilt as the camera moves).
+const TERRAIN_CAP: u64 = 500_000;
 
 /// Render-space length unit for the system view: 1000 km.
 const MM: f32 = 1.0e6;
@@ -246,6 +248,7 @@ struct World {
     // the player flies it from the pad in the rocket view.
     launch: Option<launch::Rocket>,
     rocket_body: rocket::RocketBody,
+    pad_mesh: rocket::Mesh,
     sep: Option<SepBooster>,
     smoke: Vec<Smoke>,
     smoke_accum: f32, // fractional particle spawn carry
@@ -255,6 +258,13 @@ struct World {
     launch_up: DVec3,
     launch_east: DVec3,
     launch_north: DVec3,
+    // Floating-origin reference (launch-tangent metres). The whole rocket-view
+    // scene is rendered relative to this point, snapped near the camera and
+    // updated (with a terrain rebuild) when the camera moves far from it.
+    ref_local: DVec3,
+    terrain_dirty: bool,
+    terrain_verts: Vec<rocket::MeshVertex>,
+    terrain_count: u32,
 
     // orbital map: a perspective camera framing the focused body.
     view: View,
@@ -316,6 +326,7 @@ impl World {
             flight: None,
             launch: None,
             rocket_body,
+            pad_mesh: rocket::pad_and_mount(),
             sep: None,
             smoke: Vec::new(),
             smoke_accum: 0.0,
@@ -324,6 +335,10 @@ impl World {
             launch_up,
             launch_east,
             launch_north,
+            ref_local: DVec3::ZERO,
+            terrain_dirty: true,
+            terrain_verts: Vec::new(),
+            terrain_count: 0,
             view: View::Rocket,
             sys_az: 1.4,
             sys_el: 0.30,
@@ -431,30 +446,13 @@ impl World {
         };
     }
 
-    /// Rocket-view camera: eye, target, basis, and tan(fov/2).
+    /// Rocket-view camera, floating-origin: eye + look target are returned
+    /// relative to `ref_local` (small f32 near the camera), plus the basis and
+    /// tan(fov/2). The whole rocket-view scene is uploaded in this same frame.
     fn rocket_camera(&self, aspect: f32) -> (Vec3, Vec3, Vec3, Vec3, Vec3, f32) {
-        // Chase the rocket once it is flying; otherwise frame it on the pad.
-        let target = match self.launch.as_ref() {
-            Some(rk) => {
-                let base = self.to_local(rk.r);
-                let axis = self.dir_to_local(rk.point_dir());
-                // Low and slow: look near the base so the pad + smoke stay framed;
-                // ease up the stack as the rocket climbs away.
-                let f = self.rocket_focus_y * (base.y / 120.0).clamp(0.25, 1.0);
-                base + axis * f
-            }
-            None => Vec3::new(0.0, self.rocket_focus_y, 0.0),
-        };
-        let dir = Vec3::new(
-            self.rocket_el.cos() * self.rocket_az.cos(),
-            self.rocket_el.sin(),
-            self.rocket_el.cos() * self.rocket_az.sin(),
-        );
-        let mut eye = target + dir * self.rocket_dist;
-        // Keep the camera above the (locally flat) ground so it never dips into
-        // the terrain. The pad area is flattened, so a small floor suffices.
-        eye.y = eye.y.max(2.0);
-        let fwd = (target - eye).normalize();
+        let eye = self.rel(self.camera_eye_local());
+        let target = self.rel(self.camera_look_local());
+        let fwd = (target - eye).normalize_or_zero();
         let right = fwd.cross(Vec3::Y).normalize();
         let up = right.cross(fwd).normalize();
         let tan = (50f32.to_radians() * 0.5).tan();
@@ -475,7 +473,9 @@ impl World {
             viewproj: vp.to_cols_array_2d(),
             sun: [0.40, 0.72, 0.55, 0.0],
             params: [fcoef, self.anim, 0.0, 0.0],
-            fog: [HORIZON[0], HORIZON[1], HORIZON[2], 1.0 / 42_000.0],
+            // Light aerial haze only; the atmosphere shader does the real work so
+            // the planet keeps its colour from altitude.
+            fog: [HORIZON[0], HORIZON[1], HORIZON[2], 1.0 / 160_000.0],
         }
     }
 
@@ -614,6 +614,82 @@ impl World {
         self.anim += fx_dt;
         self.advance_sep(frame_dt * self.warp.min(8.0));
         self.advance_smoke(fx_dt);
+
+        // Floating-origin reference: snap near the camera and rebuild the planet
+        // terrain when the camera has moved far from the last reference (also
+        // refreshes the LOD as the rocket climbs). Threshold grows with altitude
+        // so we rebuild often near the ground and rarely high up.
+        if self.view == View::Rocket {
+            let eye = self.camera_eye_local();
+            let alt = self.cam_world(eye).length() - self.body.radius;
+            let thresh = (alt.abs() * 0.04).clamp(25.0, 50_000.0);
+            if self.terrain_verts.is_empty() || (eye - self.ref_local).length() > thresh {
+                self.ref_local = eye;
+                self.rebuild_terrain();
+                self.terrain_dirty = true; // upload pending
+            }
+        }
+    }
+
+    /// World->local point in the launch-tangent frame (f64).
+    fn to_local_d(&self, w: DVec3) -> DVec3 {
+        let d = w - self.launch_origin;
+        DVec3::new(d.dot(self.launch_east), d.dot(self.launch_up), d.dot(self.launch_north))
+    }
+    /// World->local direction (f64, no translation).
+    fn dir_to_local_d(&self, d: DVec3) -> DVec3 {
+        DVec3::new(d.dot(self.launch_east), d.dot(self.launch_up), d.dot(self.launch_north))
+    }
+    /// Local->world point (f64).
+    fn cam_world(&self, local: DVec3) -> DVec3 {
+        self.launch_origin
+            + self.launch_east * local.x
+            + self.launch_up * local.y
+            + self.launch_north * local.z
+    }
+    /// `world - ref_local` collapsed to f32 (the floating-origin upload form).
+    fn rel(&self, local: DVec3) -> Vec3 {
+        (local - self.ref_local).as_vec3()
+    }
+
+    /// The rocket the camera frames (its local position, f64).
+    fn cam_target_local(&self) -> DVec3 {
+        match self.launch.as_ref() {
+            Some(rk) => self.to_local_d(rk.r),
+            None => DVec3::new(0.0, self.rocket_body.base_y as f64, 0.0),
+        }
+    }
+
+    /// The point the rocket-view camera looks at (launch-tangent metres, f64).
+    fn camera_look_local(&self) -> DVec3 {
+        let target = self.cam_target_local();
+        match self.launch.as_ref() {
+            Some(rk) => {
+                // Low and slow: look near the base so the pad + smoke stay framed;
+                // ease up the stack as the rocket climbs away.
+                let axis = self.dir_to_local_d(rk.point_dir());
+                let f = self.rocket_focus_y as f64 * (target.y / 120.0).clamp(0.25, 1.0);
+                target + axis * f
+            }
+            None => DVec3::new(0.0, self.rocket_focus_y as f64, 0.0),
+        }
+    }
+
+    /// Camera eye in launch-tangent metres (f64).
+    fn camera_eye_local(&self) -> DVec3 {
+        let tgt = self.camera_look_local();
+        let dir = DVec3::new(
+            (self.rocket_el.cos() * self.rocket_az.cos()) as f64,
+            self.rocket_el.sin() as f64,
+            (self.rocket_el.cos() * self.rocket_az.sin()) as f64,
+        );
+        let mut eye = tgt + dir * self.rocket_dist as f64;
+        // keep above the local ground plane
+        let ground = self.cam_world(eye).length() - self.body.radius;
+        if ground < 2.0 {
+            eye.y += 2.0 - ground;
+        }
+        eye
     }
 
     /// Emit + advect exhaust smoke particles in the local frame.
@@ -770,51 +846,77 @@ impl World {
         self.smoke.clear();
     }
 
-    /// Transform a vertex range of the rocket body by `q`/`t` into `out`.
+    /// Transform a vertex range of the rocket body by pose `q`/`base` (local f64)
+    /// into `out`, camera-relative to `ref_local` (floating origin).
     fn xform_into(
         &self,
         out: &mut Vec<rocket::MeshVertex>,
         range: std::ops::Range<usize>,
         q: Quat,
-        t: Vec3,
+        base: DVec3,
     ) {
         for v in &self.rocket_body.mesh.verts[range] {
-            let p = t + q * Vec3::from(v.pos);
+            let local = base + (q * Vec3::from(v.pos)).as_dvec3();
             let n = q * Vec3::from(v.normal);
-            out.push(rocket::MeshVertex { pos: p.into(), normal: n.into(), color: v.color });
+            out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: n.into(), color: v.color });
         }
     }
 
-    /// Per-frame dynamic rocket-view geometry: the rocket at its current pose,
-    /// exhaust plume, launch smoke, and any tumbling spent booster. The static
-    /// pad + terrain live in their own buffer.
+    /// Rebuild the full-planet LOD terrain, camera-relative to the current
+    /// `ref_local`, refined toward the camera. Called when the reference moves.
+    fn rebuild_terrain(&mut self) {
+        let cam_world = self.cam_world(self.camera_eye_local());
+        let m = rocket::planet_terrain(
+            cam_world,
+            self.ref_local,
+            self.launch_origin,
+            self.launch_up,
+            self.launch_east,
+            self.launch_north,
+            19,
+        );
+        self.terrain_count = (m.verts.len() as u64).min(TERRAIN_CAP) as u32;
+        self.terrain_verts = m.verts;
+    }
+
+    /// Per-frame dynamic rocket-view geometry, camera-relative (floating origin):
+    /// the pad + mount, the rocket at its current pose, and any tumbling spent
+    /// booster. The full planet terrain lives in its own (rebuilt-on-move) buffer.
     fn build_dynamic_mesh(&self) -> Vec<rocket::MeshVertex> {
         let rb = &self.rocket_body;
         let mut out: Vec<rocket::MeshVertex> = Vec::new();
 
+        // static pad + mount (camera-relative)
+        for v in &self.pad_mesh.verts {
+            let local = Vec3::from(v.pos).as_dvec3();
+            out.push(rocket::MeshVertex {
+                pos: self.rel(local).into(),
+                normal: v.normal,
+                color: v.color,
+            });
+        }
+
         // current rocket pose (resting on the pad when not launched)
-        let (base_local, quat, on_booster, thrust_frac, met) = match self.launch.as_ref() {
+        let (base_local, quat, on_booster) = match self.launch.as_ref() {
             Some(rk) => {
-                let base = self.to_local(rk.r);
+                let base = self.to_local_d(rk.r);
                 let q = Quat::from_rotation_arc(Vec3::Y, self.dir_to_local(rk.point_dir()));
-                let tf = if rk.live_thrust() > 0.0 { rk.throttle as f32 } else { 0.0 };
-                (base, q, rk.stage_base == 0, tf, rk.met as f32)
+                (base, q, rk.stage_base == 0)
             }
-            None => (Vec3::new(0.0, rb.base_y, 0.0), Quat::IDENTITY, true, 0.0, 0.0),
+            None => (DVec3::new(0.0, rb.base_y as f64, 0.0), Quat::IDENTITY, true),
         };
 
         self.xform_into(&mut out, rb.upper.clone(), quat, base_local);
         if on_booster {
             self.xform_into(&mut out, rb.booster.clone(), quat, base_local);
         }
-        let _ = (thrust_frac, met); // exhaust flame + smoke are FX billboards now
 
         // tumbling spent booster
         if let Some(s) = self.sep.as_ref() {
             for v in &rb.mesh.verts[rb.booster.clone()] {
-                let p = s.pos + s.rot * Vec3::from(v.pos);
+                let local = s.pos.as_dvec3() + (s.rot * Vec3::from(v.pos)).as_dvec3();
                 let n = s.rot * Vec3::from(v.normal);
-                out.push(rocket::MeshVertex { pos: p.into(), normal: n.into(), color: v.color });
+                out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: n.into(), color: v.color });
             }
         }
 
@@ -831,10 +933,10 @@ impl World {
         if let Some(rk) = self.launch.as_ref() {
             let tf = if rk.live_thrust() > 0.0 { rk.throttle as f32 } else { 0.0 };
             if tf > 0.0 {
-                let base = self.to_local(rk.r);
                 let down = -self.dir_to_local(rk.point_dir()); // flame opposes thrust
                 let er = self.rocket_body.engine_r * if rk.stage_base == 0 { 1.0 } else { 0.5 };
-                let nozzle = base + down * 1.2;
+                // nozzle, camera-relative (floating origin)
+                let nozzle = self.rel(self.to_local_d(rk.r) + down.as_dvec3() * 1.2);
                 let len = (if rk.stage_base == 0 { 7.0 } else { 3.6 }) * (0.6 + 0.4 * tf);
                 // axis billboard: width axis is perpendicular to the flame and to
                 // the view ray, so the card faces the camera.
@@ -876,7 +978,7 @@ impl World {
             let col = [g, g, g * 1.02, alpha];
             let r = right * size;
             let u = up * size;
-            let c = s.pos;
+            let c = self.rel(s.pos.as_dvec3()); // camera-relative (floating origin)
             let q = [
                 (c - r - u, [0.0f32, 0.0]),
                 (c + r - u, [1.0, 0.0]),
@@ -1098,10 +1200,10 @@ struct Gpu {
     mesh_pipeline: wgpu::RenderPipeline,
     mesh_uniform_buf: wgpu::Buffer,
     mesh_bind_group: wgpu::BindGroup,
-    mesh_vbuf: wgpu::Buffer,
-    mesh_vertex_count: u32,
-    /// Dynamic rocket-view geometry (rocket pose, spent booster), rebuilt every
-    /// frame.
+    /// Full-planet LOD terrain, rebuilt (camera-relative) when the camera moves.
+    terrain_vbuf: wgpu::Buffer,
+    /// Dynamic rocket-view geometry (pad, rocket pose, spent booster), rebuilt
+    /// every frame.
     dyn_vbuf: wgpu::Buffer,
     /// Thruster FX billboards (flame + smoke particles).
     fx_pipeline: wgpu::RenderPipeline,
@@ -1541,19 +1643,14 @@ impl Gpu {
             cache: None,
         });
 
-        // Static rocket-view geometry: the pad + mount and the planet terrain
-        // (same local tangent frame). The rocket itself is dynamic (dyn_vbuf).
-        let mut scene_mesh = rocket::pad_and_mount();
-        scene_mesh.verts.extend(rocket::build_terrain().verts);
-        let mesh_vertex_count = scene_mesh.verts.len() as u32;
-        let mesh_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mesh-vbuf"),
-            size: (scene_mesh.verts.len() * std::mem::size_of::<rocket::MeshVertex>()) as u64,
+        // Full-planet terrain is a dynamic, camera-relative buffer rebuilt as the
+        // camera moves (floating origin); the rocket/pad are in dyn_vbuf.
+        let terrain_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("terrain-vbuf"),
+            size: TERRAIN_CAP * std::mem::size_of::<rocket::MeshVertex>() as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        queue.write_buffer(&mesh_vbuf, 0, bytemuck::cast_slice(&scene_mesh.verts));
-
         let dyn_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("dyn-mesh-vbuf"),
             size: DYN_MESH_CAP * std::mem::size_of::<rocket::MeshVertex>() as u64,
@@ -1572,8 +1669,7 @@ impl Gpu {
             mesh_pipeline,
             mesh_uniform_buf,
             mesh_bind_group,
-            mesh_vbuf,
-            mesh_vertex_count,
+            terrain_vbuf,
             dyn_vbuf,
             fx_pipeline,
             fx_vbuf,
@@ -1588,7 +1684,7 @@ impl Gpu {
     fn prepare(
         &self,
         queue: &wgpu::Queue,
-        world: &World,
+        world: &mut World,
         w: u32,
         h: u32,
         time: f32,
@@ -1602,6 +1698,21 @@ impl Gpu {
                 queue.write_buffer(&self.scene_uniform_buf, 0, bytemuck::bytes_of(&su));
             }
             View::Rocket => {
+                // (Re)build + upload the camera-relative planet terrain on demand.
+                if world.terrain_dirty {
+                    if world.terrain_verts.is_empty() {
+                        world.rebuild_terrain();
+                    }
+                    let tc = world.terrain_count as usize;
+                    if tc > 0 {
+                        queue.write_buffer(
+                            &self.terrain_vbuf,
+                            0,
+                            bytemuck::cast_slice(&world.terrain_verts[..tc]),
+                        );
+                    }
+                    world.terrain_dirty = false;
+                }
                 let mu = world.mesh_uniforms(res);
                 queue.write_buffer(&self.mesh_uniform_buf, 0, bytemuck::bytes_of(&mu));
                 let sk = world.sky_uniforms(res);
@@ -1674,11 +1785,13 @@ impl Gpu {
     }
 
     /// The 3D rocket/pad/terrain mesh (depth-tested). Used in its own pass.
-    fn draw_meshes(&self, pass: &mut wgpu::RenderPass, dyn_count: u32) {
+    fn draw_meshes(&self, pass: &mut wgpu::RenderPass, terrain_count: u32, dyn_count: u32) {
         pass.set_pipeline(&self.mesh_pipeline);
         pass.set_bind_group(0, &self.mesh_bind_group, &[]);
-        pass.set_vertex_buffer(0, self.mesh_vbuf.slice(..));
-        pass.draw(0..self.mesh_vertex_count, 0..1);
+        if terrain_count > 0 {
+            pass.set_vertex_buffer(0, self.terrain_vbuf.slice(..));
+            pass.draw(0..terrain_count, 0..1);
+        }
         if dyn_count > 0 {
             pass.set_vertex_buffer(0, self.dyn_vbuf.slice(..));
             pass.draw(0..dyn_count, 0..1);
@@ -1931,7 +2044,8 @@ impl State {
 
         let (n, hn, dyn_n, fx_n) = self
             .gpu
-            .prepare(&self.queue, &self.world, self.config.width, self.config.height, t);
+            .prepare(&self.queue, &mut self.world, self.config.width, self.config.height, t);
+        let terrain_n = self.world.terrain_count;
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
@@ -1973,7 +2087,7 @@ impl State {
             {
                 let mut pass = mesh_pass(&mut encoder, &view, &depth);
                 self.gpu.draw_sky(&mut pass);
-                self.gpu.draw_meshes(&mut pass, dyn_n);
+                self.gpu.draw_meshes(&mut pass, terrain_n, dyn_n);
                 self.gpu.draw_fx(&mut pass, fx_n);
             }
             {
@@ -2219,7 +2333,7 @@ fn render_shot(
     height: u32,
 ) {
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
-    let (world, time) = setup_world(scenario, width, height);
+    let (mut world, time) = setup_world(scenario, width, height);
 
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("shot-target"),
@@ -2237,7 +2351,8 @@ fn render_shot(
     });
     let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
-    let (n, hn, dyn_n, fx_n) = gpu.prepare(queue, &world, width, height, time);
+    let (n, hn, dyn_n, fx_n) = gpu.prepare(queue, &mut world, width, height, time);
+    let terrain_n = world.terrain_count;
 
     // 256-byte aligned row pitch for the readback copy.
     let unpadded = width * 4;
@@ -2257,7 +2372,7 @@ fn render_shot(
         {
             let mut pass = mesh_pass(&mut encoder, &target_view, &depth);
             gpu.draw_sky(&mut pass);
-            gpu.draw_meshes(&mut pass, dyn_n);
+            gpu.draw_meshes(&mut pass, terrain_n, dyn_n);
             gpu.draw_fx(&mut pass, fx_n);
         }
         {
