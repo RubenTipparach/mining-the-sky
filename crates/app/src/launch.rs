@@ -164,9 +164,10 @@ impl Rocket {
     ) -> DVec3 {
         let rmag = r.length();
         let mut a = -body.mu / (rmag * rmag * rmag) * r;
-        // atmospheric drag (home world only)
-        let v_atm = body.omega() * DVec3::Y.cross(r);
-        let v_rel = v - v_atm;
+        // Atmospheric drag. The launch is flown in a frame co-moving with the
+        // launch site, so the atmosphere is treated as non-rotating (no surface-
+        // wind term) - consistent with igniting at rest over the fixed pad.
+        let v_rel = v;
         let vr = v_rel.length();
         let rho = body.density(rmag - body.radius);
         if vr > 1e-3 {
@@ -207,19 +208,17 @@ impl Rocket {
                 }
             }
 
-            // ground contact at the launch site
+            // ground contact at the launch site (co-moving frame: surface at rest)
             if self.r.length() <= body.radius {
                 let up = self.r.normalize_or_zero();
-                let v_surf = body.omega() * DVec3::Y.cross(self.r);
-                let rel = (self.v - v_surf).length();
+                let rel = self.v.length();
                 self.r = up * body.radius;
                 if self.met > 1.0 && rel > CRASH_SPEED {
                     self.crashed = true;
-                    self.v = v_surf;
+                    self.v = DVec3::ZERO;
                     return;
                 }
-                // sitting on the pad before liftoff: pin to the surface
-                self.v = v_surf;
+                self.v = DVec3::ZERO; // pinned to the pad before liftoff
             }
 
             // orbit achieved once the periapsis clears the atmosphere
@@ -310,14 +309,14 @@ mod tests {
     use super::*;
     use sim::orbit::orbit_from_state;
 
-    /// Build a Pioneer on the equator at lon 0, heading east.
+    /// Build a Pioneer on the equator at lon 0, heading east, at rest (the
+    /// co-moving launch frame).
     fn pad_rocket(body: &CentralBody) -> Rocket {
         let veh = Vehicle::pioneer();
         let up = DVec3::new(1.0, 0.0, 0.0);
         let r = up * body.radius;
-        let v = body.omega() * DVec3::Y.cross(r); // surface velocity
         let heading = DVec3::Y.cross(up).normalize(); // east
-        Rocket::on_pad(&veh, r, v, up, heading)
+        Rocket::on_pad(&veh, r, DVec3::ZERO, up, heading)
     }
 
     #[test]

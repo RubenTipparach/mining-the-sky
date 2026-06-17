@@ -225,27 +225,6 @@ pub fn rocket_body() -> RocketBody {
     }
 }
 
-/// Append an exhaust plume below the base (mesh-local: a bright flickering cone
-/// hanging from y=0 down to -length), so it follows the rocket's pose transform.
-pub fn append_plume(m: &mut Mesh, engine_r: f32, length: f32, t: f32) {
-    if length <= 0.1 {
-        return;
-    }
-    let flick = 0.85 + 0.15 * (t * 37.0).sin();
-    let len = length * flick;
-    let core = [1.0, 0.95, 0.75];
-    let outer = [1.0, 0.55, 0.18];
-    // bright inner core
-    m.frustum(0.0, 0.0, -len * 0.55, 0.2, 0.15, engine_r * 1.05, 14, core, true, false);
-    // translucent-looking orange flare (opaque, just darker/redder)
-    m.frustum(0.0, 0.0, -len, 0.1, 0.05, engine_r * 1.5, 14, outer, true, false);
-}
-
-/// Append a smoke puff (a shaded cube), used for the pad/launch effects.
-pub fn append_puff(m: &mut Mesh, center: Vec3, size: f32, col: [f32; 3]) {
-    m.bx(center, Vec3::splat(size * 0.5), col);
-}
-
 // ---------------------------------------------------------------------------
 // Real planet terrain in the rocket view.
 //

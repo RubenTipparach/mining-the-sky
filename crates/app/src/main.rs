@@ -117,9 +117,21 @@ struct OverlayVertex {
     color: [f32; 3],
 }
 
+/// Thruster-FX billboard vertex (flame + smoke), drawn by the `fx` pipeline.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct FxVertex {
+    pos: [f32; 3],
+    uv: [f32; 2],
+    color: [f32; 4],
+    kind: f32, // 0 = flame (additive), 1 = smoke (premultiplied over)
+}
+
 const OVERLAY_CAP: u64 = 8192;
 const HUD_CAP: u64 = 40000;
-/// Dynamic rocket-view geometry (rocket + plume + smoke + spent booster).
+/// Thruster-FX billboards (flame + smoke particles).
+const FX_CAP: u64 = 60000;
+/// Dynamic rocket-view geometry (rocket + spent booster).
 const DYN_MESH_CAP: u64 = 40000;
 
 /// Render-space length unit for the system view: 1000 km.
@@ -211,6 +223,17 @@ struct SepBooster {
     age: f32,
 }
 
+/// One exhaust smoke puff, advected in the rocket-view local frame. Emitted at
+/// the nozzle and left behind as the rocket flies on, so it trails and fades.
+struct Smoke {
+    pos: Vec3,
+    vel: Vec3,
+    age: f32,
+    life: f32,
+    size0: f32,
+    seed: f32,
+}
+
 struct World {
     mission: Mission,
     body: CentralBody,
@@ -224,6 +247,9 @@ struct World {
     launch: Option<launch::Rocket>,
     rocket_body: rocket::RocketBody,
     sep: Option<SepBooster>,
+    smoke: Vec<Smoke>,
+    smoke_accum: f32, // fractional particle spawn carry
+    anim: f32,        // FX animation clock (seconds)
     // launch-site tangent frame (home-centred metres): origin + up/east/north.
     launch_origin: DVec3,
     launch_up: DVec3,
@@ -291,6 +317,9 @@ impl World {
             launch: None,
             rocket_body,
             sep: None,
+            smoke: Vec::new(),
+            smoke_accum: 0.0,
+            anim: 0.0,
             launch_origin,
             launch_up,
             launch_east,
@@ -445,7 +474,7 @@ impl World {
         MeshUniforms {
             viewproj: vp.to_cols_array_2d(),
             sun: [0.40, 0.72, 0.55, 0.0],
-            params: [fcoef, 0.0, 0.0, 0.0],
+            params: [fcoef, self.anim, 0.0, 0.0],
             fog: [HORIZON[0], HORIZON[1], HORIZON[2], 1.0 / 42_000.0],
         }
     }
@@ -581,7 +610,86 @@ impl World {
             let dt = (frame_dt * self.warp).min(2.0);
             rk.integrate(&self.body, dt as f64);
         }
+        let fx_dt = (frame_dt * self.warp).min(0.5);
+        self.anim += fx_dt;
         self.advance_sep(frame_dt * self.warp.min(8.0));
+        self.advance_smoke(fx_dt);
+    }
+
+    /// Emit + advect exhaust smoke particles in the local frame.
+    fn advance_smoke(&mut self, dt: f32) {
+        if dt <= 0.0 {
+            return;
+        }
+        // advect + age existing puffs (light buoyancy, gentle drag)
+        for s in self.smoke.iter_mut() {
+            s.age += dt;
+            s.vel *= 1.0 - (1.5 * dt).min(0.9);
+            s.vel.y += 1.2 * dt; // buoyant rise
+            s.pos += s.vel * dt;
+        }
+        self.smoke.retain(|s| s.age < s.life);
+
+        // emit at the nozzle while the active stage is burning
+        let Some(rk) = self.launch.as_ref() else {
+            self.smoke.clear();
+            return;
+        };
+        let thrust_frac = if rk.live_thrust() > 0.0 { rk.throttle as f32 } else { 0.0 };
+        if thrust_frac <= 0.0 {
+            return;
+        }
+        let alt = rk.altitude(&self.body);
+        // air density fraction: lots of smoke low down, little in the thin upper
+        // atmosphere, none in vacuum (the flame remains regardless).
+        let dens = (-(alt / 9000.0)).exp().clamp(0.0, 1.0) as f32;
+        let on_pad = alt < 30.0;
+        let base = self.to_local(rk.r);
+        let down = -self.dir_to_local(rk.point_dir()); // exhaust direction
+        let nozzle = base + down * 1.5;
+        let er = self.rocket_body.engine_r * if rk.stage_base == 0 { 1.0 } else { 0.45 };
+
+        // spawn rate: heavy at the pad (the ground billow), thinning with density.
+        let rate = thrust_frac * (8.0 + 120.0 * dens) * if on_pad { 2.5 } else { 1.0 };
+        self.smoke_accum += rate * dt;
+        let n = self.smoke_accum.floor() as i32;
+        self.smoke_accum -= n as f32;
+        let mut seed = (self.anim * 977.0).to_bits();
+        let mut rnd = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32
+        };
+        let ground = Vec3::new(base.x, rocket::PAD_TOP, base.z);
+        for _ in 0..n.min(40) {
+            let jit = Vec3::new(rnd() - 0.5, rnd() - 0.5, rnd() - 0.5);
+            if on_pad {
+                // exhaust deflects off the pad: billow outward + up from the ground
+                let a = rnd() * std::f32::consts::TAU;
+                let out = Vec3::new(a.cos(), 0.12, a.sin());
+                self.smoke.push(Smoke {
+                    pos: ground + Vec3::new(jit.x, jit.y.abs() * 0.5, jit.z) * 3.0,
+                    vel: out * (9.0 + rnd() * 12.0) + Vec3::Y * (2.0 + rnd() * 3.0),
+                    age: 0.0,
+                    life: 2.4 + rnd() * 1.8,
+                    size0: 3.0 + rnd() * 2.5,
+                    seed: rnd(),
+                });
+            } else {
+                self.smoke.push(Smoke {
+                    pos: nozzle + jit * (er * 0.8),
+                    vel: down * (6.0 + rnd() * 6.0) + jit * 3.0,
+                    age: 0.0,
+                    life: 1.1 + rnd() * 1.2,
+                    size0: er * (0.8 + rnd() * 0.7),
+                    seed: rnd(),
+                });
+            }
+        }
+        // keep the particle count bounded
+        if self.smoke.len() > 900 {
+            let drop = self.smoke.len() - 900;
+            self.smoke.drain(0..drop);
+        }
     }
 
     /// World->local point in the rocket-view tangent frame (metres).
@@ -609,11 +717,16 @@ impl World {
         let veh = sim::vehicle::Vehicle::pioneer();
         // base of the rocket sits `base_y` above the pad surface, on the mount.
         let r = self.launch_origin + self.launch_up * self.rocket_body.base_y as f64;
-        let v = self.body.omega() * DVec3::Y.cross(r); // surface (eastward) velocity
+        // Co-moving launch frame: ignite at rest relative to the (fixed) pad and
+        // terrain. We drop the planet's surface-rotation boost so the rocket
+        // doesn't drift sideways out of the local scene; the player flies the
+        // gravity turn from a standstill.
+        let v = DVec3::ZERO;
         let mut rk = launch::Rocket::on_pad(&veh, r, v, self.launch_up, self.launch_east);
         rk.throttle = 1.0;
         self.launch = Some(rk);
         self.sep = None;
+        self.smoke.clear();
         log::info!("Ignition: Pioneer I - throttle up, pitch over, stage when dry");
     }
 
@@ -654,6 +767,7 @@ impl World {
     fn reset_launch(&mut self) {
         self.launch = None;
         self.sep = None;
+        self.smoke.clear();
     }
 
     /// Transform a vertex range of the rocket body by `q`/`t` into `out`.
@@ -693,50 +807,7 @@ impl World {
         if on_booster {
             self.xform_into(&mut out, rb.booster.clone(), quat, base_local);
         }
-
-        // exhaust plume (built mesh-local, carried by the same pose). Scale it to
-        // the active stage so the small upper engine doesn't get a booster plume.
-        if thrust_frac > 0.0 {
-            let mut pm = rocket::Mesh::default();
-            let (er, len) = if on_booster {
-                (rb.engine_r, 6.0 + 16.0 * thrust_frac)
-            } else {
-                (rb.engine_r * 0.45, 3.0 + 7.0 * thrust_frac)
-            };
-            rocket::append_plume(&mut pm, er, len, met);
-            for v in &pm.verts {
-                let p = base_local + quat * Vec3::from(v.pos);
-                let n = quat * Vec3::from(v.normal);
-                out.push(rocket::MeshVertex { pos: p.into(), normal: n.into(), color: v.color });
-            }
-        }
-
-        // launch smoke: a billowing ground cloud the exhaust kicks up, anchored
-        // under the rocket's ground track so it stays near the action and rises
-        // and spreads over the first few seconds.
-        if let Some(rk) = self.launch.as_ref() {
-            if rk.met < 7.0 {
-                let met = rk.met as f32;
-                let ground = Vec3::new(base_local.x, 0.0, base_local.z);
-                let mut sm = rocket::Mesh::default();
-                let puffs = 26;
-                for k in 0..puffs {
-                    let a = k as f32 / puffs as f32 * std::f32::consts::TAU * 2.3 + met * 0.4;
-                    let ring = ((k * 5) % 7) as f32 / 7.0;
-                    let spread = 4.0 + met * 6.0 * (0.4 + ring);
-                    let rise = 0.5 + met * 2.2 + (k % 4) as f32 * 1.0;
-                    let size = 4.0 + met * 2.0 + ((k * 7) % 5) as f32 * 1.2;
-                    let g = (0.92 - met * 0.07).max(0.45) - 0.07 * ((k % 3) as f32);
-                    rocket::append_puff(
-                        &mut sm,
-                        ground + Vec3::new(a.cos() * spread, rocket::PAD_TOP + rise, a.sin() * spread),
-                        size,
-                        [g, g, g * 1.02],
-                    );
-                }
-                out.extend(sm.verts);
-            }
-        }
+        let _ = (thrust_frac, met); // exhaust flame + smoke are FX billboards now
 
         // tumbling spent booster
         if let Some(s) = self.sep.as_ref() {
@@ -747,6 +818,75 @@ impl World {
             }
         }
 
+        out
+    }
+
+    /// Thruster FX billboards for the rocket view: an emissive flame at the
+    /// active nozzle (axis-aligned cards facing the camera) and the smoke-
+    /// particle trail (camera-facing puffs). `right`/`up` are the camera basis.
+    fn build_fx(&self, eye: Vec3, right: Vec3, up: Vec3) -> Vec<FxVertex> {
+        let mut out: Vec<FxVertex> = Vec::new();
+
+        // ---- exhaust flame at the active nozzle ----
+        if let Some(rk) = self.launch.as_ref() {
+            let tf = if rk.live_thrust() > 0.0 { rk.throttle as f32 } else { 0.0 };
+            if tf > 0.0 {
+                let base = self.to_local(rk.r);
+                let down = -self.dir_to_local(rk.point_dir()); // flame opposes thrust
+                let er = self.rocket_body.engine_r * if rk.stage_base == 0 { 1.0 } else { 0.5 };
+                let nozzle = base + down * 1.2;
+                let len = (if rk.stage_base == 0 { 7.0 } else { 3.6 }) * (0.6 + 0.4 * tf);
+                // axis billboard: width axis is perpendicular to the flame and to
+                // the view ray, so the card faces the camera.
+                let view = (nozzle - eye).normalize_or_zero();
+                let mut w_axis = down.cross(view).normalize_or_zero();
+                if w_axis.length_squared() < 1e-4 {
+                    w_axis = right;
+                }
+                let mut card = |length: f32, half_w: f32, seed: f32, inten: f32| {
+                    let tip = nozzle + down * length;
+                    let wn = w_axis * half_w;
+                    let wt = w_axis * (half_w * 0.22);
+                    let col = [seed, inten, 0.0, 0.0];
+                    let q = [
+                        (nozzle - wn, [0.0f32, 0.0]),
+                        (nozzle + wn, [1.0, 0.0]),
+                        (tip + wt, [1.0, 1.0]),
+                        (tip - wt, [0.0, 1.0]),
+                    ];
+                    for &i in &[0usize, 1, 2, 0, 2, 3] {
+                        out.push(FxVertex { pos: q[i].0.into(), uv: q[i].1, color: col, kind: 0.0 });
+                    }
+                };
+                card(len, er * 1.35, 0.10, tf); // orange body
+                card(len * 0.55, er * 0.7, 0.63, tf * 1.3); // white-hot core
+            }
+        }
+
+        // ---- smoke-particle trail (camera-facing billboards) ----
+        for s in &self.smoke {
+            let t = (s.age / s.life).clamp(0.0, 1.0);
+            let size = s.size0 * (1.0 + t * 3.0);
+            let fade_in = (s.age / 0.15).clamp(0.0, 1.0);
+            let alpha = fade_in * (1.0 - t) * 0.5;
+            if alpha <= 0.01 {
+                continue;
+            }
+            let g = 0.85 - 0.4 * t; // cools/darkens with age
+            let col = [g, g, g * 1.02, alpha];
+            let r = right * size;
+            let u = up * size;
+            let c = s.pos;
+            let q = [
+                (c - r - u, [0.0f32, 0.0]),
+                (c + r - u, [1.0, 0.0]),
+                (c + r + u, [1.0, 1.0]),
+                (c - r + u, [0.0, 1.0]),
+            ];
+            for &i in &[0usize, 1, 2, 0, 2, 3] {
+                out.push(FxVertex { pos: q[i].0.into(), uv: q[i].1, color: col, kind: 1.0 });
+            }
+        }
         out
     }
 
@@ -960,9 +1100,12 @@ struct Gpu {
     mesh_bind_group: wgpu::BindGroup,
     mesh_vbuf: wgpu::Buffer,
     mesh_vertex_count: u32,
-    /// Dynamic rocket-view geometry (rocket pose, plume, smoke, spent booster),
-    /// rebuilt every frame.
+    /// Dynamic rocket-view geometry (rocket pose, spent booster), rebuilt every
+    /// frame.
     dyn_vbuf: wgpu::Buffer,
+    /// Thruster FX billboards (flame + smoke particles).
+    fx_pipeline: wgpu::RenderPipeline,
+    fx_vbuf: wgpu::Buffer,
     sky_pipeline: wgpu::RenderPipeline,
     sky_uniform_buf: wgpu::Buffer,
     sky_bind_group: wgpu::BindGroup,
@@ -1264,6 +1407,73 @@ impl Gpu {
             multiview_mask: None,
             cache: None,
         });
+
+        // Thruster-FX pipeline: flame + smoke billboards, premultiplied-alpha
+        // blend (additive flame + over smoke in one pass), depth-tested but never
+        // written. Reuses the mesh uniform (viewproj + log depth + time).
+        let fx_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("fx"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("fx.wgsl").into()),
+        });
+        let fx_vbuf_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<FxVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 12, shader_location: 1 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 20, shader_location: 2 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32, offset: 36, shader_location: 3 },
+            ],
+        };
+        let fx_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("fx-pipeline"),
+            layout: Some(&mesh_layout),
+            vertex: wgpu::VertexState {
+                module: &fx_shader,
+                entry_point: Some("vs"),
+                buffers: &[fx_vbuf_layout],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &fx_shader,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let fx_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fx-vbuf"),
+            size: FX_CAP * std::mem::size_of::<FxVertex>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         // Sky pipeline: fullscreen, depth-compatible with the mesh pass but
         // never writes depth, so the terrain draws over it.
         let sky_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1365,6 +1575,8 @@ impl Gpu {
             mesh_vbuf,
             mesh_vertex_count,
             dyn_vbuf,
+            fx_pipeline,
+            fx_vbuf,
             sky_pipeline,
             sky_uniform_buf,
             sky_bind_group,
@@ -1380,9 +1592,10 @@ impl Gpu {
         w: u32,
         h: u32,
         time: f32,
-    ) -> (usize, usize, u32) {
+    ) -> (usize, usize, u32, u32) {
         let res = [w as f32, h.max(1) as f32];
         let mut dyn_n = 0u32;
+        let mut fx_n = 0u32;
         match world.view {
             View::Map => {
                 let su = world.scene_uniforms(res, time);
@@ -1402,6 +1615,12 @@ impl Gpu {
                         bytemuck::cast_slice(&dyn_verts[..dyn_n as usize]),
                     );
                 }
+                let (eye, _t, right, up, _f, _tan) = world.rocket_camera(res[0] / res[1].max(1.0));
+                let fx_verts = world.build_fx(eye, right, up);
+                fx_n = (fx_verts.len() as u64).min(FX_CAP) as u32;
+                if fx_n > 0 {
+                    queue.write_buffer(&self.fx_vbuf, 0, bytemuck::cast_slice(&fx_verts[..fx_n as usize]));
+                }
             }
         }
 
@@ -1416,7 +1635,17 @@ impl Gpu {
         if hn > 0 {
             queue.write_buffer(&self.hud_buf, 0, bytemuck::cast_slice(&hud_verts[..hn]));
         }
-        (n, hn, dyn_n)
+        (n, hn, dyn_n, fx_n)
+    }
+
+    /// Draw the thruster FX billboards (flame + smoke), in the mesh pass.
+    fn draw_fx(&self, pass: &mut wgpu::RenderPass, fx_count: u32) {
+        if fx_count > 0 {
+            pass.set_pipeline(&self.fx_pipeline);
+            pass.set_bind_group(0, &self.mesh_bind_group, &[]);
+            pass.set_vertex_buffer(0, self.fx_vbuf.slice(..));
+            pass.draw(0..fx_count, 0..1);
+        }
     }
 
     /// Map view: fullscreen multi-body raymarch + 2D overlay/HUD. The rocket
@@ -1700,7 +1929,7 @@ impl State {
         self.last_t = t;
         self.world.advance(frame_dt);
 
-        let (n, hn, dyn_n) = self
+        let (n, hn, dyn_n, fx_n) = self
             .gpu
             .prepare(&self.queue, &self.world, self.config.width, self.config.height, t);
 
@@ -1745,6 +1974,7 @@ impl State {
                 let mut pass = mesh_pass(&mut encoder, &view, &depth);
                 self.gpu.draw_sky(&mut pass);
                 self.gpu.draw_meshes(&mut pass, dyn_n);
+                self.gpu.draw_fx(&mut pass, fx_n);
             }
             {
                 let mut pass = overlay_pass(&mut encoder, &view);
@@ -1881,7 +2111,7 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.rocket_el = 0.16;
             world.rocket_dist = 110.0;
             world.ignite_launch();
-            fly(&mut world, 55.0); // pitched into the gravity turn, climbing
+            fly(&mut world, 22.0); // pitched into the gravity turn, smoke trailing
             0.0
         }
         "staging" => {
@@ -2007,7 +2237,7 @@ fn render_shot(
     });
     let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
-    let (n, hn, dyn_n) = gpu.prepare(queue, &world, width, height, time);
+    let (n, hn, dyn_n, fx_n) = gpu.prepare(queue, &world, width, height, time);
 
     // 256-byte aligned row pitch for the readback copy.
     let unpadded = width * 4;
@@ -2028,6 +2258,7 @@ fn render_shot(
             let mut pass = mesh_pass(&mut encoder, &target_view, &depth);
             gpu.draw_sky(&mut pass);
             gpu.draw_meshes(&mut pass, dyn_n);
+            gpu.draw_fx(&mut pass, fx_n);
         }
         {
             let mut pass = overlay_pass(&mut encoder, &target_view);
