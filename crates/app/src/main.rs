@@ -22,6 +22,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+mod bot;
 mod build;
 mod flight;
 mod launch;
@@ -356,6 +357,8 @@ struct World {
     mission: Mission,
     body: CentralBody,
     flight: Option<Craft>,
+    /// When engaged, the autonomous moon-landing bot flies `flight` for you.
+    moonbot: Option<bot::MoonBot>,
     /// Planned burn node for the craft (the maneuver planner).
     node: Option<ManeuverNode>,
     launched: bool,
@@ -385,6 +388,9 @@ struct World {
     lander_alt: f32,
     /// Fire the lander's descent engine (plume under the bell).
     lander_firing: bool,
+    /// RCS attitude-thruster activity (0 = idle, 1 = full puff). Drives the
+    /// blue-white RCS jets around the lander's upper body.
+    lander_rcs: f32,
     /// Grabbable parts on the rack (for in-viewport 3D drag-assembly).
     rack_slots: Vec<RackSlot>,
     /// The part currently being dragged from the rack, if any.
@@ -474,6 +480,7 @@ impl World {
             mission,
             body,
             flight: None,
+            moonbot: None,
             node: None,
             vab,
             vab_mode: true,
@@ -489,6 +496,7 @@ impl World {
             lunar: false,
             lander_alt: 0.0,
             lander_firing: false,
+            lander_rcs: 0.0,
             rack_slots,
             grab: None,
             grab_target: None,
@@ -821,11 +829,21 @@ impl World {
         self.sys_focus = self.focus_pos();
 
         let bodies = self.grav_bodies();
-        if let Some(craft) = self.flight.as_mut() {
-            let dt_sim = frame_dt * self.warp.min(8.0);
-            craft.integrate(&self.body, &bodies, dt_sim as f64);
-        } else if self.launched {
-            self.clock += frame_dt * self.warp;
+        let dt_sim = (frame_dt * self.warp.min(8.0)) as f64;
+        match (self.flight.as_mut(), self.moonbot.as_mut()) {
+            (Some(craft), maybe_bot) => {
+                // when the bot is engaged it sets the controls a human would
+                // (attitude target + throttle), flying relative to the moon.
+                if let Some(b) = maybe_bot {
+                    b.control(craft, &bodies[0]);
+                }
+                craft.integrate(&self.body, &bodies, dt_sim);
+            }
+            (None, _) => {
+                if self.launched {
+                    self.clock += frame_dt * self.warp;
+                }
+            }
         }
 
         // roll the assembled rocket out of the hangar across the flats to the pad
@@ -1465,6 +1483,51 @@ impl World {
             card(4.0, 0.7, 0.70, 1.2);
         }
 
+        // ---- RCS attitude jets around the lander's upper body ----
+        if self.show_lander && self.lander_rcs > 0.01 {
+            // four thruster clusters at the corners of the descent stage, each
+            // firing a short blue-white jet outward (lateral attitude control).
+            let inten = self.lander_rcs.clamp(0.0, 1.0);
+            let y = self.lander_alt as f64 + 3.6; // upper body
+            let br = 2.3f64;
+            for k in 0..4 {
+                let a = (k as f64 + 0.5) * std::f64::consts::FRAC_PI_2;
+                let (cx, cz) = (a.cos(), a.sin());
+                // pulse opposite pairs so it reads as a control couple, not a flare
+                let pulse = if k % 2 == 0 {
+                    0.55 + 0.45 * (self.anim * 30.0).sin()
+                } else {
+                    0.55 + 0.45 * (self.anim * 30.0 + 3.14).sin()
+                };
+                let amp = (inten * pulse as f32).clamp(0.0, 1.0);
+                if amp < 0.05 {
+                    continue;
+                }
+                let nz_local = DVec3::new(cx * br, y, cz * br);
+                let nozzle = self.rel(nz_local);
+                let dir = Vec3::new(cx as f32, 0.0, cz as f32); // outward
+                let view = (nozzle - eye).normalize_or_zero();
+                let mut w_axis = dir.cross(view).normalize_or_zero();
+                if w_axis.length_squared() < 1e-4 {
+                    w_axis = up;
+                }
+                let len = 2.6f32 * (0.6 + 0.4 * amp);
+                let tip = nozzle + dir * len;
+                let wn = w_axis * 0.42;
+                let wt = w_axis * 0.07;
+                let col = [0.2f32, amp, 0.0, 0.0];
+                let q = [
+                    (nozzle - wn, [0.0f32, 0.0]),
+                    (nozzle + wn, [1.0, 0.0]),
+                    (tip + wt, [1.0, 1.0]),
+                    (tip - wt, [0.0, 1.0]),
+                ];
+                for &i in &[0usize, 1, 2, 0, 2, 3] {
+                    out.push(FxVertex { pos: q[i].0.into(), uv: q[i].1, color: col, kind: 2.0 });
+                }
+            }
+        }
+
         // ---- smoke-particle trail (camera-facing billboards) ----
         for s in &self.smoke {
             let t = (s.age / s.life).clamp(0.0, 1.0);
@@ -1525,6 +1588,23 @@ impl World {
         };
         self.flight = Some(Craft::maneuvering(r, v));
         log::info!("Manual flight control engaged");
+    }
+
+    /// Hand the active flight craft to the autonomous moon-landing bot (or take
+    /// back manual control). Engages a craft first if none is flying.
+    fn toggle_moonbot(&mut self) {
+        if self.moonbot.is_some() {
+            self.moonbot = None;
+            log::info!("Moon bot disengaged - you have control");
+            return;
+        }
+        if self.flight.is_none() {
+            self.toggle_flight();
+        }
+        if self.flight.is_some() {
+            self.moonbot = Some(bot::MoonBot::new());
+            log::info!("Moon bot engaged - flying to the surface");
+        }
     }
 
     /// World position (unit-sphere) + colour of the map craft/rocket marker.
@@ -3117,10 +3197,66 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.show_lander = true;
             world.lander_alt = 18.0;
             world.lander_firing = true;
+            world.lander_rcs = 0.9; // attitude jets trimming the descent
             world.rocket_az = 5.4;
             world.rocket_el = 0.10;
             world.rocket_dist = 38.0;
             world.rocket_focus_y = 10.0;
+            0.0
+        }
+        "rcsdemo" => {
+            // close-up of the RCS attitude jets firing around the lander's upper
+            // body (the blue-white cold-gas puffs), on the lunar surface.
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.lunar = true;
+            world.show_lander = true;
+            world.lander_alt = 0.0;
+            world.lander_firing = false;
+            world.lander_rcs = 1.0;
+            world.rocket_az = 5.5;
+            world.rocket_el = 0.22;
+            world.rocket_dist = 13.0;
+            world.rocket_focus_y = 4.0;
+            0.0
+        }
+        "botland" => {
+            // the autonomous moon-landing bot, flown from low lunar orbit down
+            // to the surface, shown at a mid-descent instant with its descent
+            // engine + RCS attitude jets firing. The lander's height comes from
+            // the bot's actual moon-relative altitude.
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.lunar = true;
+            world.show_lander = true;
+            // fly the bot until it is on short final, then read its altitude.
+            let moon = world.grav_bodies()[0];
+            let r0 = moon.center + DVec3::X * (moon.radius + 30_000.0);
+            let vc = (moon.mu / (moon.radius + 30_000.0)).sqrt();
+            let mut craft = Craft::maneuvering(r0, DVec3::Z * vc);
+            let mut moonbot = bot::MoonBot::new();
+            // step until the bot is low (short final), capped so the shot is reproducible
+            let dt = 0.1;
+            for _ in 0..20_000 {
+                moonbot.control(&mut craft, &moon);
+                craft.integrate(&world.body, std::slice::from_ref(&moon), dt);
+                if bot::MoonBot::altitude(&craft, &moon) < 30.0 || craft.landed || craft.crashed {
+                    break;
+                }
+            }
+            let alt = bot::MoonBot::altitude(&craft, &moon).max(0.0) as f32;
+            world.lander_alt = alt;
+            world.lander_firing = craft.throttle > 0.02;
+            // RCS activity from the bot's actual attitude-control torque (floored
+            // so the short still clearly shows the jets).
+            let rcs_act = (craft.torque_report.rcs.length() / 1500.0) as f32;
+            world.lander_rcs = rcs_act.clamp(0.4, 1.0);
+            world.rocket_az = 5.4;
+            world.rocket_el = 0.12;
+            world.rocket_dist = 40.0;
+            world.rocket_focus_y = (alt * 0.5 + 4.0).min(20.0);
             0.0
         }
         "m6_landed" => {
@@ -3539,6 +3675,7 @@ impl ApplicationHandler<UserEvent> for App {
                             state.world.cycle_focus()
                         }
                         KeyCode::KeyF => state.world.toggle_flight(),
+                        KeyCode::KeyB => state.world.toggle_moonbot(),
                         KeyCode::Space => {
                             if state.world.view == View::Rocket {
                                 if state.world.vab_mode {
@@ -3652,6 +3789,10 @@ fn main() {
                 "m5_descent"
             } else if args.iter().any(|a| a == "m6_landed") {
                 "m6_landed"
+            } else if args.iter().any(|a| a == "botland") {
+                "botland"
+            } else if args.iter().any(|a| a == "rcsdemo") {
+                "rcsdemo"
             } else if args.iter().any(|a| a == "moons") {
                 "moons"
             } else if args.iter().any(|a| a == "moon") {
@@ -3707,6 +3848,8 @@ fn main() {
                 "m5_approach" => "out/m5_approach.png",
                 "m5_descent" => "out/m5_descent.png",
                 "m6_landed" => "out/m6_landed.png",
+                "botland" => "out/botland.png",
+                "rcsdemo" => "out/rcsdemo.png",
                 "moons" => "out/moons.png",
                 "moon" => "out/moon.png",
                 "rocket" => "out/rocket.png",

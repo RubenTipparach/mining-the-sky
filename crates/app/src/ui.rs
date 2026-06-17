@@ -625,12 +625,14 @@ fn flight_panel(ctx: &egui::Context, world: &mut World) {
         craft.rcs_frac() * 100.0,
     );
     let warp = world.warp;
+    let bot_phase = world.moonbot.as_ref().map(|b| b.phase.label());
 
     #[derive(PartialEq)]
     enum Act {
         Thr(f64),
         Mode(Mode),
         Release,
+        ToggleBot,
     }
     let mut act: Option<Act> = None;
     let mut warp_mul = 1.0f32;
@@ -695,6 +697,24 @@ fn flight_panel(ctx: &egui::Context, world: &mut World) {
                 act = Some(Act::Mode(Mode::Free));
             }
             ui.separator();
+            // moon-landing bot status / engage
+            match bot_phase {
+                Some(p) => {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("MOON BOT").color(GOOD));
+                        ui.label(egui::RichText::new(p).strong().color(AMBER));
+                    });
+                    if ui.button("Take control (B)").clicked() {
+                        act = Some(Act::ToggleBot);
+                    }
+                }
+                None => {
+                    if ui.button("Engage moon bot (B)").clicked() {
+                        act = Some(Act::ToggleBot);
+                    }
+                }
+            }
+            ui.separator();
             time_controls(ui, warp, &mut warp_mul);
             if ui.button("Release control (F)").clicked() {
                 act = Some(Act::Release);
@@ -704,6 +724,7 @@ fn flight_panel(ctx: &egui::Context, world: &mut World) {
     world.warp = (world.warp * warp_mul).clamp(1.0, 10000.0);
     match act {
         Some(Act::Release) => world.toggle_flight(),
+        Some(Act::ToggleBot) => world.toggle_moonbot(),
         Some(Act::Thr(d)) => {
             if let Some(c) = world.flight.as_mut() {
                 c.throttle = (c.throttle + d).clamp(0.0, 1.0);

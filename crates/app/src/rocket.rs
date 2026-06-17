@@ -176,8 +176,14 @@ pub fn lander() -> Mesh {
     // ascent cabin on top + hatch
     m.frustum(0.0, 0.0, y1, y1 + 1.5, 1.5, 1.2, 8, gray, false, true);
     m.frustum(0.0, 0.0, y1 + 1.5, y1 + 1.9, 0.7, 0.55, 10, dark, false, true);
-    // an RCS pod / antenna nub
-    m.frustum(br * 0.7, 0.0, y1 - 0.2, y1 + 0.3, 0.18, 0.12, 8, dark, true, true);
+    // four RCS thruster pods at the corners of the descent stage (the FX jets
+    // fire from here at radius ~br, y ~ 3.6)
+    for k in 0..4 {
+        let a = (k as f32 + 0.5) * std::f32::consts::FRAC_PI_2;
+        let (cx, cz) = (a.cos(), a.sin());
+        let bx = Vec3::new(cx * br * 0.96, 3.6, cz * br * 0.96);
+        m.bx(bx, Vec3::new(0.28, 0.34, 0.28), dark);
+    }
     m
 }
 

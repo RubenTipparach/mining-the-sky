@@ -75,13 +75,25 @@ fn fs(in: VsOut) -> FsOut {
         let core = pow(max(across, 0.0), 5.0) * (1.0 - along);
         let rgb = mix(body, vec3<f32>(1.3, 1.25, 1.1), core);
         out.color = vec4<f32>(rgb * a * intensity * 1.7, 0.0); // additive
-    } else {
+    } else if (in.kind < 1.5) {
         // ---- smoke ----  soft round puff, premultiplied over
         let r = length(in.uv * 2.0 - 1.0);
         let n = 0.8 + 0.2 * hash(floor(in.uv * 7.0) + vec2<f32>(in.color.x, 0.0));
         let mask = smoothstep(1.0, 0.1, r) * n;
         let a = in.color.a * mask;
         out.color = vec4<f32>(in.color.rgb * a, a);
+    } else {
+        // ---- RCS jet (kind 2) ----  a short, cool blue-white attitude puff
+        let across = 1.0 - abs(in.uv.x - 0.5) * 2.0;
+        let along = in.uv.y;
+        let seed = in.color.x;
+        let intensity = in.color.y;
+        let fl = 0.7 + 0.3 * sin(t * 80.0 + seed * 6.28 + along * 9.0);
+        var a = pow(max(across, 0.0), 1.4) * (1.0 - along);
+        a = a * a * fl;
+        // cool white core fading to pale blue at the tip
+        let rgb = mix(vec3<f32>(0.85, 0.93, 1.0), vec3<f32>(0.45, 0.6, 1.0), along);
+        out.color = vec4<f32>(rgb * a * intensity * 1.6, 0.0); // additive
     }
     return out;
 }

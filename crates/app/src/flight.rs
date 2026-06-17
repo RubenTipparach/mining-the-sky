@@ -7,7 +7,7 @@
 
 use glam::{DVec3, Vec3};
 use sim::attitude::{
-    allocate, AttitudeController, AttitudeMode, Gimbal, Rcs, ReactionWheels, RigidBody, TorqueReport,
+    allocate, AttitudeController, Gimbal, Rcs, ReactionWheels, RigidBody, TorqueReport,
 };
 use sim::body::CentralBody;
 use sim::orbit::orbit_from_state;
@@ -31,6 +31,10 @@ pub struct Craft {
     pub isp: f64,
     pub throttle: f64, // 0..1
     pub mode: Mode,
+    /// Optional explicit world-direction the autopilot should point at,
+    /// overriding `mode` (used by the moon-landing bot for moon-relative
+    /// pointing). `None` falls back to the mode.
+    pub hold_dir: Option<DVec3>,
     pub landed: bool,
     pub crashed: bool,
     /// Which body the craft last touched ("HOME" / "MOON" / "").
@@ -77,6 +81,7 @@ impl Craft {
             isp: 320.0,
             throttle: 0.0,
             mode: Mode::Prograde,
+            hold_dir: None,
             landed: false,
             crashed: false,
             landed_on: "",
@@ -113,9 +118,13 @@ impl Craft {
         self.rb.nose()
     }
 
-    /// The world direction the autopilot is currently trying to point at.
+    /// The world direction the autopilot is currently trying to point at: an
+    /// explicit `hold_dir` if set, otherwise the current orbital mode.
     pub fn target_dir(&self) -> Option<DVec3> {
-        sim::attitude::target_dir(self.mode, self.r, self.v)
+        self.hold_dir
+            .map(|d| d.normalize_or_zero())
+            .filter(|d| *d != DVec3::ZERO)
+            .or_else(|| sim::attitude::target_dir(self.mode, self.r, self.v))
     }
 
     /// Pointing error of the nose from the commanded attitude (degrees).
@@ -139,15 +148,10 @@ impl Craft {
         self.rcs.prop_frac()
     }
 
-    /// Nose direction in world coordinates (for rendering the craft's heading).
-    pub fn nose(&self) -> DVec3 {
-        self.rb.nose()
-    }
-
     /// Run one attitude-control step: autopilot -> torque allocation across
     /// gimbal/wheels/RCS -> rigid-body rotation update.
     fn step_attitude(&mut self, thrust_n: f64, dt: f64) {
-        let target = sim::attitude::target_dir(self.mode, self.r, self.v);
+        let target = self.target_dir();
         let cmd = self.ctrl.command_torque(&self.rb, target, dt);
         let (tau, report) = allocate(
             cmd,
