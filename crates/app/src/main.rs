@@ -358,6 +358,9 @@ struct World {
     pad_mesh: rocket::Mesh,
     hangar_mesh: rocket::Mesh,
     rack_mesh: rocket::Mesh,
+    lander_mesh: rocket::Mesh,
+    /// Show the lunar lander standing on the ground (instead of the rocket).
+    show_lander: bool,
     /// Grabbable parts on the rack (for in-viewport 3D drag-assembly).
     rack_slots: Vec<RackSlot>,
     /// The part currently being dragged from the rack, if any.
@@ -456,6 +459,8 @@ impl World {
             pad_mesh: rocket::pad_and_mount(),
             hangar_mesh: rocket::hangar(HANGAR_POS, &HANGAR_LIGHTS.map(|l| l.0)),
             rack_mesh: rack_mesh_init,
+            lander_mesh: rocket::lander(),
+            show_lander: false,
             rack_slots,
             grab: None,
             grab_target: None,
@@ -1279,6 +1284,16 @@ impl World {
                 });
             }
         };
+        // the lunar lander on the surface (preview / landed), instead of the launch stack
+        if self.show_lander {
+            let base = DVec3::new(0.0, 0.0, 0.0);
+            for v in &self.lander_mesh.verts {
+                let local = base + Vec3::from(v.pos).as_dvec3();
+                out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: v.normal, color: v.color });
+            }
+            return out;
+        }
+
         push_static(&mut out, &self.pad_mesh);
         push_static(&mut out, &self.hangar_mesh);
         push_static(&mut out, &self.rack_mesh);
@@ -2686,6 +2701,18 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.rocket_el = 0.12;
             0.0
         }
+        "lander" => {
+            // the 3D lunar descent module standing on the surface
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.show_lander = true;
+            world.rocket_az = 5.4;
+            world.rocket_el = 0.16;
+            world.rocket_dist = 22.0;
+            world.rocket_focus_y = 3.0;
+            0.0
+        }
         "vab" => {
             // inside the assembly building, looking at the rocket (default start)
             world.view = View::Rocket;
@@ -3390,6 +3417,8 @@ fn main() {
                 "system"
             } else if args.iter().any(|a| a == "grabdemo") {
                 "grabdemo"
+            } else if args.iter().any(|a| a == "lander") {
+                "lander"
             } else if args.iter().any(|a| a == "vab") {
                 "vab"
             } else if args.iter().any(|a| a == "rollout") {

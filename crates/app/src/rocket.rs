@@ -105,6 +105,68 @@ impl Mesh {
         }
     }
 
+    /// A square-section strut between two points (for lander legs etc.).
+    fn strut(&mut self, a: Vec3, b: Vec3, r: f32, col: [f32; 3]) {
+        let d = b - a;
+        let len = d.length();
+        if len < 1e-4 {
+            return;
+        }
+        let dir = d / len;
+        let refv = if dir.y.abs() < 0.95 { Vec3::Y } else { Vec3::X };
+        let u = dir.cross(refv).normalize() * r;
+        let v = dir.cross(u.normalize()).normalize() * r;
+        let ca = [a + u + v, a + u - v, a - u - v, a - u + v];
+        let cb = [b + u + v, b + u - v, b - u - v, b - u + v];
+        for i in 0..4 {
+            let j = (i + 1) % 4;
+            let n = (ca[j] - ca[i]).cross(cb[i] - ca[i]).normalize_or_zero();
+            self.quad(ca[i], ca[j], cb[j], cb[i], n, col);
+        }
+        self.quad(ca[0], ca[1], ca[2], ca[3], -dir, col);
+        self.quad(cb[3], cb[2], cb[1], cb[0], dir, col);
+    }
+}
+
+/// A 3D lunar descent module: a gold-foil descent stage with a big engine bell,
+/// four splayed landing legs with footpads, and a small ascent cabin on top.
+/// Built about its footpads at y=0 so it stands on a surface.
+pub fn lander() -> Mesh {
+    let mut m = Mesh::default();
+    let gold = [0.82, 0.66, 0.26];
+    let gray = [0.68, 0.70, 0.74];
+    let dark = [0.13, 0.13, 0.15];
+    let br = 2.2; // descent-stage body radius
+    let y0 = 2.2; // body bottom
+    let y1 = 4.0; // body top
+
+    // descent stage body (octagonal)
+    m.frustum(0.0, 0.0, y0, y1, br, br, 8, gold, true, true);
+    // a darker equipment band
+    m.frustum(0.0, 0.0, y0 + 0.4, y0 + 0.7, br * 1.02, br * 1.02, 8, [0.5, 0.42, 0.18], false, false);
+    // descent engine bell, hanging below the body centre
+    m.frustum(0.0, 0.0, 0.9, y0, 0.35, 1.0, 14, dark, false, true);
+
+    // four landing legs + footpads + braces
+    for k in 0..4 {
+        let a = (k as f32 + 0.5) * std::f32::consts::FRAC_PI_2;
+        let (cx, cz) = (a.cos(), a.sin());
+        let hip = Vec3::new(cx * br * 0.9, y0 + 0.1, cz * br * 0.9);
+        let foot = Vec3::new(cx * (br + 2.0), 0.12, cz * (br + 2.0));
+        m.strut(hip, foot, 0.13, gray);
+        // brace from higher on the body to the leg
+        let shoulder = Vec3::new(cx * br * 0.5, y1 - 0.4, cz * br * 0.5);
+        m.strut(shoulder, foot + Vec3::new(0.0, 0.6, 0.0), 0.08, gray);
+        // footpad
+        m.frustum(foot.x, foot.z, 0.0, 0.28, 0.55, 0.42, 10, gray, true, true);
+    }
+
+    // ascent cabin on top + hatch
+    m.frustum(0.0, 0.0, y1, y1 + 1.5, 1.5, 1.2, 8, gray, false, true);
+    m.frustum(0.0, 0.0, y1 + 1.5, y1 + 1.9, 0.7, 0.55, 10, dark, false, true);
+    // an RCS pod / antenna nub
+    m.frustum(br * 0.7, 0.0, y1 - 0.2, y1 + 0.3, 0.18, 0.12, 8, dark, true, true);
+    m
 }
 
 /// The flyable rocket body, built about its base at y=0 and pointing +Y. The
