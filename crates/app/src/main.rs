@@ -22,6 +22,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+mod build;
 mod flight;
 mod launch;
 mod mission;
@@ -217,7 +218,7 @@ impl SystemCamera {
 // per-frame geometry/uniform builders so both render paths share them.
 // ---------------------------------------------------------------------------
 
-/// A jettisoned booster tumbling away after staging, integrated ballistically
+/// A jettisoned stage tumbling away after separation, integrated ballistically
 /// in the rocket-view local frame (metres) for a few seconds of spectacle.
 struct SepBooster {
     pos: Vec3,
@@ -225,6 +226,29 @@ struct SepBooster {
     rot: Quat,
     spin: Vec3,
     age: f32,
+    /// Vertex range (in the rocket body mesh) of the jettisoned stage.
+    range: std::ops::Range<usize>,
+}
+
+/// A payload delivered to orbit by a completed mission. Persists and is drawn
+/// circling the home world in the map view; missions accumulate these.
+struct OrbitObject {
+    name: &'static str,
+    color: [f32; 3],
+    radius_mm: f32, // orbit radius (Mm, home-centred)
+    t1: Vec3,       // orbit-plane basis (home-centred world unit vectors)
+    t2: Vec3,
+    rate: f32,    // rad/s
+    phase0: f32,  // angle at epoch
+    epoch: f64,   // sys_time at insertion
+}
+
+impl OrbitObject {
+    /// World position (Mm) at `sys_time`, given the home world's position.
+    fn pos_mm(&self, home_pos: DVec3, sys_time: f64) -> DVec3 {
+        let th = self.phase0 + self.rate * (sys_time - self.epoch) as f32;
+        home_pos + (self.t1 * th.cos() + self.t2 * th.sin()).as_dvec3() * self.radius_mm as f64
+    }
 }
 
 /// One exhaust smoke puff, advected in the rocket-view local frame. Emitted at
@@ -249,9 +273,15 @@ struct World {
     // player-controlled launch (KSP-style); replaces the on-rails ascent when
     // the player flies it from the pad in the rocket view.
     launch: Option<launch::Rocket>,
+    /// The current vehicle design (Vehicle Assembly Building).
+    vab: build::Vab,
     rocket_body: rocket::RocketBody,
     pad_mesh: rocket::Mesh,
     sep: Option<SepBooster>,
+    /// Payloads delivered to orbit by completed missions (they accumulate).
+    orbits: Vec<OrbitObject>,
+    /// Whether the active launch's payload has been captured to orbit yet.
+    mission_captured: bool,
     smoke: Vec<Smoke>,
     smoke_accum: f32, // fractional particle spawn carry
     anim: f32,        // FX animation clock (seconds)
@@ -303,7 +333,8 @@ impl World {
     fn new() -> World {
         let mission = Mission::pioneer_from_spaceport();
         let body = CentralBody::home();
-        let rocket_body = rocket::rocket_body();
+        let vab = build::Vab::default_build();
+        let rocket_body = rocket::rocket_body(&vab.to_vehicle(), vab.payload().color);
         let rocket_frame = (rocket_body.focus_y, rocket_body.cam_dist);
         let (launch_origin, launch_up, launch_east, launch_north) = rocket::launch_frame();
         let home_radius_mm = (body.radius as f32) / MM;
@@ -326,10 +357,13 @@ impl World {
             mission,
             body,
             flight: None,
+            vab,
             launch: None,
             rocket_body,
             pad_mesh: rocket::pad_and_mount(),
             sep: None,
+            orbits: Vec::new(),
+            mission_captured: false,
             smoke: Vec::new(),
             smoke_accum: 0.0,
             anim: 0.0,
@@ -626,6 +660,7 @@ impl World {
             let dt = (frame_dt * self.warp).min(2.0);
             rk.integrate(&self.body, dt as f64);
         }
+        self.capture_orbit_if_reached();
         let fx_dt = (frame_dt * self.warp).min(0.5);
         self.anim += fx_dt;
         self.advance_sep(frame_dt * self.warp.min(8.0));
@@ -742,7 +777,7 @@ impl World {
         let q = Quat::from_rotation_arc(Vec3::Y, self.dir_to_local(rk.point_dir()));
         let ny = self.rocket_body.nozzle_y.get(rk.stage_base).copied().unwrap_or(0.0);
         let nozzle = base + q * Vec3::new(0.0, ny - 1.2, 0.0);
-        let er = self.rocket_body.engine_r * if rk.stage_base == 0 { 1.0 } else { 0.45 };
+        let er = self.rocket_body.engine_r.get(rk.stage_base).copied().unwrap_or(0.9);
 
         // spawn rate: heavy at the pad (the ground billow), thinning with density.
         let rate = thrust_frac * (8.0 + 120.0 * dens) * if on_pad { 2.5 } else { 1.0 };
@@ -807,9 +842,17 @@ impl World {
         .normalize_or_zero()
     }
 
-    /// Ignite the full stack on the pad and begin a player-controlled launch.
+    /// Rebuild the rocket-view geometry from the current VAB design (call after
+    /// the player edits the build).
+    fn rebuild_vehicle(&mut self) {
+        self.rocket_body = rocket::rocket_body(&self.vab.to_vehicle(), self.vab.payload().color);
+        self.rocket_focus_y = self.rocket_body.focus_y;
+    }
+
+    /// Ignite the assembled vehicle on the pad and begin a player launch.
     fn ignite_launch(&mut self) {
-        let veh = sim::vehicle::Vehicle::pioneer();
+        self.rebuild_vehicle();
+        let veh = self.vab.to_vehicle();
         // base of the rocket sits `base_y` above the pad surface, on the mount.
         let r = self.launch_origin + self.launch_up * self.rocket_body.base_y as f64;
         // Co-moving launch frame: ignite at rest relative to the (fixed) pad and
@@ -822,19 +865,26 @@ impl World {
         self.launch = Some(rk);
         self.sep = None;
         self.smoke.clear();
-        log::info!("Ignition: Pioneer I - throttle up, pitch over, stage when dry");
+        self.mission_captured = false;
+        log::info!("Ignition: {} - throttle up, pitch over, stage when dry", veh.name);
     }
 
     /// Jettison the active stage; spawn the spent booster tumbling away.
     fn stage_launch(&mut self) {
-        // capture the booster pose + velocity (immutable borrow) before removal
-        let (r, pd, v, can_stage) = match self.launch.as_ref() {
-            Some(rk) => (rk.r, rk.point_dir(), rk.v, rk.stages.len() > 1),
+        // capture the spent stage's pose + velocity (immutable borrow) first
+        let (r, pd, v, stage, can_stage) = match self.launch.as_ref() {
+            Some(rk) => (rk.r, rk.point_dir(), rk.v, rk.stage_base, rk.stages.len() > 1),
             None => return,
         };
         if !can_stage {
             return;
         }
+        let range = self
+            .rocket_body
+            .stage_ranges
+            .get(stage)
+            .cloned()
+            .unwrap_or(0..0);
         let base_local = self.to_local(r);
         let pd_local = self.dir_to_local(pd);
         let rot = Quat::from_rotation_arc(Vec3::Y, pd_local);
@@ -847,6 +897,7 @@ impl World {
             rot,
             spin: Vec3::new(0.7, 0.15, 1.1),
             age: 0.0,
+            range,
         });
     }
 
@@ -863,6 +914,46 @@ impl World {
         self.launch = None;
         self.sep = None;
         self.smoke.clear();
+        self.mission_captured = false;
+    }
+
+    /// Whether the active launch has reached a stable parking orbit.
+    fn mission_complete(&self) -> bool {
+        self.mission_captured
+    }
+
+    /// On reaching a bound parking orbit, deposit the payload as a persistent
+    /// satellite circling the home world. Missions accumulate these.
+    fn capture_orbit_if_reached(&mut self) {
+        if self.mission_captured {
+            return;
+        }
+        let reached = self.launch.as_ref().map(|rk| rk.orbit_reached).unwrap_or(false);
+        if !reached {
+            return;
+        }
+        let rk = self.launch.as_ref().unwrap();
+        let orb = sim::orbit::orbit_from_state(rk.r, rk.v, self.body.mu);
+        let radius_m = rk.r.length();
+        let h = orb.h_vec.normalize_or_zero();
+        let aref = if h.x.abs() < 0.9 { DVec3::X } else { DVec3::Y };
+        let t1d = h.cross(aref).normalize_or_zero();
+        let t2d = h.cross(t1d).normalize_or_zero();
+        let phase0 = (rk.r.dot(t2d)).atan2(rk.r.dot(t1d)) as f32;
+        let rate = (sim::orbit::circular_speed(self.body.mu, radius_m) / radius_m) as f32;
+        let pay = self.vab.payload();
+        self.orbits.push(OrbitObject {
+            name: pay.name,
+            color: pay.color,
+            radius_mm: (radius_m / MM as f64) as f32,
+            t1: t1d.as_vec3(),
+            t2: t2d.as_vec3(),
+            rate,
+            phase0,
+            epoch: self.sys_time,
+        });
+        self.mission_captured = true;
+        log::info!("Payload to orbit: {} ({} satellites)", pay.name, self.orbits.len());
     }
 
     /// Transform a vertex range of the rocket body by pose `q`/`base` (local f64)
@@ -916,23 +1007,24 @@ impl World {
         }
 
         // current rocket pose (resting on the pad when not launched)
-        let (base_local, quat, on_booster) = match self.launch.as_ref() {
+        let (base_local, quat, active) = match self.launch.as_ref() {
             Some(rk) => {
                 let base = self.to_local_d(rk.r);
                 let q = Quat::from_rotation_arc(Vec3::Y, self.dir_to_local(rk.point_dir()));
-                (base, q, rk.stage_base == 0)
+                (base, q, rk.stage_base)
             }
-            None => (DVec3::new(0.0, rb.base_y as f64, 0.0), Quat::IDENTITY, true),
+            None => (DVec3::new(0.0, rb.base_y as f64, 0.0), Quat::IDENTITY, 0),
         };
 
-        self.xform_into(&mut out, rb.upper.clone(), quat, base_local);
-        if on_booster {
-            self.xform_into(&mut out, rb.booster.clone(), quat, base_local);
+        // draw the payload + every still-attached stage (active stage and above)
+        self.xform_into(&mut out, rb.payload_range.clone(), quat, base_local);
+        for r in rb.stage_ranges.iter().skip(active) {
+            self.xform_into(&mut out, r.clone(), quat, base_local);
         }
 
-        // tumbling spent booster
+        // tumbling spent stage
         if let Some(s) = self.sep.as_ref() {
-            for v in &rb.mesh.verts[rb.booster.clone()] {
+            for v in &rb.mesh.verts[s.range.clone()] {
                 let local = s.pos.as_dvec3() + (s.rot * Vec3::from(v.pos)).as_dvec3();
                 let n = s.rot * Vec3::from(v.normal);
                 out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: n.into(), color: v.color });
@@ -954,15 +1046,16 @@ impl World {
             if tf > 0.0 {
                 let booster = rk.stage_base == 0;
                 let down = -self.dir_to_local(rk.point_dir()); // flame opposes thrust
-                let er = self.rocket_body.engine_r * if booster { 1.2 } else { 0.7 };
+                let er = self.rocket_body.engine_r.get(rk.stage_base).copied().unwrap_or(0.9)
+                    * 1.6;
                 // Anchor at the ACTIVE stage's engine: its nozzle sits up the mesh
-                // by `nozzle_y`, so after the booster drops the upper-stage flame
-                // stays at its own engine instead of the old booster base.
+                // by `nozzle_y`, so after a stage drops the flame stays at the new
+                // active engine instead of the old base.
                 let q = Quat::from_rotation_arc(Vec3::Y, self.dir_to_local(rk.point_dir()));
                 let ny = self.rocket_body.nozzle_y.get(rk.stage_base).copied().unwrap_or(0.0);
                 let mount = self.to_local_d(rk.r) + (q * Vec3::new(0.0, ny - 1.2, 0.0)).as_dvec3();
                 let nozzle = self.rel(mount);
-                let len = (if booster { 17.0 } else { 9.5 }) * (0.55 + 0.45 * tf);
+                let len = (if booster { 17.0 } else { 10.5 }) * (0.55 + 0.45 * tf);
                 // axis billboard: width axis is perpendicular to the flame and to
                 // the view ray, so the card faces the camera.
                 let view = (nozzle - eye).normalize_or_zero();
@@ -1170,6 +1263,26 @@ impl World {
             }
         }
 
+        // rings of payloads our missions placed in orbit (visible zoomed to home)
+        if self.sys_dist < 200.0 && !self.orbits.is_empty() {
+            let home_pos = self.universe.position(self.universe.home_index(), t);
+            for o in &self.orbits {
+                let col = [o.color[0] * 0.7, o.color[1] * 0.7, o.color[2] * 0.7];
+                let mut prev: Option<[f32; 2]> = None;
+                for k in 0..=96 {
+                    let th = k as f32 / 96.0 * std::f32::consts::TAU;
+                    let p = home_pos
+                        + (o.t1 * th.cos() + o.t2 * th.sin()).as_dvec3() * o.radius_mm as f64;
+                    let cur = cam.project(p);
+                    if let (Some(a), Some(b)) = (prev, cur) {
+                        out.push(OverlayVertex { pos: a, color: col });
+                        out.push(OverlayVertex { pos: b, color: col });
+                    }
+                    prev = cur;
+                }
+            }
+        }
+
         out
     }
 
@@ -1204,6 +1317,14 @@ impl World {
             if let Some(c) = cam.project(self.universe.position(i, self.sys_time)) {
                 push_filled_diamond(&mut out, c, sz + 0.004, aspect, [0.0, 0.0, 0.0]);
                 push_filled_diamond(&mut out, c, sz, aspect, b.color);
+            }
+        }
+
+        // payloads our missions have placed in orbit around the home world
+        for o in &self.orbits {
+            if let Some(c) = cam.project(o.pos_mm(home_pos, self.sys_time)) {
+                push_filled_diamond(&mut out, c, 0.011, aspect, [0.0, 0.0, 0.0]);
+                push_filled_diamond(&mut out, c, 0.007, aspect, o.color);
             }
         }
         out
@@ -2219,6 +2340,48 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
         }
     }
 
+    // Autopilot: fly a closed-loop gravity turn + circularization until a stable
+    // parking orbit is reached (or fuel runs out). Used to verify the
+    // mission-to-orbit -> persistent-satellite loop headlessly.
+    fn fly_to_orbit(w: &mut World) {
+        let radius = w.body.radius;
+        for _ in 0..12000 {
+            let done = w
+                .launch
+                .as_ref()
+                .map(|rk| rk.orbit_reached || rk.crashed)
+                .unwrap_or(true);
+            if done {
+                break;
+            }
+            // read state, then steer
+            let (met, apo, dry) = {
+                let rk = w.launch.as_ref().unwrap();
+                let orb = sim::orbit::orbit_from_state(rk.r, rk.v, w.body.mu);
+                (rk.met, orb.ra - radius, rk.prop_frac() <= 0.0)
+            };
+            if dry {
+                if w.launch.as_ref().map(|r| r.stages.len() > 1).unwrap_or(false) {
+                    w.stage_launch();
+                } else {
+                    break; // out of fuel, no more stages
+                }
+            }
+            if let Some(rk) = w.launch.as_mut() {
+                // vertical, then gravity-turn to ~80 deg, then horizontal to raise
+                // periapsis once the apoapsis is high enough.
+                rk.pitch = if met < 12.0 {
+                    0.0
+                } else if apo < 180_000.0 {
+                    (((met - 12.0) / 110.0).clamp(0.0, 1.0) * 80f64.to_radians()).min(1.4)
+                } else {
+                    90f64.to_radians()
+                };
+            }
+            w.advance(0.25);
+        }
+    }
+
     // Frame the map on the home world (where the launch/orbit is drawn).
     let frame_map = |w: &mut World| {
         w.view = View::Map;
@@ -2283,6 +2446,30 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             fly(&mut world, 130.0);
             world.rocket_dist = 900.0;
             0.0
+        }
+        "deploy" => {
+            // fly a full mission to orbit, then frame the deployed satellite +
+            // its orbit ring around the home world on the map.
+            world.ignite_launch();
+            fly_to_orbit(&mut world);
+            frame_map(&mut world);
+            world.sys_dist = 22.0;
+            world.sys_el = 0.45;
+            6.0
+        }
+        "constellation" => {
+            // several back-to-back missions: each successful flight leaves another
+            // payload in orbit, so they accumulate around the home world.
+            for p in 0..4usize {
+                world.vab.payload = p % build::PAYLOADS.len();
+                world.ignite_launch();
+                fly_to_orbit(&mut world);
+                world.reset_launch();
+            }
+            frame_map(&mut world);
+            world.sys_dist = 22.0;
+            world.sys_el = 0.45;
+            6.0
         }
         "launchmap" => {
             // a player launch shown on the orbital map: live marker + predicted
@@ -2830,6 +3017,10 @@ fn main() {
                 "launchmap"
             } else if args.iter().any(|a| a == "upperflame") {
                 "upperflame"
+            } else if args.iter().any(|a| a == "constellation") {
+                "constellation"
+            } else if args.iter().any(|a| a == "deploy") {
+                "deploy"
             } else if args.iter().any(|a| a == "orbit") {
                 "orbit"
             } else if args.iter().any(|a| a == "ascent") {

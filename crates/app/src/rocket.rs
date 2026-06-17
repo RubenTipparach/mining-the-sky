@@ -108,13 +108,13 @@ impl Mesh {
 }
 
 /// The flyable rocket body, built about its base at y=0 and pointing +Y. The
-/// pad and mount are separate (they stay behind on liftoff). `booster` and
-/// `upper` are the vertex ranges of the first stage and everything above it, so
-/// the spent booster can be split off and tumbled away at staging.
+/// pad and mount are separate (they stay behind on liftoff). `stage_ranges[i]`
+/// is the vertex range of stage i (bottom-first), so a spent stage can be split
+/// off and tumbled away at separation; `payload_range` is the payload + nose.
 pub struct RocketBody {
     pub mesh: Mesh,
-    pub booster: std::ops::Range<usize>,
-    pub upper: std::ops::Range<usize>,
+    pub stage_ranges: Vec<std::ops::Range<usize>>,
+    pub payload_range: std::ops::Range<usize>,
     /// Height (m) the base sits above the pad slab when resting on the mount.
     pub base_y: f32,
     /// Total stack height (m).
@@ -122,16 +122,20 @@ pub struct RocketBody {
     /// Y to aim the camera at (mid-stack), and a good default distance.
     pub focus_y: f32,
     pub cam_dist: f32,
-    /// Radius of the first stage's engine cluster (for plume placement).
-    pub engine_r: f32,
-    /// Mesh-Y of each stage's engine mount (where its exhaust exits), so the
-    /// flame can sit at the active stage's nozzle even after the booster drops.
+    /// Engine-cluster radius per stage (plume width).
+    pub engine_r: Vec<f32>,
+    /// Mesh-Y of each stage's engine mount (where its exhaust exits).
     pub nozzle_y: Vec<f32>,
 }
 
 pub const PAD_TOP: f32 = 1.2;
 pub const MOUNT_H: f32 = 2.2; // rocket base sits this far above the pad slab
 const PROP_DENSITY: f32 = 1000.0; // kg/m^3, sizes stage height from propellant
+
+/// Stage body radius (m) from its propellant load (bigger tank -> wider).
+fn stage_radius(prop: f64) -> f32 {
+    ((prop / 200_000.0).cbrt() as f32 * 1.9).clamp(0.7, 3.2)
+}
 
 /// The static launch pad slab + mount legs (the planet terrain is the ground;
 /// see `build_terrain`). The rocket itself is the separate `rocket_body`.
@@ -148,42 +152,46 @@ pub fn pad_and_mount() -> Mesh {
     m
 }
 
-/// Build the Pioneer rocket body about its base at y=0.
-pub fn rocket_body() -> RocketBody {
-    let veh = Vehicle::pioneer();
+/// Build the rocket body for `veh` about its base at y=0, proportional to each
+/// stage's tank (radius/height) and engine (cluster). `payload_col` tints the
+/// payload section.
+pub fn rocket_body(veh: &Vehicle, payload_col: [f32; 3]) -> RocketBody {
     let mut m = Mesh::default();
-    let radii = [1.85f32, 1.7];
-    let body_cols = [[0.90f32, 0.90, 0.93], [0.72, 0.74, 0.78]];
-    let mut engine_r = radii[0];
+    let n = veh.stages.len().max(1);
+    let radii: Vec<f32> = veh.stages.iter().map(|s| stage_radius(s.prop)).collect();
+    let body_cols = [[0.90f32, 0.90, 0.93], [0.72, 0.74, 0.78], [0.66, 0.68, 0.74]];
 
+    let mut stage_ranges = Vec::new();
+    let mut nozzle_y = Vec::new();
+    let mut engine_r = Vec::new();
     let mut y = 0.0f32;
-    let mut booster_end = 0usize;
-    let mut nozzle_y: Vec<f32> = Vec::new();
     for (i, stage) in veh.stages.iter().enumerate() {
-        let r = radii[i.min(radii.len() - 1)];
+        let start = m.verts.len();
+        let r = radii[i];
         let col = body_cols[i.min(body_cols.len() - 1)];
         let vol = stage.prop as f32 / PROP_DENSITY;
-        let h = (vol / (std::f32::consts::PI * r * r)).max(3.0);
-        nozzle_y.push(y); // this stage's engine mounts at its base
+        let h = (vol / (std::f32::consts::PI * r * r)).max(2.5);
+        nozzle_y.push(y);
 
-        // body
+        // body + a couple of dark bands for scale
         m.frustum(0.0, 0.0, y, y + h, r, r, 24, col, false, false);
-        // a couple of dark bands for visual scale
         m.frustum(0.0, 0.0, y + h * 0.33, y + h * 0.33 + 0.3, r * 1.01, r * 1.01, 24, [0.15, 0.16, 0.18], false, false);
 
-        // engines below this stage's base
+        // engines: a cluster for high-thrust boosters, a single bell otherwise
+        let nz = if stage.thrust > 5.0e6 { 5 } else if stage.thrust > 2.0e6 { 4 } else { 1 };
+        let er = if nz > 1 { (r * 0.5).clamp(0.4, 1.7) } else { (r * 0.45).clamp(0.3, 1.2) };
+        engine_r.push(er);
+        for k in 0..nz {
+            let (ex, ez) = if nz > 1 && k < nz - 1 {
+                let a = k as f32 / (nz - 1) as f32 * std::f32::consts::TAU;
+                (a.cos() * r * 0.5, a.sin() * r * 0.5)
+            } else {
+                (0.0, 0.0)
+            };
+            m.frustum(ex, ez, y - 1.7, y, er * 0.5, er * 0.8, 12, [0.13, 0.13, 0.15], false, true);
+        }
+        // fins on the first stage
         if i == 0 {
-            engine_r = r * 0.5;
-            for k in 0..5 {
-                let (ex, ez) = if k < 4 {
-                    let a = k as f32 * std::f32::consts::FRAC_PI_2;
-                    (a.cos() * r * 0.5, a.sin() * r * 0.5)
-                } else {
-                    (0.0, 0.0)
-                };
-                m.frustum(ex, ez, y - 1.7, y, 0.4, 0.62, 12, [0.13, 0.13, 0.15], false, true);
-            }
-            // fins at the four cardinal directions (axis-aligned, no rotation)
             let fy = y + 2.0;
             for (cx, cz, hx, hz) in [
                 (r + 0.7, 0.0, 0.9, 0.12),
@@ -193,35 +201,31 @@ pub fn rocket_body() -> RocketBody {
             ] {
                 m.bx(Vec3::new(cx, fy, cz), Vec3::new(hx, 1.8, hz), [0.55, 0.10, 0.10]);
             }
-        } else {
-            m.frustum(0.0, 0.0, y - 1.5, y, 0.5, 0.85, 16, [0.13, 0.13, 0.15], false, true);
         }
 
         y += h;
-
-        // interstage to the next stage radius (or taper toward payload)
-        let next_r = radii.get(i + 1).copied().unwrap_or(r * 0.92);
+        // interstage tapering to the next stage's radius (or toward the payload)
+        let next_r = radii.get(i + 1).copied().unwrap_or(r * 0.85);
         m.frustum(0.0, 0.0, y, y + 0.6, r, next_r, 24, [0.18, 0.18, 0.21], false, false);
         y += 0.6;
 
-        // the booster (stage 0) and its interstage drop together at staging
-        if i == 0 {
-            booster_end = m.verts.len();
-        }
+        stage_ranges.push(start..m.verts.len());
     }
 
-    // payload section + nose cone
-    let pr = radii[radii.len() - 1] * 0.92;
-    m.frustum(0.0, 0.0, y, y + 4.0, pr, pr, 24, [0.30, 0.33, 0.42], false, false);
+    // payload fairing + nose cone
+    let pstart = m.verts.len();
+    let pr = radii.last().copied().unwrap_or(1.5) * 0.85;
+    m.frustum(0.0, 0.0, y, y + 4.0, pr, pr, 24, payload_col, false, false);
     y += 4.0;
-    m.frustum(0.0, 0.0, y, y + 4.5, pr, 0.0, 24, [0.93, 0.93, 0.96], false, false);
-    y += 4.5;
+    m.frustum(0.0, 0.0, y, y + 4.0, pr, 0.0, 24, [0.93, 0.93, 0.96], false, false);
+    y += 4.0;
+    let payload_range = pstart..m.verts.len();
 
-    let total = m.verts.len();
+    let _ = n;
     RocketBody {
         mesh: m,
-        booster: 0..booster_end,
-        upper: booster_end..total,
+        stage_ranges,
+        payload_range,
         base_y: PAD_TOP + MOUNT_H,
         height: y,
         focus_y: y * 0.45,

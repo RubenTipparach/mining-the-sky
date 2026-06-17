@@ -62,59 +62,129 @@ fn kv(ui: &mut egui::Ui, k: &str, v: &str) {
 }
 
 fn vehicle_panel(ctx: &egui::Context, world: &mut World) {
-    let m = &world.mission;
-    let vehicle = m.vehicle;
-    let stack: Vec<(usize, String, f32, f32)> = m
-        .stack
-        .iter()
-        .enumerate()
-        .map(|(i, (n, w, d))| (i, n.to_string(), *w, *d))
-        .collect();
-    let (mass, twr, dv, pay, target) =
-        (m.liftoff_mass_t, m.liftoff_twr, m.total_dv, m.payload_t, m.target_orbit_km());
-    let launched = world.launched;
-    let mut do_launch = false;
+    use crate::build;
+    let mut vab = world.vab.clone();
+    let mut changed = false;
+    let mut launch = false;
+    enum Act {
+        Remove(usize),
+        Add,
+    }
+    let mut act: Option<Act> = None;
+    let n_orbit = world.orbits.len();
+    let g = world.body.surface_gravity();
 
     egui::Window::new("VEHICLE ASSEMBLY")
         .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 12.0))
-        .default_width(250.0)
+        .default_width(310.0)
         .resizable(false)
         .show(ctx, |ui| {
-            ui.label(egui::RichText::new(vehicle).heading().color(AMBER));
+            ui.label(egui::RichText::new("VEHICLE ASSEMBLY").heading().color(AMBER));
             ui.add_space(2.0);
-            egui::Grid::new("stack").num_columns(3).striped(true).show(ui, |ui| {
-                for (i, n, w, d) in stack.iter().rev() {
-                    ui.label(format!("S{} {}", i + 1, n));
-                    ui.label(format!("{w:.0} t"));
-                    ui.label(egui::RichText::new(format!("{d:.0} m/s")).color(DIM));
+            // stages, top of the stack first
+            egui::Grid::new("vab_stages").num_columns(4).spacing([6.0, 4.0]).show(ui, |ui| {
+                for i in (0..vab.stages.len()).rev() {
+                    ui.label(egui::RichText::new(format!("S{}", i + 1)).color(DIM));
+                    egui::ComboBox::from_id_salt(("eng", i))
+                        .selected_text(build::ENGINES[vab.stages[i].engine].name)
+                        .width(96.0)
+                        .show_ui(ui, |ui| {
+                            for (k, e) in build::ENGINES.iter().enumerate() {
+                                if ui.selectable_value(&mut vab.stages[i].engine, k, e.name).clicked() {
+                                    changed = true;
+                                }
+                            }
+                        });
+                    egui::ComboBox::from_id_salt(("tank", i))
+                        .selected_text(build::TANKS[vab.stages[i].tank].name)
+                        .width(82.0)
+                        .show_ui(ui, |ui| {
+                            for (k, t) in build::TANKS.iter().enumerate() {
+                                if ui.selectable_value(&mut vab.stages[i].tank, k, t.name).clicked() {
+                                    changed = true;
+                                }
+                            }
+                        });
+                    if vab.stages.len() > 1 {
+                        if ui.button("x").clicked() {
+                            act = Some(Act::Remove(i));
+                        }
+                    } else {
+                        ui.label("");
+                    }
                     ui.end_row();
                 }
             });
-            ui.separator();
-            egui::Grid::new("stats").num_columns(2).show(ui, |ui| {
-                kv(ui, "Mass", &format!("{mass:.0} t"));
-                kv(ui, "Liftoff TWR", &format!("{twr:.2}"));
-                kv(ui, "Total delta-v", &format!("{dv:.0} m/s"));
-                kv(ui, "Payload", &format!("{pay:.0} t"));
-                kv(ui, "Target orbit", &format!("{target:.0} km"));
+            ui.horizontal(|ui| {
+                if ui.button("+ stage").clicked() {
+                    act = Some(Act::Add);
+                }
+                ui.label(egui::RichText::new("Payload").color(DIM));
+                egui::ComboBox::from_id_salt("payload")
+                    .selected_text(build::PAYLOADS[vab.payload].name)
+                    .width(120.0)
+                    .show_ui(ui, |ui| {
+                        for (k, p) in build::PAYLOADS.iter().enumerate() {
+                            if ui.selectable_value(&mut vab.payload, k, p.name).clicked() {
+                                changed = true;
+                            }
+                        }
+                    });
             });
+
             ui.separator();
-            let _ = launched;
-            let btn = egui::Button::new(egui::RichText::new("LAUNCH").strong().color(egui::Color32::BLACK))
-                .fill(GOOD)
-                .min_size(egui::vec2(120.0, 26.0));
-            if ui.add(btn).clicked() {
-                do_launch = true;
+            let veh = vab.to_vehicle();
+            let mass_t = veh.liftoff_mass() / 1000.0;
+            let twr = veh.stages[0].thrust / (veh.liftoff_mass() * g);
+            let total_dv: f64 =
+                (0..veh.stages.len()).map(|i| veh.stages[i].dv(veh.mass_above(i))).sum();
+            egui::Grid::new("vab_stats").num_columns(2).show(ui, |ui| {
+                kv(ui, "Liftoff mass", &format!("{mass_t:.0} t"));
+                ui.label(egui::RichText::new("Liftoff TWR").color(DIM));
+                let twr_col = if twr < 1.0 { WARN } else { GOOD };
+                ui.label(egui::RichText::new(format!("{twr:.2}")).color(twr_col));
+                ui.end_row();
+                kv(ui, "Total delta-v", &format!("{total_dv:.0} m/s"));
+                kv(ui, "Payload", &format!("{:.0} kg", vab.payload().mass));
+            });
+            if twr < 1.0 {
+                ui.label(egui::RichText::new("TWR < 1: add engines or drop tankage").color(WARN));
             }
-            ui.label(egui::RichText::new("or press Space to ignite").color(DIM));
+
             ui.separator();
-            ui.label(egui::RichText::new("Fly it yourself:").color(DIM));
-            ui.label(egui::RichText::new("Shift / Ctrl  throttle").color(DIM));
-            ui.label(egui::RichText::new("W / S  pitch over").color(DIM));
-            ui.label(egui::RichText::new("Space  stage    R  reset").color(DIM));
+            let btn = egui::Button::new(
+                egui::RichText::new("LAUNCH").strong().color(egui::Color32::BLACK),
+            )
+            .fill(GOOD)
+            .min_size(egui::vec2(120.0, 26.0));
+            if ui.add(btn).clicked() {
+                launch = true;
+            }
+            ui.label(egui::RichText::new("Space ignite/stage  Shift/Ctrl throttle  W/S pitch").color(DIM));
+            ui.separator();
+            let col = if n_orbit > 0 { GOOD } else { DIM };
+            ui.label(egui::RichText::new(format!("Satellites in orbit: {n_orbit}")).color(col));
         });
 
-    if do_launch {
+    match act {
+        Some(Act::Remove(i)) => {
+            if vab.stages.len() > 1 {
+                vab.stages.remove(i);
+                changed = true;
+            }
+        }
+        Some(Act::Add) => {
+            // a new vacuum upper stage on top of the stack
+            vab.stages.push(build::StageCfg { engine: 3, tank: 0 });
+            changed = true;
+        }
+        None => {}
+    }
+    if changed {
+        world.vab = vab;
+        world.rebuild_vehicle();
+    }
+    if launch {
         world.ignite_launch();
     }
 }
@@ -133,6 +203,8 @@ fn launch_panel(ctx: &egui::Context, world: &mut World) {
         _ => DIM,
     };
     let twr_col = if tel.twr < 1.0 && tel.phase == "POWERED" { WARN } else { GOOD };
+    let complete = world.mission_complete();
+    let n_orbit = world.orbits.len();
 
     enum Act {
         Throttle(f64),
@@ -185,24 +257,39 @@ fn launch_panel(ctx: &egui::Context, world: &mut World) {
                 );
             });
             ui.separator();
-            ui.horizontal(|ui| {
-                if ui.button("- thr").clicked() {
-                    act = Some(Act::Throttle(-0.1));
-                }
-                if ui.button("+ thr").clicked() {
-                    act = Some(Act::Throttle(0.1));
-                }
-                if ui.button("STAGE").clicked() {
-                    act = Some(Act::Stage);
-                }
-                if ui.button("Reset").clicked() {
+            if complete {
+                ui.label(
+                    egui::RichText::new("ORBIT ACHIEVED - payload deployed").strong().color(GOOD),
+                );
+                ui.label(egui::RichText::new(format!("Satellites in orbit: {n_orbit}")).color(DIM));
+                let btn = egui::Button::new(
+                    egui::RichText::new("NEW MISSION").strong().color(egui::Color32::BLACK),
+                )
+                .fill(GOOD)
+                .min_size(egui::vec2(140.0, 24.0));
+                if ui.add(btn).clicked() {
                     act = Some(Act::Reset);
                 }
-            });
-            ui.label(
-                egui::RichText::new("Shift/Ctrl throttle  W/S pitch  Space stage")
-                    .color(DIM),
-            );
+                ui.label(egui::RichText::new("(R to return to the VAB)").color(DIM));
+            } else {
+                ui.horizontal(|ui| {
+                    if ui.button("- thr").clicked() {
+                        act = Some(Act::Throttle(-0.1));
+                    }
+                    if ui.button("+ thr").clicked() {
+                        act = Some(Act::Throttle(0.1));
+                    }
+                    if ui.button("STAGE").clicked() {
+                        act = Some(Act::Stage);
+                    }
+                    if ui.button("Reset").clicked() {
+                        act = Some(Act::Reset);
+                    }
+                });
+                ui.label(
+                    egui::RichText::new("Shift/Ctrl throttle  W/S pitch  Space stage").color(DIM),
+                );
+            }
         });
 
     match act {
