@@ -51,9 +51,58 @@ fn dfbm(p: vec3<f32>) -> f32 {
     }
     return s;
 }
-// Multi-scale regolith height at a surface direction (unit), in [-1,1]-ish.
+// 3 random values in [0,1) for an integer cell (for cellular crater placement).
+fn dhash3(c: vec3<f32>) -> vec3<f32> {
+    let q = vec3<f32>(
+        dot(c, vec3<f32>(127.1, 311.7, 74.7)),
+        dot(c, vec3<f32>(269.5, 183.3, 246.1)),
+        dot(c, vec3<f32>(113.5, 271.9, 124.6)),
+    );
+    return fract(sin(q) * 43758.5453);
+}
+
+// Cellular crater field at a surface direction: scatter one impact per grid
+// cell, each a depressed bowl with a raised rim, and sum the contributions of
+// the nearby cells. `freq` sets the crater scale, `depth` their relief.
+fn crater_layer(dir: vec3<f32>, freq: f32, depth: f32) -> f32 {
+    let pp = dir * freq;
+    let ip = floor(pp);
+    let fp = pp - ip;
+    var h = 0.0;
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let g = vec3<f32>(f32(dx), f32(dy), f32(dz));
+                let r = dhash3(ip + g);
+                // feature point inside the cell; r.z gates presence + varies size
+                let feat = g + r - fp;
+                let d = length(feat);
+                let present = step(0.30, r.z);
+                let cr = 0.34 + 0.30 * r.x; // crater radius (cell units)
+                let s = d / cr;
+                if (present > 0.5 && s < 1.35) {
+                    let dep = depth * (0.55 + 0.7 * r.y);
+                    var c = 0.0;
+                    if (s < 1.0) {
+                        c = c - dep * (1.0 - s * s); // parabolic bowl floor
+                    }
+                    // sharp raised rim ring + a little ejecta
+                    c = c + 0.45 * dep * exp(-pow((s - 1.0) / 0.16, 2.0));
+                    h = h + c;
+                }
+            }
+        }
+    }
+    return h;
+}
+
+// Surface relief at a direction (unit): three crater scales + fine roughness.
 fn detail_height(dir: vec3<f32>) -> f32 {
-    return dfbm(dir * 14.0) + 0.5 * dfbm(dir * 38.0 + vec3<f32>(11.0));
+    var h = crater_layer(dir, 7.0, 1.0);
+    h = h + crater_layer(dir, 17.0, 0.45);
+    h = h + crater_layer(dir, 44.0, 0.18); // small craters (close-up)
+    h = h + 0.10 * dfbm(dir * 90.0);       // fine regolith grain
+    return h;
 }
 
 struct VsOut {
@@ -99,7 +148,7 @@ fn fs(in: VsOut) -> FsOut {
     // the sun. This is a continuous function of the body-space direction, so it
     // is identical across LOD patch seams and brings crater/rubble relief at
     // altitude without needing fine geometry.
-    var micro_shadow = 1.0;
+    var ao = 1.0;
     if (u.detail.w > 0.5) {
         let bp = in.wpos - u.detail.xyz;       // body-space position
         let dir = normalize(bp);
@@ -107,27 +156,23 @@ fn fs(in: VsOut) -> FsOut {
         var t = cross(select(vec3<f32>(0.0,0.0,1.0), vec3<f32>(1.0,0.0,0.0), abs(dir.x) < 0.9), dir);
         t = normalize(t);
         let b = cross(dir, t);
-        let e = 0.012;                          // angular sample step
+        // Sample step shrinks as we close in, so fine craters resolve on final
+        // approach while staying coarse (anti-aliased) at distance.
+        let fade = clamp(1.0 - (in.flogz - 1.0) / (u.detail.w * 10.0), 0.25, 1.0);
+        let e = mix(0.020, 0.0035, fade);
         let h0 = detail_height(dir);
         let ht = detail_height(normalize(dir + t * e));
         let hb = detail_height(normalize(dir + b * e));
-        // surface-tangent gradient -> tilt the normal (strength fades with view dist)
-        let grad = (ht - h0) * t + (hb - h0) * b;
-        let fade = clamp(1.0 - (in.flogz - 1.0) / (u.detail.w * 10.0), 0.25, 1.0);
-        n = normalize(n - grad * (2.2 * fade));
-        // cheap micro self-shadow: step toward the sun and see if the field rises
-        let st = dot(s, t);
-        let sb = dot(s, b);
-        var occ = 0.0;
-        for (var k = 1; k <= 3; k = k + 1) {
-            let st_e = e * f32(k) * 1.5;
-            let sd = normalize(dir + (t * st + b * sb) * st_e);
-            occ = max(occ, (detail_height(sd) - h0) / (st_e * 6.0 + 1e-3));
-        }
-        micro_shadow = clamp(1.0 - 0.55 * clamp(occ, 0.0, 1.0), 0.3, 1.0);
+        // surface-tangent gradient -> tilt the normal (the smaller step near the
+        // surface makes the slope steeper, so scale it back down by 1/e)
+        let grad = ((ht - h0) * t + (hb - h0) * b) * (0.010 / e);
+        n = normalize(n - grad * (1.6 * fade));
+        // free ambient occlusion: crater floors (low h0) sit in shadow / hold
+        // more regolith, so they read darker.
+        ao = clamp(1.0 + 0.7 * min(h0, 0.0), 0.45, 1.0);
     }
 
-    let diff = max(dot(n, s), 0.0) * micro_shadow;
+    let diff = max(dot(n, s), 0.0) * ao;
     // Airless (lunar) bodies have no sky-fill: ambient is near-black so the only
     // light is the direct sun, giving stark crater shadows. On worlds with air,
     // use the bluish hemispheric sky/ground ambient.
