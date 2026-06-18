@@ -1334,37 +1334,34 @@ pub fn asteroid_terrain(cam_local: DVec3, radius: f64, elev: &Elevation, max_dep
     let lod = select(&planet, cam_local, 1.6, max_depth);
     let mut m = Mesh::default();
     let n = 9;
-    let grid = n * n;
+    // The true surface point at a direction (same field build_mesh displaced by).
+    let surf = |d: DVec3| -> DVec3 { d * (radius + elev.land_height_m(d)) };
+    // Analytic normal from the height-field gradient: sample the surface a tiny
+    // step along two tangents and cross them. This is a continuous function of
+    // direction, so neighbouring (and different-LOD) patches that share an edge
+    // get IDENTICAL normals - no per-patch lighting seams.
+    let eps = 4.0e-4;
+    let normal_at = |d: DVec3| -> Vec3 {
+        let (t, b) = terrain::cubesphere::tangent_basis(d);
+        let p0 = surf(d);
+        let pt = surf((d + t * eps).normalize());
+        let pb = surf((d + b * eps).normalize());
+        let mut nn = (pt - p0).cross(pb - p0).normalize_or_zero();
+        if nn.dot(d) < 0.0 {
+            nn = -nn;
+        }
+        if nn.length_squared() < 1e-9 {
+            nn = d;
+        }
+        nn.as_vec3()
+    };
     for patch in &lod.patches {
         let skirt = (patch.edge * 0.35).clamp(2.0, 5_000.0);
         let pm = build_mesh(&planet, patch, n, elev, skirt);
         let nv = pm.positions.len();
         let local: Vec<Vec3> = pm.positions.iter().map(|&w| w.as_vec3()).collect();
-        let radial: Vec<Vec3> = local.iter().map(|p| p.normalize_or_zero()).collect();
-
-        // smooth normals from the surface triangles (skirts excluded)
-        let mut nrm = vec![Vec3::ZERO; nv];
-        for tri in pm.indices.chunks(3) {
-            let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
-            if i0 >= grid || i1 >= grid || i2 >= grid {
-                continue;
-            }
-            let mut fnv = (local[i1] - local[i0]).cross(local[i2] - local[i0]);
-            let rc = radial[i0] + radial[i1] + radial[i2];
-            if fnv.dot(rc) < 0.0 {
-                fnv = -fnv;
-            }
-            nrm[i0] += fnv;
-            nrm[i1] += fnv;
-            nrm[i2] += fnv;
-        }
-        for i in 0..nv {
-            let mut nn = nrm[i].normalize_or_zero();
-            if nn.length_squared() < 1e-6 || nn.dot(radial[i]) < 0.0 {
-                nn = radial[i];
-            }
-            nrm[i] = nn;
-        }
+        let radial: Vec<Vec3> = pm.positions.iter().map(|&w| w.normalize_or_zero().as_vec3()).collect();
+        let nrm: Vec<Vec3> = pm.positions.iter().map(|&w| normal_at(w.normalize())).collect();
         let col: Vec<[f32; 3]> = (0..nv)
             .map(|i| {
                 let h_frac = ((local[i].length() - radius as f32) / amp).clamp(0.0, 1.0);
