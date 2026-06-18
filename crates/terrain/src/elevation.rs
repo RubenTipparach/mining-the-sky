@@ -195,7 +195,10 @@ impl Elevation {
         let lobe = self.continents.get([d.x * 1.5, d.y * 1.5, d.z * 1.5]); // big lobes
         let med = self.hills.get([d.x * 4.0, d.y * 4.0, d.z * 4.0]);
         let fine = self.fine.get([d.x * 13.0, d.y * 13.0, d.z * 13.0]);
-        let mut h = 0.5 + 0.30 * lobe + 0.10 * med + 0.04 * fine; // ~0..1
+        // Mostly big lobes for the silhouette; keep the medium/fine geometry
+        // relief gentle so the ground is smooth up close (crater texture is added
+        // by the surface-detail shader, not the mesh).
+        let mut h = 0.5 + 0.32 * lobe + 0.06 * med + 0.02 * fine; // ~0..1
         for i in 0..self.ast_craters.len() {
             let c = self.ast_craters[i];
             let cr = self.ast_crater_cr[i];

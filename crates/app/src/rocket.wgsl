@@ -166,10 +166,10 @@ fn fs(in: VsOut) -> FsOut {
         // surface-tangent gradient -> tilt the normal (the smaller step near the
         // surface makes the slope steeper, so scale it back down by 1/e)
         let grad = ((ht - h0) * t + (hb - h0) * b) * (0.010 / e);
-        // Ground-level smoothing: very near fragments (the patch right around a
-        // landed craft) taper the detail back to smooth, settled regolith; the
-        // mid-ground and horizon keep their craters.
-        let near = smoothstep(12.0, 110.0, in.flogz - 1.0);
+        // Ground-level smoothing: near fragments (the area around a landed
+        // craft) taper the detail back to smooth, settled regolith over a wide
+        // band; the far surface and horizon keep their craters.
+        let near = smoothstep(20.0, 260.0, in.flogz - 1.0);
         n = normalize(n - grad * (1.6 * fade * near));
         // free ambient occlusion: crater floors (low h0) sit in shadow / hold
         // more regolith, so they read darker (also eased out up close).
