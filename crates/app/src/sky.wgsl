@@ -167,6 +167,17 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let sun = normalize(u.sun.xyz);
     let cam = u.cam.xyz;
 
+    // Deep space (asteroid field, cam.w >= 1.5): a full starfield + sun disk,
+    // with no planet body occluding the sky at all.
+    if (u.cam.w >= 1.5) {
+        var lc = starfield(ray);
+        let sd = max(dot(ray, sun), 0.0);
+        let disk = smoothstep(0.9994, 0.9998, sd) * 1.2;
+        let glow = pow(sd, 2400.0) * 0.5;
+        lc = lc + vec3<f32>(1.0, 0.98, 0.92) * (disk + glow);
+        return vec4<f32>(lc, 1.0);
+    }
+
     // Airless body (the moon): pure black space, a starfield, and a hard sun
     // disk. No atmospheric scattering, no limb glow.
     if (u.cam.w >= 0.5) {

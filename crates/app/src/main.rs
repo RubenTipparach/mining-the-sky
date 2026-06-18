@@ -215,6 +215,9 @@ const HORIZON: [f32; 3] = [0.74, 0.82, 0.93];
 /// uses a fairly high sun; the moon uses a low, grazing sun for long shadows.
 const SUN_LOCAL: Vec3 = Vec3::new(0.40, 0.72, 0.55);
 const SUN_LOCAL_MOON: Vec3 = Vec3::new(0.62, 0.17, 0.77);
+/// Deep-space (asteroid) sun: higher than the lunar grazing sun so a body
+/// viewed from the sun side reads as a solid lit rock.
+const SUN_LOCAL_SPACE: Vec3 = Vec3::new(0.45, 0.58, 0.68);
 
 /// A perspective camera for the orbital map. The position is f64 (Mm) so the
 /// full-scale system stays precise; projection is camera-relative.
@@ -390,6 +393,11 @@ struct World {
     /// Show the MOON BASE structures-catalog panel (only for the full colony,
     /// not single delivered modules).
     base_panel: bool,
+    /// Deep-space scene (asteroid): suppress the planet terrain and render a
+    /// pure starfield sky around the body at the origin.
+    space: bool,
+    /// Name shown for the body being inspected in a deep-space scene.
+    space_label: &'static str,
     /// Render the surface as the moon: grey regolith + black airless sky.
     lunar: bool,
     /// Height (m) the lander floats above the surface (0 = landed).
@@ -504,6 +512,8 @@ impl World {
             base_mesh: None,
             fairing_open: 0.0,
             base_panel: false,
+            space: false,
+            space_label: "",
             lunar: false,
             lander_alt: 0.0,
             lander_firing: false,
@@ -684,8 +694,15 @@ impl World {
         } else {
             [HORIZON[0], HORIZON[1], HORIZON[2], 1.0 / 160_000.0]
         };
-        // A low, grazing sun on the moon throws long shadows off the crater rims.
-        let sun_l = if self.lunar { SUN_LOCAL_MOON } else { SUN_LOCAL };
+        // A low, grazing sun on the moon throws long shadows off the crater rims;
+        // a higher sun for deep-space asteroid portraits.
+        let sun_l = if self.space {
+            SUN_LOCAL_SPACE
+        } else if self.lunar {
+            SUN_LOCAL_MOON
+        } else {
+            SUN_LOCAL
+        };
         MeshUniforms {
             viewproj: vp.to_cols_array_2d(),
             sun: [sun_l.x, sun_l.y, sun_l.z, lunar],
@@ -715,7 +732,13 @@ impl World {
         let cam_world = self.cam_world(self.camera_eye_local());
         // Sun in world coords, matching the mesh shader's local sun direction
         // (a low, grazing sun on the moon).
-        let sl = if self.lunar { SUN_LOCAL_MOON } else { SUN_LOCAL };
+        let sl = if self.space {
+            SUN_LOCAL_SPACE
+        } else if self.lunar {
+            SUN_LOCAL_MOON
+        } else {
+            SUN_LOCAL
+        };
         let sun = (self.launch_east * sl.x as f64
             + self.launch_up * sl.y as f64
             + self.launch_north * sl.z as f64)
@@ -730,7 +753,7 @@ impl World {
                 cam_world.x as f32,
                 cam_world.y as f32,
                 cam_world.z as f32,
-                if self.lunar { 1.0 } else { 0.0 },
+                if self.space { 2.0 } else if self.lunar { 1.0 } else { 0.0 },
             ],
             params: [tan, aspect, self.body.radius as f32, r_atm as f32],
         }
@@ -1326,6 +1349,12 @@ impl World {
     /// Rebuild the full-planet LOD terrain, camera-relative to the current
     /// `ref_local`, refined toward the camera. Called when the reference moves.
     fn rebuild_terrain(&mut self) {
+        // Deep-space (asteroid) scenes have no planet underfoot.
+        if self.space {
+            self.terrain_verts.clear();
+            self.terrain_count = 0;
+            return;
+        }
         let cam_world = self.cam_world(self.camera_eye_local());
         let m = rocket::planet_terrain(
             cam_world,
@@ -3367,6 +3396,78 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.rocket_focus_y = 2.6;
             0.0
         }
+        "ast_orbit" => {
+            // a large asteroid seen from orbit, lit against a starfield.
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.lunar = true; // airless lighting
+            world.space = true; // no planet, starfield sky
+            world.base_mesh = Some(rocket::asteroid_preset(0));
+            world.space_label = rocket::ASTEROID_NAMES[0];
+            world.rocket_az = 0.55;
+            world.rocket_el = 0.33;
+            world.rocket_dist = 1350.0;
+            world.rocket_focus_y = 0.0;
+            0.0
+        }
+        "ast_orbit2" => {
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.lunar = true;
+            world.space = true;
+            world.base_mesh = Some(rocket::asteroid_preset(2)); // elongated peanut
+            world.space_label = rocket::ASTEROID_NAMES[2];
+            world.rocket_az = 0.55;
+            world.rocket_el = 0.33;
+            world.rocket_dist = 1050.0;
+            world.rocket_focus_y = 0.0;
+            0.0
+        }
+        "ast_orbit3" => {
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.lunar = true;
+            world.space = true;
+            world.base_mesh = Some(rocket::asteroid_preset(3)); // long shard
+            world.space_label = rocket::ASTEROID_NAMES[3];
+            world.rocket_az = 0.5;
+            world.rocket_el = 0.34;
+            world.rocket_dist = 1300.0;
+            world.rocket_focus_y = 0.0;
+            0.0
+        }
+        "ast_surf" => {
+            // down near the surface of a large asteroid: rubble horizon + space.
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.lunar = true;
+            world.space = true;
+            world.base_mesh = Some(rocket::asteroid_preset(1)); // squat, cratered
+            world.space_label = rocket::ASTEROID_NAMES[1];
+            world.rocket_az = 0.9;
+            world.rocket_el = 0.07;
+            world.rocket_dist = 545.0;
+            world.rocket_focus_y = 250.0;
+            0.0
+        }
+        "ast_surf2" => {
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.lunar = true;
+            world.space = true;
+            world.base_mesh = Some(rocket::asteroid_preset(2));
+            world.space_label = rocket::ASTEROID_NAMES[2];
+            world.rocket_az = 0.6;
+            world.rocket_el = 0.08;
+            world.rocket_dist = 430.0;
+            world.rocket_focus_y = 170.0;
+            0.0
+        }
         "moonbase" => {
             // an assembled moon base on the cratered surface: HQ, mining,
             // reactor, lunar VAB, printer, tourist dome, spaceport, hotel and
@@ -3930,6 +4031,16 @@ fn main() {
                 "botland"
             } else if args.iter().any(|a| a == "rcsdemo") {
                 "rcsdemo"
+            } else if args.iter().any(|a| a == "ast_orbit2") {
+                "ast_orbit2"
+            } else if args.iter().any(|a| a == "ast_orbit3") {
+                "ast_orbit3"
+            } else if args.iter().any(|a| a == "ast_orbit") {
+                "ast_orbit"
+            } else if args.iter().any(|a| a == "ast_surf2") {
+                "ast_surf2"
+            } else if args.iter().any(|a| a == "ast_surf") {
+                "ast_surf"
             } else if args.iter().any(|a| a == "cargoparts") {
                 "cargoparts"
             } else if args.iter().any(|a| a == "cargo") {
@@ -3999,6 +4110,11 @@ fn main() {
                 "m6_landed" => "out/m6_landed.png",
                 "botland" => "out/botland.png",
                 "rcsdemo" => "out/rcsdemo.png",
+                "ast_orbit" => "out/ast_orbit.png",
+                "ast_orbit2" => "out/ast_orbit2.png",
+                "ast_orbit3" => "out/ast_orbit3.png",
+                "ast_surf" => "out/ast_surf.png",
+                "ast_surf2" => "out/ast_surf2.png",
                 "cargo" => "out/cargo.png",
                 "cargoparts" => "out/cargoparts.png",
                 "delivery" => "out/delivery.png",

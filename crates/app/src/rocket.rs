@@ -632,6 +632,170 @@ pub fn cargo_module(idx: usize) -> Mesh {
     m
 }
 
+// ----------------------------------------------------------------------------
+// Procedural asteroids. An irregular ("potato") body: a cube-sphere displaced
+// by value-noise lumps and gouged by a handful of impact craters, then stretched
+// into an ellipsoid. Built about the origin in metres, lit as an airless rock.
+// ----------------------------------------------------------------------------
+
+fn hash31(p: Vec3) -> f32 {
+    let h = (p.x * 127.1 + p.y * 311.7 + p.z * 74.7).sin() * 43758.547;
+    h - h.floor()
+}
+
+/// Smooth value noise in 3D (trilinear interpolation of a hashed lattice).
+fn vnoise(p: Vec3) -> f32 {
+    let i = p.floor();
+    let f = p - i;
+    let u = f * f * (Vec3::splat(3.0) - 2.0 * f); // smoothstep weights
+    let c = |dx: f32, dy: f32, dz: f32| hash31(i + Vec3::new(dx, dy, dz));
+    let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+    let x00 = lerp(c(0., 0., 0.), c(1., 0., 0.), u.x);
+    let x10 = lerp(c(0., 1., 0.), c(1., 1., 0.), u.x);
+    let x01 = lerp(c(0., 0., 1.), c(1., 0., 1.), u.x);
+    let x11 = lerp(c(0., 1., 1.), c(1., 1., 1.), u.x);
+    let y0 = lerp(x00, x10, u.y);
+    let y1 = lerp(x01, x11, u.y);
+    lerp(y0, y1, u.z)
+}
+
+/// Fractal value noise in [-1, 1].
+fn fbm3(p: Vec3, octaves: i32) -> f32 {
+    let mut sum = 0.0;
+    let mut amp = 0.5;
+    let mut freq = 1.0;
+    for _ in 0..octaves {
+        sum += amp * (vnoise(p * freq) * 2.0 - 1.0);
+        freq *= 2.0;
+        amp *= 0.5;
+    }
+    sum
+}
+
+fn sphere_rand(seed: f32, k: usize) -> Vec3 {
+    let a = hash31(Vec3::new(seed, k as f32, 1.0)) * TAU;
+    let z = hash31(Vec3::new(seed, k as f32, 2.0)) * 2.0 - 1.0;
+    let r = (1.0 - z * z).max(0.0).sqrt();
+    Vec3::new(r * a.cos(), z, r * a.sin())
+}
+
+/// Unit cube-face point (u, v in [-1, 1]) mapped to a sphere direction.
+fn cube_dir(face: usize, u: f32, v: f32) -> Vec3 {
+    let p = match face {
+        0 => Vec3::new(1.0, v, -u),
+        1 => Vec3::new(-1.0, v, u),
+        2 => Vec3::new(u, 1.0, -v),
+        3 => Vec3::new(u, -1.0, v),
+        4 => Vec3::new(u, v, 1.0),
+        _ => Vec3::new(-u, v, -1.0),
+    };
+    p.normalize()
+}
+
+fn asteroid_color(dir: Vec3, disp: f32, n: Vec3) -> [f32; 3] {
+    // height-tinted rock: darker in the gouged lows, lighter on raised faces
+    let h = ((disp - 0.82) / 0.5).clamp(0.0, 1.0);
+    let base = mix3([0.19, 0.16, 0.13], [0.41, 0.37, 0.31], h);
+    // expose slightly cooler rock on steep slopes (fresh fracture faces)
+    let slope = (1.0 - n.dot(dir)).clamp(0.0, 1.0);
+    let c = mix3(base, [0.30, 0.30, 0.31], slope * 0.55);
+    let j = 0.84 + 0.32 * hash31(dir * 41.0);
+    [c[0] * j, c[1] * j, c[2] * j]
+}
+
+/// A procedural asteroid of mean `radius` (m), stretched by `elong` (per-axis
+/// scale) and roughened by `seed`. `craters` impact basins are gouged in.
+pub fn asteroid(seed: f32, radius: f32, elong: Vec3, craters: usize) -> Mesh {
+    let off = Vec3::splat(seed * 13.7 + 4.0);
+    let crat: Vec<(Vec3, f32, f32)> = (0..craters)
+        .map(|k| {
+            let dir = sphere_rand(seed + 7.0, k);
+            let a = hash31(Vec3::new(seed, k as f32, 3.0));
+            let b = hash31(Vec3::new(seed, k as f32, 5.0));
+            (dir, 0.20 + 0.55 * a, 0.10 + 0.16 * b)
+        })
+        .collect();
+
+    let displace = |dir: Vec3| -> f32 {
+        let lump = fbm3(dir * 2.0 + off, 5);
+        let fine = fbm3(dir * 6.5 + off, 3);
+        let mut h = 1.0 + 0.30 * lump + 0.08 * fine;
+        for &(c, cr, depth) in &crat {
+            let ang = (1.0 - dir.dot(c).clamp(-1.0, 1.0)).max(0.0); // 0 at centre
+            let t = (ang / cr).min(1.0);
+            let bowl = 1.0 - t;
+            let bowl = bowl * bowl * (3.0 - 2.0 * bowl); // smooth bowl
+            h -= depth * bowl;
+        }
+        h.max(0.45)
+    };
+    let surf = |dir: Vec3| -> Vec3 {
+        let d = displace(dir);
+        Vec3::new(dir.x * elong.x, dir.y * elong.y, dir.z * elong.z) * (radius * d)
+    };
+
+    let n = 44usize;
+    let mut m = Mesh::default();
+    for face in 0..6 {
+        let mut pos = vec![Vec3::ZERO; n * n];
+        let mut dir = vec![Vec3::ZERO; n * n];
+        for j in 0..n {
+            for i in 0..n {
+                let u = (i as f32 / (n - 1) as f32) * 2.0 - 1.0;
+                let v = (j as f32 / (n - 1) as f32) * 2.0 - 1.0;
+                let dd = cube_dir(face, u, v);
+                dir[j * n + i] = dd;
+                pos[j * n + i] = surf(dd);
+            }
+        }
+        // smooth normals via central differences within the face grid
+        let mut nrm = vec![Vec3::ZERO; n * n];
+        for j in 0..n {
+            for i in 0..n {
+                let im = i.saturating_sub(1);
+                let ip = (i + 1).min(n - 1);
+                let jm = j.saturating_sub(1);
+                let jp = (j + 1).min(n - 1);
+                let du = pos[j * n + ip] - pos[j * n + im];
+                let dv = pos[jp * n + i] - pos[jm * n + i];
+                let mut nn = du.cross(dv).normalize_or_zero();
+                if nn.dot(dir[j * n + i]) < 0.0 {
+                    nn = -nn;
+                }
+                if nn.length_squared() < 1e-6 {
+                    nn = dir[j * n + i];
+                }
+                nrm[j * n + i] = nn;
+            }
+        }
+        let col: Vec<[f32; 3]> =
+            (0..n * n).map(|k| asteroid_color(dir[k], displace(dir[k]), nrm[k])).collect();
+        for j in 0..n - 1 {
+            for i in 0..n - 1 {
+                let a = j * n + i;
+                let b = j * n + i + 1;
+                let c = (j + 1) * n + i;
+                let d = (j + 1) * n + i + 1;
+                m.tri3([pos[a], pos[c], pos[b]], [nrm[a], nrm[c], nrm[b]], [col[a], col[c], col[b]]);
+                m.tri3([pos[b], pos[c], pos[d]], [nrm[b], nrm[c], nrm[d]], [col[b], col[c], col[d]]);
+            }
+        }
+    }
+    m
+}
+
+/// A few named large asteroids with distinct silhouettes.
+pub fn asteroid_preset(idx: usize) -> Mesh {
+    match idx {
+        0 => asteroid(2.0, 520.0, Vec3::new(1.04, 0.96, 1.0), 6), // near-spherical
+        1 => asteroid(8.0, 470.0, Vec3::new(1.12, 0.84, 1.05), 9), // squat, cratered
+        2 => asteroid(15.0, 360.0, Vec3::new(1.7, 0.78, 0.86), 5), // elongated peanut
+        _ => asteroid(23.0, 430.0, Vec3::new(1.55, 0.82, 0.95), 7), // long shard
+    }
+}
+
+pub const ASTEROID_NAMES: &[&str] = &["Hebe", "Pallas", "Itokara", "Eron"];
+
 /// The five cargo modules lined up in a row (for a parts preview), each
 /// unpacked/standing on the ground, spaced along +X centred on the origin.
 pub fn cargo_catalog() -> Mesh {

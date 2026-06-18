@@ -58,7 +58,7 @@ fn fs(in: VsOut) -> FsOut {
     // use the bluish hemispheric sky/ground ambient.
     let airless = u.sun.w;
     let amb_air = mix(vec3<f32>(0.18, 0.16, 0.14), vec3<f32>(0.40, 0.45, 0.55), clamp(n.y * 0.5 + 0.5, 0.0, 1.0));
-    let amb_moon = vec3<f32>(0.05, 0.05, 0.055);
+    let amb_moon = vec3<f32>(0.09, 0.09, 0.10);
     let amb = mix(amb_air, amb_moon, airless);
     let sun_col = mix(vec3<f32>(1.0, 0.97, 0.9), vec3<f32>(1.25, 1.22, 1.15), airless);
     // Inside the assembly building (interior -> 1) the roof shades the sun, so

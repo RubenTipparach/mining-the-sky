@@ -16,7 +16,9 @@ pub fn build(ctx: &egui::Context, world: &mut World) {
     apply_theme(ctx);
     match world.view {
         View::Rocket => {
-            if world.base_mesh.is_some() && world.base_panel {
+            if world.space {
+                asteroid_panel(ctx, world); // inspecting an asteroid
+            } else if world.base_mesh.is_some() && world.base_panel {
                 moonbase_panel(ctx, world); // surveying the colony
             } else if world.base_mesh.is_some() {
                 // a single delivered cargo module on the surface: no panel
@@ -310,6 +312,19 @@ fn lander_panel(ctx: &egui::Context, world: &mut World) {
             } else {
                 ui.label(egui::RichText::new("Powered descent").color(WARN));
             }
+        });
+}
+
+/// A small readout while inspecting an asteroid in deep space.
+fn asteroid_panel(ctx: &egui::Context, world: &mut World) {
+    let name = if world.space_label.is_empty() { "ASTEROID" } else { world.space_label };
+    egui::Window::new("ASTEROID")
+        .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 12.0))
+        .default_width(200.0)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.label(egui::RichText::new(name).heading().color(AMBER));
+            ui.label(egui::RichText::new("Minor body - C/S-type rubble").color(DIM));
         });
 }
 
