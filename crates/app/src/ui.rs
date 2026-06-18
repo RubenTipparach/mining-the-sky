@@ -16,7 +16,9 @@ pub fn build(ctx: &egui::Context, world: &mut World) {
     apply_theme(ctx);
     match world.view {
         View::Rocket => {
-            if world.show_lander {
+            if world.base_mesh.is_some() {
+                moonbase_panel(ctx, world); // surveying the colony
+            } else if world.show_lander {
                 lander_panel(ctx, world); // on the lunar surface
             } else if world.launch.is_some() {
                 launch_panel(ctx, world);
@@ -306,6 +308,26 @@ fn lander_panel(ctx: &egui::Context, world: &mut World) {
             } else {
                 ui.label(egui::RichText::new("Powered descent").color(WARN));
             }
+        });
+}
+
+/// Shown when surveying the moon base: the buildable structures catalog.
+fn moonbase_panel(ctx: &egui::Context, _world: &mut World) {
+    egui::Window::new("MOON BASE")
+        .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 12.0))
+        .default_width(250.0)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.label(egui::RichText::new("MOON BASE").heading().color(AMBER));
+            ui.label(egui::RichText::new("Buildable structures").color(DIM));
+            ui.separator();
+            egui::Grid::new("base_parts").num_columns(2).show(ui, |ui| {
+                for p in crate::rocket::BASE_PARTS {
+                    ui.label(egui::RichText::new(p.name).color(GOOD));
+                    ui.label(egui::RichText::new(p.kind).color(DIM));
+                    ui.end_row();
+                }
+            });
         });
 }
 

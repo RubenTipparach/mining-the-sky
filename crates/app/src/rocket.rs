@@ -138,6 +138,67 @@ impl Mesh {
         self.quad(ca[0], ca[1], ca[2], ca[3], -dir, col);
         self.quad(cb[3], cb[2], cb[1], cb[0], dir, col);
     }
+
+    /// A hemispherical dome of `radius` and `height`, sitting on `(cx, y0, cz)`,
+    /// built from latitude rings (outward normals). Good for habitat / tourist
+    /// domes.
+    #[allow(clippy::too_many_arguments)]
+    fn dome(&mut self, cx: f32, cz: f32, y0: f32, radius: f32, height: f32, sides: usize, rings: usize, col: [f32; 3]) {
+        use std::f32::consts::FRAC_PI_2;
+        let center = Vec3::new(cx, y0, cz);
+        for r in 0..rings {
+            let t0 = r as f32 / rings as f32;
+            let t1 = (r + 1) as f32 / rings as f32;
+            let (ya, ra) = (y0 + height * (t0 * FRAC_PI_2).sin(), radius * (t0 * FRAC_PI_2).cos());
+            let (yb, rb) = (y0 + height * (t1 * FRAC_PI_2).sin(), radius * (t1 * FRAC_PI_2).cos());
+            for i in 0..sides {
+                let a0 = i as f32 / sides as f32 * TAU;
+                let a1 = (i + 1) as f32 / sides as f32 * TAU;
+                let p00 = Vec3::new(cx + ra * a0.cos(), ya, cz + ra * a0.sin());
+                let p10 = Vec3::new(cx + ra * a1.cos(), ya, cz + ra * a1.sin());
+                let p11 = Vec3::new(cx + rb * a1.cos(), yb, cz + rb * a1.sin());
+                let p01 = Vec3::new(cx + rb * a0.cos(), yb, cz + rb * a0.sin());
+                if r == rings - 1 {
+                    let apex = Vec3::new(cx, y0 + height, cz);
+                    let n = (0.5 * (p00 + p10) - center).normalize_or_zero();
+                    self.tri(p00, p10, apex, n, col);
+                } else {
+                    let nm = (0.25 * (p00 + p10 + p11 + p01) - center).normalize_or_zero();
+                    self.quad(p00, p10, p11, p01, nm, col);
+                }
+            }
+        }
+    }
+
+    /// A downward hemisphere (mirror of `dome`), for the bottom of a spherical
+    /// tank. Apex hangs `height` below `(cx, y0, cz)`.
+    #[allow(clippy::too_many_arguments)]
+    fn dome_down(&mut self, cx: f32, cz: f32, y0: f32, radius: f32, height: f32, sides: usize, rings: usize, col: [f32; 3]) {
+        use std::f32::consts::FRAC_PI_2;
+        let center = Vec3::new(cx, y0, cz);
+        for r in 0..rings {
+            let t0 = r as f32 / rings as f32;
+            let t1 = (r + 1) as f32 / rings as f32;
+            let (ya, ra) = (y0 - height * (t0 * FRAC_PI_2).sin(), radius * (t0 * FRAC_PI_2).cos());
+            let (yb, rb) = (y0 - height * (t1 * FRAC_PI_2).sin(), radius * (t1 * FRAC_PI_2).cos());
+            for i in 0..sides {
+                let a0 = i as f32 / sides as f32 * TAU;
+                let a1 = (i + 1) as f32 / sides as f32 * TAU;
+                let p00 = Vec3::new(cx + ra * a0.cos(), ya, cz + ra * a0.sin());
+                let p10 = Vec3::new(cx + ra * a1.cos(), ya, cz + ra * a1.sin());
+                let p11 = Vec3::new(cx + rb * a1.cos(), yb, cz + rb * a1.sin());
+                let p01 = Vec3::new(cx + rb * a0.cos(), yb, cz + rb * a0.sin());
+                if r == rings - 1 {
+                    let apex = Vec3::new(cx, y0 - height, cz);
+                    let n = (0.5 * (p00 + p10) - center).normalize_or_zero();
+                    self.tri(p10, p00, apex, n, col);
+                } else {
+                    let nm = (0.25 * (p00 + p10 + p11 + p01) - center).normalize_or_zero();
+                    self.quad(p01, p11, p10, p00, nm, col);
+                }
+            }
+        }
+    }
 }
 
 /// A 3D lunar descent module: a gold-foil descent stage with a big engine bell,
@@ -183,6 +244,294 @@ pub fn lander() -> Mesh {
         let (cx, cz) = (a.cos(), a.sin());
         let bx = Vec3::new(cx * br * 0.96, 3.6, cz * br * 0.96);
         m.bx(bx, Vec3::new(0.28, 0.34, 0.28), dark);
+    }
+    m
+}
+
+// ----------------------------------------------------------------------------
+// Moon-base structures. A small catalog of modular surface buildings, each
+// built about its own footprint centre at (cx, 0, cz) so they can be placed on
+// the lunar surface (the y=0 plane of the rocket-view lunar terrain).
+// ----------------------------------------------------------------------------
+
+/// Metadata for a placeable base structure (name + footprint radius + blurb).
+pub struct BaseStructure {
+    pub name: &'static str,
+    pub kind: &'static str,
+    /// Approximate footprint radius (m) for layout / collision.
+    pub footprint: f32,
+    pub desc: &'static str,
+}
+
+/// The buildable moon-base parts catalog (order matches `add_base_structure`).
+pub const BASE_PARTS: &[BaseStructure] = &[
+    BaseStructure { name: "HQ / Admin", kind: "command", footprint: 8.0, desc: "Command and administration tower with comms dish." },
+    BaseStructure { name: "Mining Outpost", kind: "industry", footprint: 9.0, desc: "Regolith drill derrick, ore hopper and conveyor." },
+    BaseStructure { name: "Power Reactor", kind: "power", footprint: 8.0, desc: "Compact fission reactor with radiator fins." },
+    BaseStructure { name: "Lunar VAB", kind: "industry", footprint: 11.0, desc: "Vehicle assembly hangar for surface-built craft." },
+    BaseStructure { name: "3D Printing Facility", kind: "industry", footprint: 9.0, desc: "Gantry printer that fabricates parts from regolith." },
+    BaseStructure { name: "Tourist Hub", kind: "civic", footprint: 9.0, desc: "Domed visitor centre and observation gallery." },
+    BaseStructure { name: "Spaceport", kind: "transport", footprint: 12.0, desc: "Landing pad with control tower and approach lights." },
+    BaseStructure { name: "Hotel", kind: "civic", footprint: 8.0, desc: "Tiered habitat hotel with panoramic window decks." },
+    BaseStructure { name: "Refueling Station", kind: "transport", footprint: 9.0, desc: "Cryogenic propellant tanks and transfer pipes." },
+];
+
+// Shared lunar-base palette.
+const BB_WHITE: [f32; 3] = [0.84, 0.86, 0.90];
+const BB_TRIM: [f32; 3] = [0.52, 0.55, 0.60];
+const BB_DARK: [f32; 3] = [0.12, 0.13, 0.17];
+const BB_WIN: [f32; 3] = [0.30, 0.62, 0.85];
+const BB_SOLAR: [f32; 3] = [0.10, 0.14, 0.36];
+const BB_GOLD: [f32; 3] = [0.82, 0.66, 0.26];
+const BB_STEEL: [f32; 3] = [0.58, 0.61, 0.66];
+const BB_RED: [f32; 3] = [0.80, 0.22, 0.16];
+const BB_CYAN: [f32; 3] = [0.55, 0.82, 0.95];
+const BB_INDUST: [f32; 3] = [0.78, 0.62, 0.22];
+
+/// A flat solar array panel: a thin tilted slab on a short post at (cx, cz).
+fn solar_array(m: &mut Mesh, cx: f32, cz: f32, w: f32, d: f32, col: [f32; 3]) {
+    m.frustum(cx, cz, 0.0, 1.4, 0.16, 0.16, 6, BB_STEEL, false, false); // post
+    // a slab, slightly raised, with a frame underneath
+    m.bx(Vec3::new(cx, 1.7, cz), Vec3::new(w, 0.08, d), col);
+    m.bx(Vec3::new(cx, 1.55, cz), Vec3::new(w * 0.96, 0.05, d * 0.96), BB_TRIM);
+}
+
+/// A low connecting corridor tube between two ground points.
+fn corridor(m: &mut Mesh, ax: f32, az: f32, bx: f32, bz: f32) {
+    let a = Vec3::new(ax, 1.1, az);
+    let b = Vec3::new(bx, 1.1, bz);
+    m.strut(a, b, 0.9, BB_WHITE);
+}
+
+fn build_hq(m: &mut Mesh, cx: f32, cz: f32) {
+    // stacked command tower, narrowing upward
+    m.bx(Vec3::new(cx, 2.6, cz), Vec3::new(5.0, 2.6, 4.2), BB_WHITE);
+    m.bx(Vec3::new(cx, 2.7, cz), Vec3::new(5.06, 0.8, 4.26), BB_WIN); // window band
+    m.bx(Vec3::new(cx, 6.4, cz), Vec3::new(3.6, 1.4, 3.0), BB_WHITE);
+    m.bx(Vec3::new(cx, 6.5, cz), Vec3::new(3.66, 0.6, 3.06), BB_WIN);
+    m.bx(Vec3::new(cx, 8.6, cz), Vec3::new(2.2, 0.9, 1.9), BB_TRIM);
+    // comms dish on a mast
+    m.frustum(cx, cz, 9.5, 12.0, 0.12, 0.12, 6, BB_STEEL, false, false);
+    m.frustum(cx + 0.9, cz, 11.0, 11.9, 0.0, 1.4, 12, BB_WHITE, false, true);
+    // entrance + flag mast
+    m.bx(Vec3::new(cx, 1.0, cz + 4.4), Vec3::new(1.2, 1.0, 0.5), BB_DARK);
+    m.frustum(cx - 4.0, cz + 3.0, 0.0, 7.0, 0.07, 0.07, 5, BB_STEEL, false, false);
+    m.bx(Vec3::new(cx - 3.6, 6.4, cz + 3.0), Vec3::new(0.9, 0.5, 0.04), BB_RED);
+}
+
+fn build_mining(m: &mut Mesh, cx: f32, cz: f32) {
+    // a dark excavation pit lip + derrick over it
+    m.frustum(cx, cz, 0.0, 0.3, 4.0, 3.2, 8, BB_TRIM, true, false);
+    m.frustum(cx, cz, 0.05, 0.25, 3.0, 2.6, 8, BB_DARK, true, false);
+    // four legs of the drill derrick converging to a head
+    let head = Vec3::new(cx, 11.0, cz);
+    for k in 0..4 {
+        let a = (k as f32 + 0.5) * std::f32::consts::FRAC_PI_2;
+        let foot = Vec3::new(cx + 3.4 * a.cos(), 0.2, cz + 3.4 * a.sin());
+        m.strut(foot, head, 0.18, BB_INDUST);
+        let mid = Vec3::new(cx + 1.9 * a.cos(), 5.5, cz + 1.9 * a.sin());
+        m.strut(foot + Vec3::new(0.0, 4.0, 0.0), mid, 0.1, BB_STEEL);
+    }
+    // drill string down into the pit + winch head
+    m.frustum(cx, cz, 0.0, 10.5, 0.25, 0.25, 6, BB_STEEL, false, false);
+    m.bx(Vec3::new(cx, 11.2, cz), Vec3::new(1.0, 0.8, 1.0), BB_INDUST);
+    // ore hopper + sloped conveyor off to the side
+    m.frustum(cx + 6.0, cz, 1.6, 4.6, 1.9, 1.2, 6, BB_STEEL, false, true);
+    m.bx(Vec3::new(cx + 6.0, 0.8, cz), Vec3::new(2.0, 0.8, 2.0), BB_TRIM);
+    m.strut(Vec3::new(cx + 3.0, 1.0, cz), Vec3::new(cx + 6.0, 3.4, cz), 0.5, BB_DARK);
+}
+
+fn build_reactor(m: &mut Mesh, cx: f32, cz: f32) {
+    // containment cylinder + dome
+    m.frustum(cx, cz, 0.0, 5.0, 2.6, 2.4, 16, BB_WHITE, true, false);
+    m.bx(Vec3::new(cx, 2.4, cz), Vec3::new(2.66, 0.7, 2.66), BB_RED); // hazard band (square overlay reads as a ring on the round body corners; keep subtle)
+    m.dome(cx, cz, 5.0, 2.4, 1.8, 16, 4, BB_STEEL);
+    // radiator fins radiating around the base
+    for k in 0..6 {
+        let a = k as f32 / 6.0 * TAU;
+        let (dx, dz) = (a.cos(), a.sin());
+        let bx = cx + dx * 4.6;
+        let bz = cz + dz * 4.6;
+        // a tall thin panel aligned radially
+        let along = Vec3::new(dz, 0.0, -dx); // perpendicular for thickness
+        let c = Vec3::new(bx, 2.6, bz);
+        // build as a thin box: large along radial+vertical, thin across
+        let he = Vec3::new(1.9 * dx.abs() + 0.12, 2.2, 1.9 * dz.abs() + 0.12);
+        let _ = along;
+        m.bx(c, Vec3::new(he.x, he.y, he.z), BB_TRIM);
+    }
+    // warning beacon
+    m.frustum(cx, cz, 6.8, 7.4, 0.18, 0.1, 6, BB_RED, false, true);
+}
+
+fn build_vab(m: &mut Mesh, cx: f32, cz: f32) {
+    // tall assembly hangar with a big door recess and roof trusses
+    m.bx(Vec3::new(cx, 7.0, cz), Vec3::new(6.0, 7.0, 5.0), BB_WHITE);
+    // big door (dark recess) on the +Z face
+    m.bx(Vec3::new(cx, 5.0, cz + 5.02), Vec3::new(3.6, 5.0, 0.2), BB_DARK);
+    m.bx(Vec3::new(cx, 5.0, cz + 5.06), Vec3::new(0.2, 5.0, 0.2), BB_TRIM); // door split
+    // roof trusses
+    for s in [-1.0f32, 0.0, 1.0] {
+        m.strut(Vec3::new(cx - 6.0, 14.0, cz + s * 3.5), Vec3::new(cx + 6.0, 14.0, cz + s * 3.5), 0.18, BB_STEEL);
+    }
+    m.bx(Vec3::new(cx, 14.3, cz), Vec3::new(6.1, 0.4, 5.1), BB_TRIM); // roof cap
+    // "LVAB" stripe
+    m.bx(Vec3::new(cx, 11.6, cz + 5.02), Vec3::new(4.2, 0.7, 0.06), BB_GOLD);
+}
+
+fn build_printer(m: &mut Mesh, cx: f32, cz: f32) {
+    // low open fabrication bay with a gantry printer over a build plate
+    m.bx(Vec3::new(cx, 1.4, cz), Vec3::new(5.5, 1.4, 5.5), BB_WHITE);
+    m.bx(Vec3::new(cx, 2.9, cz), Vec3::new(4.6, 0.2, 4.6), BB_DARK); // open bay floor
+    m.bx(Vec3::new(cx, 3.0, cz), Vec3::new(2.4, 0.25, 2.4), BB_TRIM); // build plate
+    // gantry: two rails + a moving crossbeam + a print head
+    for s in [-1.0f32, 1.0] {
+        m.bx(Vec3::new(cx + s * 4.4, 4.4, cz), Vec3::new(0.25, 1.6, 4.6), BB_STEEL);
+    }
+    m.bx(Vec3::new(cx, 5.6, cz + 1.2), Vec3::new(4.6, 0.3, 0.3), BB_STEEL); // crossbeam
+    m.bx(Vec3::new(cx + 1.0, 5.0, cz + 1.2), Vec3::new(0.4, 0.7, 0.4), BB_INDUST); // head
+    m.frustum(cx + 1.0, cz + 1.2, 4.3, 4.9, 0.06, 0.18, 6, BB_DARK, false, true); // nozzle
+}
+
+fn build_tourist(m: &mut Mesh, cx: f32, cz: f32) {
+    // a glass observation dome on a low ring wall, with an entrance vestibule
+    m.frustum(cx, cz, 0.0, 1.4, 5.2, 5.2, 20, BB_WHITE, false, false); // ring wall
+    m.frustum(cx, cz, 0.0, 0.3, 5.2, 5.4, 20, BB_TRIM, true, false); // base lip
+    m.dome(cx, cz, 1.4, 5.0, 4.4, 20, 5, BB_CYAN); // glass dome
+    // meridian ribs on the dome
+    for k in 0..6 {
+        let a = k as f32 / 6.0 * TAU;
+        m.strut(
+            Vec3::new(cx + 5.0 * a.cos(), 1.5, cz + 5.0 * a.sin()),
+            Vec3::new(cx, 5.7, cz),
+            0.08,
+            BB_TRIM,
+        );
+    }
+    m.bx(Vec3::new(cx, 1.2, cz + 5.4), Vec3::new(1.6, 1.2, 1.2), BB_WHITE); // entrance
+}
+
+fn build_spaceport(m: &mut Mesh, cx: f32, cz: f32) {
+    // a circular landing pad with markings + a control tower beside it
+    m.frustum(cx, cz, 0.0, 0.35, 7.0, 7.0, 24, BB_TRIM, true, true);
+    m.frustum(cx, cz, 0.36, 0.42, 3.0, 3.0, 20, BB_GOLD, true, false); // centre ring
+    m.frustum(cx, cz, 0.43, 0.47, 0.9, 0.9, 12, BB_DARK, true, false);
+    // four corner pad lights
+    for k in 0..4 {
+        let a = (k as f32 + 0.5) * std::f32::consts::FRAC_PI_2;
+        m.frustum(cx + 6.2 * a.cos(), cz + 6.2 * a.sin(), 0.4, 1.1, 0.18, 0.1, 5, BB_RED, false, true);
+    }
+    // control tower off to one edge
+    let tx = cx + 8.4;
+    m.frustum(tx, cz, 0.0, 8.0, 0.9, 0.7, 8, BB_WHITE, true, false);
+    m.frustum(tx, cz, 8.0, 9.4, 2.0, 1.6, 8, BB_WHITE, false, true); // flared cab
+    m.frustum(tx, cz, 8.2, 9.1, 2.06, 1.66, 8, BB_WIN, false, false); // cab glass
+    m.frustum(tx, cz, 9.4, 11.5, 0.06, 0.06, 4, BB_STEEL, false, false); // antenna
+}
+
+fn build_hotel(m: &mut Mesh, cx: f32, cz: f32) {
+    // tiered "wedding cake" habitat: stacked cylinders with window bands
+    let tiers = [(0.0f32, 4.6f32), (3.4, 3.8), (6.6, 3.0), (9.4, 2.2)];
+    for (i, &(y, r)) in tiers.iter().enumerate() {
+        let h = if i + 1 < tiers.len() { tiers[i + 1].0 } else { y + 2.4 };
+        m.frustum(cx, cz, y, h, r, r * 0.92, 18, BB_WHITE, i == 0, false);
+        // window band near the top of each tier
+        m.frustum(cx, cz, h - 0.8, h - 0.2, r * 0.94, r * 0.9, 18, BB_WIN, false, false);
+    }
+    m.dome(cx, cz, 11.8, 2.0, 1.6, 16, 4, BB_GOLD); // roof cupola
+    // viewing deck ring around the second tier
+    m.frustum(cx, cz, 3.3, 3.5, 4.4, 4.4, 18, BB_TRIM, false, false);
+}
+
+fn build_refuel(m: &mut Mesh, cx: f32, cz: f32) {
+    // two vertical cryo tanks + a spherical tank + connecting pipes
+    for &(dx, dz, r, h) in &[(-2.6f32, 0.0f32, 1.6f32, 7.0f32), (2.6, 0.0, 1.6, 7.0)] {
+        m.frustum(cx + dx, cz + dz, 0.0, h, r, r, 12, BB_WHITE, true, false);
+        m.dome(cx + dx, cz + dz, h, r, r * 0.8, 12, 3, BB_STEEL);
+        m.frustum(cx + dx, cz + dz, 0.0, 0.4, r * 1.05, r * 1.05, 12, BB_TRIM, true, false);
+    }
+    // spherical tank (dome up + dome down) on a cradle
+    let sy = 2.6;
+    m.dome(cx, cz + 4.2, sy, 1.8, 1.8, 14, 4, BB_GOLD);
+    m.dome_down(cx, cz + 4.2, sy, 1.8, 1.8, 14, 4, BB_GOLD);
+    m.frustum(cx, cz + 4.2, 0.0, sy - 1.4, 0.4, 0.6, 6, BB_STEEL, false, false); // pedestal
+    // transfer pipes between tanks
+    m.strut(Vec3::new(cx - 2.6, 1.2, cz), Vec3::new(cx + 2.6, 1.2, cz), 0.22, BB_STEEL);
+    m.strut(Vec3::new(cx, 1.2, cz), Vec3::new(cx, 1.2, cz + 4.2), 0.22, BB_STEEL);
+    // a fuel-line mast / flag
+    m.frustum(cx + 4.0, cz, 0.0, 5.0, 0.08, 0.08, 5, BB_STEEL, false, false);
+    m.bx(Vec3::new(cx + 4.4, 4.4, cz), Vec3::new(0.8, 0.45, 0.04), BB_GOLD);
+}
+
+/// Draw base structure `idx` (matching `BASE_PARTS`) at ground centre (cx, cz).
+fn add_base_structure(m: &mut Mesh, idx: usize, cx: f32, cz: f32) {
+    match idx {
+        0 => build_hq(m, cx, cz),
+        1 => build_mining(m, cx, cz),
+        2 => build_reactor(m, cx, cz),
+        3 => build_vab(m, cx, cz),
+        4 => build_printer(m, cx, cz),
+        5 => build_tourist(m, cx, cz),
+        6 => build_spaceport(m, cx, cz),
+        7 => build_hotel(m, cx, cz),
+        _ => build_refuel(m, cx, cz),
+    }
+}
+
+/// A single base structure, centred at the origin (for a parts preview).
+pub fn base_structure(idx: usize) -> Mesh {
+    let mut m = Mesh::default();
+    add_base_structure(&mut m, idx % BASE_PARTS.len(), 0.0, 0.0);
+    m
+}
+
+/// The whole moon base, laid out around a central plaza with connecting
+/// corridors and solar arrays.
+pub fn moon_base() -> Mesh {
+    let mut m = Mesh::default();
+    // layout: ring of structures around a central habitat dome + plaza
+    let positions: [(f32, f32); 9] = [
+        (0.0, -30.0),   // HQ (front)
+        (34.0, -16.0),  // Mining
+        (40.0, 14.0),   // Reactor
+        (22.0, 34.0),   // VAB
+        (-22.0, 34.0),  // Printer
+        (-40.0, 14.0),  // Tourist
+        (-34.0, -16.0), // Spaceport
+        (-16.0, 18.0),  // Hotel (inner)
+        (16.0, 18.0),   // Refuel (inner)
+    ];
+    // central plaza pad + habitat dome
+    m.frustum(0.0, 4.0, 0.0, 0.25, 12.0, 12.0, 28, BB_TRIM, true, false);
+    m.dome(0.0, 4.0, 0.25, 6.0, 4.5, 20, 5, BB_WHITE);
+    m.frustum(0.0, 4.0, 0.25, 1.0, 6.0, 5.9, 20, BB_WIN, false, false);
+    // connecting corridors from the plaza out to each structure
+    for &(x, z) in &positions {
+        let d = (x * x + z * z).sqrt().max(1.0);
+        let (ux, uz) = (x / d, z / d);
+        corridor(&mut m, ux * 7.0, 4.0 + uz * 7.0, x - ux * 9.0, z - uz * 9.0);
+    }
+    for (i, &(x, z)) in positions.iter().enumerate() {
+        add_base_structure(&mut m, i, x, z);
+    }
+    // a solar-array field behind the reactor
+    for k in 0..6 {
+        let row = (k / 3) as f32;
+        let col = (k % 3) as f32;
+        solar_array(&mut m, 52.0 + col * 5.0, 26.0 + row * 6.0, 2.2, 2.6, BB_SOLAR);
+    }
+    m
+}
+
+/// All base structures lined up in a row (for a catalog / parts preview shot),
+/// spaced along +X centred on the origin.
+pub fn base_catalog() -> Mesh {
+    let mut m = Mesh::default();
+    let n = BASE_PARTS.len();
+    let spacing = 22.0f32;
+    for i in 0..n {
+        let cx = (i as f32 - (n - 1) as f32 * 0.5) * spacing;
+        add_base_structure(&mut m, i, cx, 0.0);
     }
     m
 }

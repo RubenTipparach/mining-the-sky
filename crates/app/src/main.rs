@@ -382,6 +382,8 @@ struct World {
     lander_mesh: rocket::Mesh,
     /// Show the lunar lander standing on the ground (instead of the rocket).
     show_lander: bool,
+    /// An assembled/previewed moon base mesh to draw on the surface, if any.
+    base_mesh: Option<rocket::Mesh>,
     /// Render the surface as the moon: grey regolith + black airless sky.
     lunar: bool,
     /// Height (m) the lander floats above the surface (0 = landed).
@@ -493,6 +495,7 @@ impl World {
             rack_mesh: rack_mesh_init,
             lander_mesh: rocket::lander(),
             show_lander: false,
+            base_mesh: None,
             lunar: false,
             lander_alt: 0.0,
             lander_firing: false,
@@ -1351,6 +1354,22 @@ impl World {
                 });
             }
         };
+        // the moon base on the surface (preview / overview), instead of the stack
+        if let Some(base) = self.base_mesh.as_ref() {
+            for v in &base.verts {
+                let local = Vec3::from(v.pos).as_dvec3();
+                out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: v.normal, color: v.color });
+            }
+            // optionally also show the lander parked at the base
+            if self.show_lander {
+                let b = DVec3::new(0.0, self.lander_alt as f64, 0.0);
+                for v in &self.lander_mesh.verts {
+                    let local = b + Vec3::from(v.pos).as_dvec3();
+                    out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: v.normal, color: v.color });
+                }
+            }
+            return out;
+        }
         // the lunar lander on the surface (preview / landed), instead of the launch stack
         if self.show_lander {
             let base = DVec3::new(0.0, self.lander_alt as f64, 0.0);
@@ -3275,6 +3294,48 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.rocket_focus_y = 3.0;
             0.0
         }
+        "moonbase" => {
+            // an assembled moon base on the cratered surface: HQ, mining,
+            // reactor, lunar VAB, printer, tourist dome, spaceport, hotel and
+            // refueling station around a central habitat plaza.
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.lunar = true;
+            world.base_mesh = Some(rocket::moon_base());
+            world.rocket_az = 5.5;
+            world.rocket_el = 0.42; // look down over the colony
+            world.rocket_dist = 165.0;
+            world.rocket_focus_y = 6.0;
+            0.0
+        }
+        "basetour" => {
+            // a ground-level view across the colony, close enough to read the
+            // building detail (plaza dome, hotel, refuel tanks, reactor beyond).
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.lunar = true;
+            world.base_mesh = Some(rocket::moon_base());
+            world.rocket_az = 4.71;
+            world.rocket_el = 0.12;
+            world.rocket_dist = 62.0;
+            world.rocket_focus_y = 6.0;
+            0.0
+        }
+        "baseparts" => {
+            // the parts catalog: every structure lined up in a row.
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.lunar = true;
+            world.base_mesh = Some(rocket::base_catalog());
+            world.rocket_az = 4.45; // 3/4 view along the row
+            world.rocket_el = 0.20;
+            world.rocket_dist = 150.0;
+            world.rocket_focus_y = 9.0;
+            0.0
+        }
         _ => {
             // map view: craft coasting in the parking orbit.
             frame_map(&mut world);
@@ -3793,6 +3854,12 @@ fn main() {
                 "botland"
             } else if args.iter().any(|a| a == "rcsdemo") {
                 "rcsdemo"
+            } else if args.iter().any(|a| a == "moonbase") {
+                "moonbase"
+            } else if args.iter().any(|a| a == "basetour") {
+                "basetour"
+            } else if args.iter().any(|a| a == "baseparts") {
+                "baseparts"
             } else if args.iter().any(|a| a == "moons") {
                 "moons"
             } else if args.iter().any(|a| a == "moon") {
@@ -3850,6 +3917,9 @@ fn main() {
                 "m6_landed" => "out/m6_landed.png",
                 "botland" => "out/botland.png",
                 "rcsdemo" => "out/rcsdemo.png",
+                "moonbase" => "out/moonbase.png",
+                "basetour" => "out/basetour.png",
+                "baseparts" => "out/baseparts.png",
                 "moons" => "out/moons.png",
                 "moon" => "out/moon.png",
                 "rocket" => "out/rocket.png",
