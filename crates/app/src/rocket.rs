@@ -1322,3 +1322,67 @@ pub fn planet_terrain(
     }
     m
 }
+
+/// An asteroid rendered through the LOD quadtree (so detail refines as the
+/// camera approaches), centred at the local origin. `cam_local` is the camera
+/// position in the asteroid frame; `radius` is the base sphere radius and the
+/// `elev` asteroid field adds the lobes/craters on top. Returns local-space
+/// vertices (the body sits at the origin, so no floating-origin offset).
+pub fn asteroid_terrain(cam_local: DVec3, radius: f64, elev: &Elevation, max_depth: u32) -> Mesh {
+    let planet = Planet { radius };
+    let amp = (radius * 0.34) as f32; // colour scale (matches the field amplitude)
+    let lod = select(&planet, cam_local, 1.6, max_depth);
+    let mut m = Mesh::default();
+    let n = 9;
+    let grid = n * n;
+    for patch in &lod.patches {
+        let skirt = (patch.edge * 0.35).clamp(2.0, 5_000.0);
+        let pm = build_mesh(&planet, patch, n, elev, skirt);
+        let nv = pm.positions.len();
+        let local: Vec<Vec3> = pm.positions.iter().map(|&w| w.as_vec3()).collect();
+        let radial: Vec<Vec3> = local.iter().map(|p| p.normalize_or_zero()).collect();
+
+        // smooth normals from the surface triangles (skirts excluded)
+        let mut nrm = vec![Vec3::ZERO; nv];
+        for tri in pm.indices.chunks(3) {
+            let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+            if i0 >= grid || i1 >= grid || i2 >= grid {
+                continue;
+            }
+            let mut fnv = (local[i1] - local[i0]).cross(local[i2] - local[i0]);
+            let rc = radial[i0] + radial[i1] + radial[i2];
+            if fnv.dot(rc) < 0.0 {
+                fnv = -fnv;
+            }
+            nrm[i0] += fnv;
+            nrm[i1] += fnv;
+            nrm[i2] += fnv;
+        }
+        for i in 0..nv {
+            let mut nn = nrm[i].normalize_or_zero();
+            if nn.length_squared() < 1e-6 || nn.dot(radial[i]) < 0.0 {
+                nn = radial[i];
+            }
+            nrm[i] = nn;
+        }
+        let col: Vec<[f32; 3]> = (0..nv)
+            .map(|i| {
+                let h_frac = ((local[i].length() - radius as f32) / amp).clamp(0.0, 1.0);
+                let base = mix3([0.17, 0.14, 0.12], [0.40, 0.36, 0.31], h_frac);
+                let slope = (1.0 - nrm[i].dot(radial[i])).clamp(0.0, 1.0);
+                let c = mix3(base, [0.30, 0.30, 0.31], slope * 0.5);
+                let j = 0.84 + 0.32 * hashf(local[i] * 0.5);
+                [c[0] * j, c[1] * j, c[2] * j]
+            })
+            .collect();
+        for tri in pm.indices.chunks(3) {
+            let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+            m.tri3(
+                [local[i0], local[i1], local[i2]],
+                [nrm[i0], nrm[i1], nrm[i2]],
+                [col[i0], col[i1], col[i2]],
+            );
+        }
+    }
+    m
+}
