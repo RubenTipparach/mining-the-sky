@@ -16,3 +16,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "launch"
 path = "src/bin/launch.rs"
+
+[[bin]]
+name = "attitude"
+path = "src/bin/attitude.rs"

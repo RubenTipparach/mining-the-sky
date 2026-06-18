@@ -1,0 +1,6 @@
+# Headless GPU verification: point the Vulkan loader at Mesa's software driver
+# (lavapipe) so `cargo run -p app -- shot ...` renders without a physical GPU.
+# Requires `apt-get install -y mesa-vulkan-drivers` in the container first.
+# See CLAUDE.md "Verifying rendering headlessly".
+[env]
+VK_ICD_FILENAMES = "/usr/share/vulkan/icd.d/lvp_icd.json"

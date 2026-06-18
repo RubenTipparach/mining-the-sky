@@ -12,9 +12,15 @@ struct Scene {
     sun: vec4<f32>,     // xyz world sun direction
     home: vec4<f32>,    // xyz centre, w radius (Mm)
     moon: vec4<f32>,    // xyz centre, w radius (Mm)
-    params: vec4<f32>,  // x = tan(fov/2), y = aspect, z = time, w unused
-    res: vec4<f32>,     // x,y = resolution
+    sunbody: vec4<f32>,  // star A: xyz centre, w radius (Mm)
+    sunbody2: vec4<f32>, // star B: xyz centre, w radius (Mm)
+    params: vec4<f32>,   // x=tan(fov/2), y=aspect, z=time, w=planet count
+    res: vec4<f32>,      // x,y = resolution
+    planets: array<vec4<f32>, 16>,    // xyz centre, w radius (Mm)
+    planet_col: array<vec4<f32>, 16>, // rgb colour
+    moons: array<vec4<f32>, 8>,       // nearest moons: xyz centre, w radius
 };
+
 
 @group(0) @binding(0) var<uniform> s: Scene;
 @group(0) @binding(1) var home_tex: texture_2d<f32>;
@@ -80,9 +86,26 @@ fn hit_sphere(ro: vec3<f32>, rd: vec3<f32>, center: vec3<f32>, radius: f32) -> f
     return t;
 }
 
+fn shade_star(p: vec3<f32>, center: vec3<f32>, rd: vec3<f32>, tint: vec3<f32>) -> vec3<f32> {
+    let n = normalize(p - center);
+    // limb darkening + granulation; emissive and bright (bloom via tonemap)
+    let limb = pow(clamp(dot(n, -rd), 0.0, 1.0), 0.45);
+    let gran = 0.85 + 0.15 * vnoise(n * 40.0);
+    return tint * (0.6 + 0.7 * limb) * gran;
+}
+
+fn shade_planet(p: vec3<f32>, center: vec3<f32>, color: vec3<f32>) -> vec3<f32> {
+    let n = normalize(p - center);
+    let sun = normalize(s.sun.xyz - p);
+    let ndl = max(dot(n, sun), 0.0);
+    // faint banding for variety
+    let band = 0.92 + 0.08 * sin(n.y * 18.0);
+    return color * band * (0.05 + 0.95 * ndl);
+}
+
 fn shade_home(p: vec3<f32>, rd: vec3<f32>) -> vec3<f32> {
     let n = normalize(p - s.home.xyz);
-    let sun = normalize(s.sun.xyz);
+    let sun = normalize(s.sun.xyz - p);
 
     let lon = atan2(n.z, n.x);
     let lat = asin(clamp(n.y, -1.0, 1.0));
@@ -107,9 +130,9 @@ fn shade_home(p: vec3<f32>, rd: vec3<f32>) -> vec3<f32> {
     return col;
 }
 
-fn shade_moon(p: vec3<f32>) -> vec3<f32> {
-    let n = normalize(p - s.moon.xyz);
-    let sun = normalize(s.sun.xyz);
+fn shade_moon_at(p: vec3<f32>, center: vec3<f32>) -> vec3<f32> {
+    let n = normalize(p - center);
+    let sun = normalize(s.sun.xyz - p);
     // grey regolith with darker maria from noise
     let maria = vnoise(n * 6.0) * 0.5 + vnoise(n * 18.0) * 0.25;
     let base = mix(0.32, 0.62, smoothstep(0.35, 0.75, maria));
@@ -128,21 +151,40 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     );
     let ro = s.cam_pos.xyz;
 
-    let th = hit_sphere(ro, rd, s.home.xyz, s.home.w);
-    let tm = hit_sphere(ro, rd, s.moon.xyz, s.moon.w);
-
     var col = vec3<f32>(0.0);
     var hit = false;
+    var best = 1e30;
 
-    // choose the nearest positive hit
-    let hh = th > 0.0;
-    let mh = tm > 0.0;
-    if (hh && (!mh || th <= tm)) {
-        col = shade_home(ro + rd * th, rd);
-        hit = true;
-    } else if (mh) {
-        col = shade_moon(ro + rd * tm);
-        hit = true;
+    let th = hit_sphere(ro, rd, s.home.xyz, s.home.w);
+    if (th > 0.0 && th < best) { best = th; col = shade_home(ro + rd * th, rd); hit = true; }
+    let tm = hit_sphere(ro, rd, s.moon.xyz, s.moon.w);
+    if (s.moon.w > 0.0 && tm > 0.0 && tm < best) { best = tm; col = shade_moon_at(ro + rd * tm, s.moon.xyz); hit = true; }
+    // nearest moons as lit spheres (so they read as real bodies up close)
+    let mcount = i32(s.res.z);
+    for (var k = 0; k < mcount; k = k + 1) {
+        let mb = s.moons[k];
+        let tmo = hit_sphere(ro, rd, mb.xyz, mb.w);
+        if (tmo > 0.0 && tmo < best) {
+            best = tmo;
+            col = shade_moon_at(ro + rd * tmo, mb.xyz);
+            hit = true;
+        }
+    }
+    // binary stars
+    let ta = hit_sphere(ro, rd, s.sunbody.xyz, s.sunbody.w);
+    if (ta > 0.0 && ta < best) { best = ta; col = shade_star(ro + rd * ta, s.sunbody.xyz, rd, vec3<f32>(1.6, 1.3, 0.8)); hit = true; }
+    let tb = hit_sphere(ro, rd, s.sunbody2.xyz, s.sunbody2.w);
+    if (tb > 0.0 && tb < best) { best = tb; col = shade_star(ro + rd * tb, s.sunbody2.xyz, rd, vec3<f32>(1.5, 0.55, 0.4)); hit = true; }
+    // circumbinary planets
+    let pcount = i32(s.params.w);
+    for (var k = 0; k < pcount; k = k + 1) {
+        let pl = s.planets[k];
+        let tp = hit_sphere(ro, rd, pl.xyz, pl.w);
+        if (tp > 0.0 && tp < best) {
+            best = tp;
+            col = shade_planet(ro + rd * tp, pl.xyz, s.planet_col[k].rgb);
+            hit = true;
+        }
     }
 
     if (!hit) {
@@ -150,13 +192,23 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         let star = step(0.9975, hash3(floor(rd * 1400.0)));
         col = vec3<f32>(star) * 0.7;
 
+        // corona/glow when looking near either star
+        let to_sun = normalize(s.sunbody.xyz - ro);
+        let sa = max(dot(rd, to_sun), 0.0);
+        col = col + vec3<f32>(1.4, 1.1, 0.7) * (pow(sa, 220.0) * 1.5 + pow(sa, 12.0) * 0.10);
+
+        // the red companion (star B) glows with its own ruddy corona
+        let to_sun2 = normalize(s.sunbody2.xyz - ro);
+        let sb = max(dot(rd, to_sun2), 0.0);
+        col = col + vec3<f32>(1.5, 0.45, 0.30) * (pow(sb, 240.0) * 1.3 + pow(sb, 12.0) * 0.09);
+
         let oc = s.home.xyz - ro;
         let tca = dot(oc, rd);
         if (tca > 0.0) {
             let d = sqrt(max(dot(oc, oc) - tca * tca, 0.0));
             let r = s.home.w;
             let halo = smoothstep(r * 1.06, r, d) * smoothstep(r * 0.985, r, d);
-            let sun = normalize(s.sun.xyz);
+            let sun = normalize(s.sun.xyz - s.home.xyz);
             let lit = clamp(dot(normalize(oc), sun) * 0.5 + 0.6, 0.0, 1.0);
             col = col + vec3<f32>(0.3, 0.5, 1.0) * halo * lit * 0.9;
         }

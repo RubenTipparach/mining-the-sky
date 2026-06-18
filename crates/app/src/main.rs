@@ -15,31 +15,82 @@
 
 use std::sync::Arc;
 
-use glam::{DVec3, Mat3, Vec3};
+use glam::{DVec3, Mat4, Quat, Vec3};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+mod bot;
+mod build;
 mod flight;
-mod hud;
+mod launch;
 mod mission;
+mod rocket;
+mod ui;
+mod universe;
 use flight::{Craft, GravBody, Mode};
-use hud::Hud;
 use mission::Mission;
 use sim::body::CentralBody;
 
-#[repr(C)]
-#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct Uniforms {
-    resolution: [f32; 2],
-    scale: f32,
-    time: f32,
-    sun: [f32; 4],
-    cx: [f32; 4],
-    cy: [f32; 4],
-    cz: [f32; 4],
+/// Drawable size for the surface. On the web the winit window reports a near
+/// zero inner size, so derive it from the canvas client rect times the device
+/// pixel ratio (this is what fixes the blank/1x1 browser render).
+fn surface_size(window: &Window) -> (u32, u32) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        webx::canvas_size(window)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let s = window.inner_size();
+        (s.width.max(1), s.height.max(1))
+    }
+}
+
+/// Browser glue: status reporting, WebGPU detection, and canvas sizing.
+#[cfg(target_arch = "wasm32")]
+mod webx {
+    use wasm_bindgen::JsValue;
+    use winit::platform::web::WindowExtWebSys;
+    use winit::window::Window;
+
+    /// Replace the on-page `#hud` text so failures are visible instead of a
+    /// blank page.
+    pub fn set_status(msg: &str) {
+        if let Some(el) = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.get_element_by_id("hud"))
+        {
+            el.set_text_content(Some(msg));
+        }
+    }
+
+    /// True if `navigator.gpu` exists (checked via Reflect so we do not need the
+    /// web-sys `Gpu` feature).
+    pub fn has_webgpu() -> bool {
+        web_sys::window()
+            .map(|w| {
+                let nav = w.navigator();
+                js_sys::Reflect::get(&nav, &JsValue::from_str("gpu"))
+                    .map(|v| !v.is_undefined() && !v.is_null())
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Canvas client size in physical pixels (CSS pixels times devicePixelRatio).
+    pub fn canvas_size(window: &Window) -> (u32, u32) {
+        if let Some(canvas) = window.canvas() {
+            let dpr = web_sys::window().map(|w| w.device_pixel_ratio()).unwrap_or(1.0);
+            let w = (canvas.client_width() as f64 * dpr).round() as u32;
+            let h = (canvas.client_height() as f64 * dpr).round() as u32;
+            (w.max(1), h.max(1))
+        } else {
+            (1, 1)
+        }
+    }
 }
 
 #[repr(C)]
@@ -52,8 +103,13 @@ struct SceneUniforms {
     sun: [f32; 4],
     home: [f32; 4],
     moon: [f32; 4],
-    params: [f32; 4],
-    res: [f32; 4],
+    sunbody: [f32; 4],  // star A: xyz centre, w radius (Mm)
+    sunbody2: [f32; 4], // star B (red): xyz centre, w radius (Mm)
+    params: [f32; 4],   // x=tan(fov/2), y=aspect, z=time, w=planet count
+    res: [f32; 4],      // x,y=resolution, z=moon count
+    planets: [[f32; 4]; 16],    // xyz centre, w radius (Mm)
+    planet_col: [[f32; 4]; 16], // rgb colour
+    moons: [[f32; 4]; 8],       // nearest moons: xyz centre, w radius (Mm)
 }
 
 #[repr(C)]
@@ -63,21 +119,110 @@ struct OverlayVertex {
     color: [f32; 3],
 }
 
+/// Thruster-FX billboard vertex (flame + smoke), drawn by the `fx` pipeline.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct FxVertex {
+    pos: [f32; 3],
+    uv: [f32; 2],
+    color: [f32; 4],
+    kind: f32, // 0 = flame (additive), 1 = smoke (premultiplied over)
+}
+
 const OVERLAY_CAP: u64 = 8192;
 const HUD_CAP: u64 = 40000;
+/// Thruster-FX billboards (flame + smoke particles).
+const FX_CAP: u64 = 60000;
+/// Dynamic rocket-view geometry (pad + rocket + spent booster).
+const DYN_MESH_CAP: u64 = 40000;
+/// Full-planet LOD terrain (rebuilt as the camera moves).
+const TERRAIN_CAP: u64 = 500_000;
 
 /// Render-space length unit for the system view: 1000 km.
 const MM: f32 = 1.0e6;
 
+/// Local-frame position (metres) of the assembly building. It sits ~5 km from
+/// the pad (which is at the origin); the rocket rolls out across the flats to it.
+const HANGAR_POS: Vec3 = Vec3::new(-5000.0, 0.0, 0.0);
+const RACK_POS: Vec3 = Vec3::new(-5000.0, 0.0, 42.0);
+
+/// Interior work lights of the assembly building: (offset from HANGAR_POS,
+/// colour*intensity, range metres). Mounted high on the wall corners (cool) and
+/// under the roof (warm) - kept out near the structure, not beside the rocket.
+const HANGAR_LIGHTS: [(Vec3, [f32; 3], f32); 6] = [
+    (Vec3::new(50.0, 92.0, 50.0), [0.85, 0.95, 1.25], 80.0),
+    (Vec3::new(-50.0, 92.0, 50.0), [0.85, 0.95, 1.25], 80.0),
+    (Vec3::new(50.0, 92.0, -50.0), [0.85, 0.95, 1.25], 80.0),
+    (Vec3::new(-50.0, 92.0, -50.0), [0.85, 0.95, 1.25], 80.0),
+    (Vec3::new(28.0, 144.0, 0.0), [1.3, 1.05, 0.7], 95.0),
+    (Vec3::new(-28.0, 144.0, 0.0), [1.3, 1.05, 0.7], 95.0),
+];
+
+/// Depth format for the rocket view's mesh pass.
+const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
 #[derive(Clone, Copy, PartialEq)]
 enum View {
-    Surface,
-    System,
+    /// Orbital map: perspective view of the bodies + launch/orbit trajectories.
+    Map,
+    /// 3D surface: the rocket on the pad over LOD terrain.
+    Rocket,
 }
 
-/// A perspective camera for the system view (all positions in Mm).
+
+use universe::{Body, Kind, Universe};
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct MeshUniforms {
+    viewproj: [[f32; 4]; 4],
+    sun: [f32; 4],
+    /// params.x = log-depth Fcoef, y = time, z = active point-light count.
+    params: [f32; 4],
+    /// rgb = horizon haze colour, w = fog density (1/visibility metres).
+    fog: [f32; 4],
+    /// Interior point lights: xyz = position (camera-relative), w = range (m).
+    lights: [[f32; 4]; 8],
+    /// rgb = colour * intensity for each light.
+    light_col: [[f32; 4]; 8],
+}
+
+const MAX_LIGHTS: usize = 8;
+
+/// A perspective sky for the rocket view (drawn behind the terrain).
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct SkyUniforms {
+    /// Camera basis in WORLD (planet-centred) coords for per-pixel view rays.
+    right: [f32; 4],
+    up: [f32; 4],
+    fwd: [f32; 4],
+    /// World sun direction (xyz).
+    sun: [f32; 4],
+    /// Camera position relative to the planet centre (world metres).
+    cam: [f32; 4],
+    /// x = tan(fov/2), y = aspect, z = planet radius, w = atmosphere top radius.
+    params: [f32; 4],
+}
+
+/// Far plane for the rocket-view log-depth buffer (m): beyond planet diameter.
+const LOG_DEPTH_FAR: f32 = 2.0e7;
+
+/// Horizon haze colour shared by the sky and the terrain aerial-perspective fog.
+const HORIZON: [f32; 3] = [0.74, 0.82, 0.93];
+
+/// Sun direction in the launch tangent frame (east, up, north). The home world
+/// uses a fairly high sun; the moon uses a low, grazing sun for long shadows.
+const SUN_LOCAL: Vec3 = Vec3::new(0.40, 0.72, 0.55);
+const SUN_LOCAL_MOON: Vec3 = Vec3::new(0.62, 0.17, 0.77);
+/// Deep-space (asteroid) sun: higher than the lunar grazing sun so a body
+/// viewed from the sun side reads as a solid lit rock.
+const SUN_LOCAL_SPACE: Vec3 = Vec3::new(0.45, 0.58, 0.68);
+
+/// A perspective camera for the orbital map. The position is f64 (Mm) so the
+/// full-scale system stays precise; projection is camera-relative.
 struct SystemCamera {
-    pos: Vec3,
+    pos: DVec3,
     right: Vec3,
     up: Vec3,
     forward: Vec3,
@@ -86,9 +231,10 @@ struct SystemCamera {
 }
 
 impl SystemCamera {
-    /// Project a world point (Mm) to clip space, or `None` if behind the camera.
-    fn project(&self, p: Vec3) -> Option<[f32; 2]> {
-        let rel = p - self.pos;
+    /// Project a world point (Mm, f64) to clip space, or `None` if behind the
+    /// camera. Camera-relative, so f32 precision holds near the focused body.
+    fn project(&self, p: DVec3) -> Option<[f32; 2]> {
+        let rel = (p - self.pos).as_vec3();
         let fd = rel.dot(self.forward);
         if fd <= 0.0 {
             return None;
@@ -104,23 +250,199 @@ impl SystemCamera {
 // per-frame geometry/uniform builders so both render paths share them.
 // ---------------------------------------------------------------------------
 
+/// A jettisoned stage tumbling away after separation, integrated ballistically
+/// in the rocket-view local frame (metres) for a few seconds of spectacle.
+struct SepBooster {
+    pos: Vec3,
+    vel: Vec3,
+    rot: Quat,
+    spin: Vec3,
+    age: f32,
+    /// Vertex range (in the rocket body mesh) of the jettisoned stage.
+    range: std::ops::Range<usize>,
+}
+
+/// A planned maneuver (burn node) on the craft's current orbit: where to burn
+/// (true anomaly `nu`) and the prograde / normal / radial delta-v (m/s).
+#[derive(Clone, Copy)]
+struct ManeuverNode {
+    nu: f64,
+    pro: f64,
+    nrm: f64,
+    rad: f64,
+}
+
+/// A payload delivered to orbit by a completed mission. Persists and is drawn
+/// circling the home world in the map view; missions accumulate these.
+struct OrbitObject {
+    name: &'static str,
+    color: [f32; 3],
+    radius_mm: f32, // orbit radius (Mm, home-centred)
+    t1: Vec3,       // orbit-plane basis (home-centred world unit vectors)
+    t2: Vec3,
+    rate: f32,    // rad/s
+    phase0: f32,  // angle at epoch
+    epoch: f64,   // sys_time at insertion
+}
+
+/// A grabbable part on the VAB rack: its local position, kind and catalog index.
+#[derive(Clone, Copy)]
+struct RackSlot {
+    pos: Vec3,
+    kind: rocket::PartKind,
+    idx: usize,
+}
+
+/// Build the parts rack beside the hangar from the catalog: rows of engines,
+/// tanks and payloads as 3D models you can grab. Returns the mesh + slot table.
+fn build_rack() -> (rocket::Mesh, Vec<RackSlot>) {
+    let mut m = rocket::Mesh::default();
+    let mut slots = Vec::new();
+    let base = RACK_POS;
+    let rows: [(rocket::PartKind, usize, [f32; 3], f32); 3] = [
+        (rocket::PartKind::Engine, build::ENGINES.len(), [0.55, 0.55, 0.60], 3.0),
+        (rocket::PartKind::Tank, build::TANKS.len(), [0.82, 0.82, 0.86], 6.4),
+        (rocket::PartKind::Payload, build::PAYLOADS.len(), [0.88, 0.80, 0.42], 9.6),
+    ];
+    for (kind, n, col, y) in rows {
+        let w = n as f32 * 3.2;
+        // shelf bar + back panel
+        rocket::append_box(&mut m, base + Vec3::new(0.0, y - 1.4, 0.0), Vec3::new(w * 0.5, 0.2, 1.6), [0.28, 0.29, 0.33]);
+        for k in 0..n {
+            let x = -(w * 0.5) + 1.6 + k as f32 * 3.2;
+            let p = base + Vec3::new(x, y, 0.0);
+            rocket::append_part(&mut m, kind, p, col);
+            slots.push(RackSlot { pos: p, kind, idx: k });
+        }
+    }
+    // back wall of the rack
+    rocket::append_box(&mut m, base + Vec3::new(0.0, 6.0, 1.6), Vec3::new(22.0, 7.0, 0.2), [0.24, 0.25, 0.28]);
+    (m, slots)
+}
+
+/// Nearest ray-sphere hit distance (or None).
+fn ray_sphere_near(o: Vec3, d: Vec3, c: Vec3, r: f32) -> Option<f32> {
+    let oc = o - c;
+    let b = oc.dot(d);
+    let cc = oc.dot(oc) - r * r;
+    let disc = b * b - cc;
+    if disc < 0.0 {
+        return None;
+    }
+    let t = -b - disc.sqrt();
+    if t > 0.0 {
+        Some(t)
+    } else {
+        None
+    }
+}
+
+impl OrbitObject {
+    /// World position (Mm) at `sys_time`, given the home world's position.
+    fn pos_mm(&self, home_pos: DVec3, sys_time: f64) -> DVec3 {
+        let th = self.phase0 + self.rate * (sys_time - self.epoch) as f32;
+        home_pos + (self.t1 * th.cos() + self.t2 * th.sin()).as_dvec3() * self.radius_mm as f64
+    }
+}
+
+/// One exhaust smoke puff, advected in the rocket-view local frame. Emitted at
+/// the nozzle and left behind as the rocket flies on, so it trails and fades.
+struct Smoke {
+    pos: Vec3,
+    vel: Vec3,
+    age: f32,
+    life: f32,
+    size0: f32,
+    seed: f32,
+}
+
 struct World {
     mission: Mission,
     body: CentralBody,
     flight: Option<Craft>,
-    az: f32,
-    el: f32,
-    scale: f32,
+    /// When engaged, the autonomous moon-landing bot flies `flight` for you.
+    moonbot: Option<bot::MoonBot>,
+    /// Planned burn node for the craft (the maneuver planner).
+    node: Option<ManeuverNode>,
     launched: bool,
     clock: f32, // mission-elapsed seconds
     warp: f32,
 
-    // system view: a perspective camera framing the home world + its moon.
+    // player-controlled launch (KSP-style); replaces the on-rails ascent when
+    // the player flies it from the pad in the rocket view.
+    launch: Option<launch::Rocket>,
+    /// The current vehicle design (Vehicle Assembly Building).
+    vab: build::Vab,
+    /// In the assembly building (true) vs out on the pad (false).
+    vab_mode: bool,
+    /// Roll-out progress: 0 = in the hangar, 1 = on the pad. Animates.
+    rollout: f32,
+    rolling_out: bool,
+    rocket_body: rocket::RocketBody,
+    pad_mesh: rocket::Mesh,
+    hangar_mesh: rocket::Mesh,
+    rack_mesh: rocket::Mesh,
+    lander_mesh: rocket::Mesh,
+    /// Show the lunar lander standing on the ground (instead of the rocket).
+    show_lander: bool,
+    /// An assembled/previewed moon base mesh to draw on the surface, if any.
+    base_mesh: Option<rocket::Mesh>,
+    /// Fairing clamshell open fraction (0 = closed, 1 = halves fully swung out
+    /// revealing the cargo module).
+    fairing_open: f32,
+    /// Show the MOON BASE structures-catalog panel (only for the full colony,
+    /// not single delivered modules).
+    base_panel: bool,
+    /// Deep-space scene (asteroid): suppress the planet terrain and render a
+    /// pure starfield sky around the body at the origin.
+    space: bool,
+    /// Name shown for the body being inspected in a deep-space scene.
+    space_label: &'static str,
+    /// Render the surface as the moon: grey regolith + black airless sky.
+    lunar: bool,
+    /// Height (m) the lander floats above the surface (0 = landed).
+    lander_alt: f32,
+    /// Fire the lander's descent engine (plume under the bell).
+    lander_firing: bool,
+    /// RCS attitude-thruster activity (0 = idle, 1 = full puff). Drives the
+    /// blue-white RCS jets around the lander's upper body.
+    lander_rcs: f32,
+    /// Grabbable parts on the rack (for in-viewport 3D drag-assembly).
+    rack_slots: Vec<RackSlot>,
+    /// The part currently being dragged from the rack, if any.
+    grab: Option<RackSlot>,
+    /// The stack slot the dragged part is hovering (kind + stage), if any.
+    grab_target: Option<(rocket::PartKind, usize)>,
+    /// Drag ghost position (camera-relative) while grabbing.
+    grab_ghost: Vec3,
+    sep: Option<SepBooster>,
+    /// Payloads delivered to orbit by completed missions (they accumulate).
+    orbits: Vec<OrbitObject>,
+    /// Whether the active launch's payload has been captured to orbit yet.
+    mission_captured: bool,
+    smoke: Vec<Smoke>,
+    smoke_accum: f32, // fractional particle spawn carry
+    anim: f32,        // FX animation clock (seconds)
+    // launch-site tangent frame (home-centred metres): origin + up/east/north.
+    launch_origin: DVec3,
+    launch_up: DVec3,
+    launch_east: DVec3,
+    launch_north: DVec3,
+    // Floating-origin reference (launch-tangent metres). The whole rocket-view
+    // scene is rendered relative to this point, snapped near the camera and
+    // updated (with a terrain rebuild) when the camera moves far from it.
+    ref_local: DVec3,
+    terrain_dirty: bool,
+    terrain_verts: Vec<rocket::MeshVertex>,
+    terrain_count: u32,
+
+    // orbital map: a perspective camera framing the focused body.
     view: View,
     sys_az: f32,
     sys_el: f32,
-    sys_dist: f32, // camera distance from the focus point (Mm)
-    sys_focus: Vec3,
+    sys_dist: f64,    // camera distance from the focus point (Mm)
+    sys_focus: DVec3, // focused body position (Mm), updated each frame
+    sys_time: f64,    // simulation seconds (drives on-rails orbits)
     home_radius_mm: f32,
     moon_center_mm: Vec3,
     moon_radius_mm: f32,
@@ -129,12 +451,31 @@ struct World {
     moon_center_m: DVec3,
     moon_mu: f64,
     moon_radius_m: f64,
+
+    // rocket view: an orbit camera framing the 3D vehicle on the pad (metres).
+    rocket_az: f32,
+    rocket_el: f32,
+    rocket_dist: f32,
+    rocket_focus_y: f32,
+
+    universe: Universe,
+    /// Indices into `universe.bodies` of the navigable bodies (stars + planets).
+    nav: Vec<usize>,
+    /// Index (into `universe.bodies`) of the focused body.
+    focus: usize,
+    /// egui body-browser search text.
+    ui_search: String,
 }
 
 impl World {
     fn new() -> World {
         let mission = Mission::pioneer_from_spaceport();
         let body = CentralBody::home();
+        let vab = build::Vab::default_build();
+        let rocket_body = rocket::rocket_body(&vab.to_vehicle(), vab.payload().color, vab.payload().module);
+        let rocket_frame = (rocket_body.focus_y, rocket_body.cam_dist);
+        let (rack_mesh_init, rack_slots) = build_rack();
+        let (launch_origin, launch_up, launch_east, launch_north) = rocket::launch_frame();
         let home_radius_mm = (body.radius as f32) / MM;
         // A fictional moon: ~0.27 home radii, parked off to one side. Distance is
         // compressed from the real ~60 radii so both bodies frame nicely in one
@@ -148,28 +489,142 @@ impl World {
         );
         let moon_radius_m = moon_radius_mm as f64 * MM as f64;
         let moon_mu = 1.7 * moon_radius_m * moon_radius_m; // ~1.7 m/s^2 surface gravity
-        World {
-            az: mission.spaceport_lon,
-            el: mission.spaceport_lat,
-            scale: 1.25,
+        let mut w = World {
             launched: false,
             clock: 0.0,
-            warp: 8.0,
+            warp: 1.0,
             mission,
             body,
             flight: None,
-            view: View::Surface,
+            moonbot: None,
+            node: None,
+            vab,
+            vab_mode: true,
+            rollout: 0.0,
+            rolling_out: false,
+            launch: None,
+            rocket_body,
+            pad_mesh: rocket::pad_and_mount(),
+            hangar_mesh: rocket::hangar(HANGAR_POS, &HANGAR_LIGHTS.map(|l| l.0)),
+            rack_mesh: rack_mesh_init,
+            lander_mesh: rocket::lander(),
+            show_lander: false,
+            base_mesh: None,
+            fairing_open: 0.0,
+            base_panel: false,
+            space: false,
+            space_label: "",
+            lunar: false,
+            lander_alt: 0.0,
+            lander_firing: false,
+            lander_rcs: 0.0,
+            rack_slots,
+            grab: None,
+            grab_target: None,
+            grab_ghost: Vec3::ZERO,
+            sep: None,
+            orbits: Vec::new(),
+            mission_captured: false,
+            smoke: Vec::new(),
+            smoke_accum: 0.0,
+            anim: 0.0,
+            launch_origin,
+            launch_up,
+            launch_east,
+            launch_north,
+            ref_local: DVec3::ZERO,
+            terrain_dirty: true,
+            terrain_verts: Vec::new(),
+            terrain_count: 0,
+            view: View::Rocket,
             sys_az: 1.4,
             sys_el: 0.30,
             sys_dist: 120.0,
-            sys_focus: moon_center_mm * 0.5,
+            sys_focus: DVec3::ZERO,
+            sys_time: 0.0,
             home_radius_mm,
             moon_center_mm,
             moon_radius_mm,
             moon_center_m,
             moon_mu,
             moon_radius_m,
+            rocket_az: 0.7, // start inside the assembly building, facing the rocket
+            rocket_el: 0.18,
+            rocket_dist: 52.0,
+            rocket_focus_y: rocket_frame.0,
+            universe: Universe { bodies: Vec::new() },
+            nav: Vec::new(),
+            focus: 0,
+            ui_search: String::new(),
+        };
+        // Generate the full Kepler-47 system; the landable moon is injected as
+        // home's first moon so the map and the flight sim agree.
+        w.universe = universe::generate(47, w.home_radius_mm);
+        w.nav = w
+            .universe
+            .bodies
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| matches!(b.kind, Kind::StarA | Kind::StarB | Kind::Planet))
+            .map(|(i, _)| i)
+            .collect();
+        // default focus: the home world (body index)
+        w.focus = w.universe.home_index();
+        w.apply_focus();
+        w
+    }
+
+    /// The currently focused body.
+    fn focus_body(&self) -> &Body {
+        &self.universe.bodies[self.focus]
+    }
+
+    fn focus_label(&self) -> &str {
+        self.focus_body().name.as_str()
+    }
+
+    /// Pick the nearest body to a screen position (any body, incl. moons /
+    /// asteroids / comets). Returns its body index.
+    fn pick_body(&self, res: (f32, f32), cx: f32, cy: f32) -> Option<usize> {
+        let cam = self.system_camera(res.0 / res.1.max(1.0));
+        let ndc = [cx / res.0 * 2.0 - 1.0, 1.0 - cy / res.1 * 2.0];
+        let mut best = None;
+        let mut best_d = 0.05f32; // clip-space threshold
+        for i in 0..self.universe.bodies.len() {
+            if let Some(c) = cam.project(self.universe.position(i, self.sys_time)) {
+                let d = ((c[0] - ndc[0]).powi(2) + (c[1] - ndc[1]).powi(2)).sqrt();
+                if d < best_d {
+                    best_d = d;
+                    best = Some(i);
+                }
+            }
         }
+        best
+    }
+
+    /// Cycle the orbital-map focus through the navigable bodies.
+    fn cycle_focus(&mut self) {
+        let cur = self.nav.iter().position(|&i| i == self.focus).unwrap_or(0);
+        let next = self.nav[(cur + 1) % self.nav.len()];
+        self.set_focus(next);
+    }
+
+    fn set_focus(&mut self, body_idx: usize) {
+        if body_idx < self.universe.bodies.len() {
+            self.focus = body_idx;
+            self.apply_focus();
+        }
+    }
+
+    /// World position of the focused body at the current sim time.
+    fn focus_pos(&self) -> DVec3 {
+        self.universe.position(self.focus, self.sys_time)
+    }
+
+    fn apply_focus(&mut self) {
+        let radius = self.focus_body().radius;
+        self.sys_focus = self.focus_pos();
+        self.sys_dist = (radius * 4.0).max(2.0);
     }
 
     fn grav_bodies(&self) -> Vec<GravBody> {
@@ -183,9 +638,125 @@ impl World {
 
     fn toggle_view(&mut self) {
         self.view = match self.view {
-            View::Surface => View::System,
-            View::System => View::Surface,
+            View::Map => View::Rocket,
+            View::Rocket => View::Map,
         };
+    }
+
+    /// Rocket-view camera, floating-origin: eye + look target are returned
+    /// relative to `ref_local` (small f32 near the camera), plus the basis and
+    /// tan(fov/2). The whole rocket-view scene is uploaded in this same frame.
+    fn rocket_camera(&self, aspect: f32) -> (Vec3, Vec3, Vec3, Vec3, Vec3, f32) {
+        let eye = self.rel(self.camera_eye_local());
+        let target = self.rel(self.camera_look_local());
+        let fwd = (target - eye).normalize_or_zero();
+        let right = fwd.cross(Vec3::Y).normalize();
+        let up = right.cross(fwd).normalize();
+        let tan = (50f32.to_radians() * 0.5).tan();
+        let _ = aspect;
+        (eye, target, right, up, fwd, tan)
+    }
+
+    /// View-projection + sun + fog for the rocket view (local scene, metres).
+    fn mesh_uniforms(&self, res: [f32; 2]) -> MeshUniforms {
+        let aspect = res[0] / res[1].max(1.0);
+        let (eye, target, _r, _u, _f, _t) = self.rocket_camera(aspect);
+        let view = Mat4::look_at_rh(eye, target, Vec3::Y);
+        // wide near/far range; the logarithmic depth buffer keeps precision.
+        let proj = Mat4::perspective_rh(50f32.to_radians(), aspect, 0.1, LOG_DEPTH_FAR);
+        let vp = proj * view;
+        let fcoef = 1.0 / (LOG_DEPTH_FAR + 1.0).log2();
+
+        // Interior work lights, brightest in the building and fading out as the
+        // rocket rolls onto the pad (so the pad stays sunlit).
+        let mut lights = [[0.0f32; 4]; MAX_LIGHTS];
+        let mut light_col = [[0.0f32; 4]; MAX_LIGHTS];
+        let scale = (1.0 - self.rollout).clamp(0.0, 1.0);
+        let mut nlights = 0usize;
+        if scale > 0.01 {
+            // a subtle flicker so the lighting reads as live
+            let flick = 0.92 + 0.08 * (self.anim * 9.0).sin();
+            for (off, col, range) in HANGAR_LIGHTS {
+                let p = self.rel((HANGAR_POS + off).as_dvec3());
+                lights[nlights] = [p.x, p.y, p.z, range];
+                let s = scale * flick * 1.15; // gentle, so the falloff reads
+                light_col[nlights] = [col[0] * s, col[1] * s, col[2] * s, 0.0];
+                nlights += 1;
+            }
+        }
+
+        // On the airless moon there is no sky ambient or aerial haze: flag the
+        // shader (sun.w = 1) and kill the fog so the surface reads dark with
+        // hard, high-contrast crater shadows.
+        let lunar = if self.lunar { 1.0 } else { 0.0 };
+        let fog = if self.lunar {
+            [0.0, 0.0, 0.0, 0.0]
+        } else {
+            [HORIZON[0], HORIZON[1], HORIZON[2], 1.0 / 160_000.0]
+        };
+        // A low, grazing sun on the moon throws long shadows off the crater rims;
+        // a higher sun for deep-space asteroid portraits.
+        let sun_l = if self.space {
+            SUN_LOCAL_SPACE
+        } else if self.lunar {
+            SUN_LOCAL_MOON
+        } else {
+            SUN_LOCAL
+        };
+        MeshUniforms {
+            viewproj: vp.to_cols_array_2d(),
+            sun: [sun_l.x, sun_l.y, sun_l.z, lunar],
+            params: [fcoef, self.anim, nlights as f32, scale],
+            // Light aerial haze only; the atmosphere shader does the real work so
+            // the planet keeps its colour from altitude.
+            fog,
+            lights,
+            light_col,
+        }
+    }
+
+
+    /// Sky/atmosphere uniforms for the rocket view: the camera basis and
+    /// position in planet-centred world coords so the shader can ray-march the
+    /// atmosphere shell.
+    fn sky_uniforms(&self, res: [f32; 2]) -> SkyUniforms {
+        let aspect = res[0] / res[1].max(1.0);
+        let (_eye, _target, right, up, fwd, tan) = self.rocket_camera(aspect);
+        // local camera basis -> world (planet-centred) via the launch frame.
+        let to_world_dir = |d: Vec3| -> [f32; 4] {
+            let w = self.launch_east * d.x as f64
+                + self.launch_up * d.y as f64
+                + self.launch_north * d.z as f64;
+            [w.x as f32, w.y as f32, w.z as f32, 0.0]
+        };
+        let cam_world = self.cam_world(self.camera_eye_local());
+        // Sun in world coords, matching the mesh shader's local sun direction
+        // (a low, grazing sun on the moon).
+        let sl = if self.space {
+            SUN_LOCAL_SPACE
+        } else if self.lunar {
+            SUN_LOCAL_MOON
+        } else {
+            SUN_LOCAL
+        };
+        let sun = (self.launch_east * sl.x as f64
+            + self.launch_up * sl.y as f64
+            + self.launch_north * sl.z as f64)
+            .normalize();
+        let r_atm = self.body.radius + 90_000.0;
+        SkyUniforms {
+            right: to_world_dir(right),
+            up: to_world_dir(up),
+            fwd: to_world_dir(fwd),
+            sun: [sun.x as f32, sun.y as f32, sun.z as f32, 0.0],
+            cam: [
+                cam_world.x as f32,
+                cam_world.y as f32,
+                cam_world.z as f32,
+                if self.space { 2.0 } else if self.lunar { 1.0 } else { 0.0 },
+            ],
+            params: [tan, aspect, self.body.radius as f32, r_atm as f32],
+        }
     }
 
     /// System-view perspective camera: position + basis + tan(fov/2), all in Mm.
@@ -195,8 +766,8 @@ impl World {
             self.sys_el.sin(),
             self.sys_el.cos() * self.sys_az.sin(),
         );
-        let cam_pos = self.sys_focus + dir * self.sys_dist;
-        let forward = (self.sys_focus - cam_pos).normalize();
+        let cam_pos = self.sys_focus + dir.as_dvec3() * self.sys_dist;
+        let forward = (self.sys_focus - cam_pos).as_vec3().normalize();
         let right = forward.cross(Vec3::Y).normalize();
         let up = right.cross(forward).normalize();
         let fov: f32 = 42.0_f32.to_radians();
@@ -210,40 +781,868 @@ impl World {
         }
     }
 
-    /// Perspective camera + body uniforms for the system view.
+    /// Perspective camera + body uniforms for the orbital map. All body centres
+    /// are passed camera-relative (floating origin) so f32 holds at AU scale.
     fn scene_uniforms(&self, res: [f32; 2], time: f32) -> SceneUniforms {
         let aspect = res[0] / res[1].max(1.0);
         let cam = self.system_camera(aspect);
+        let t = self.sys_time;
+        let rel = |p: DVec3| -> Vec3 { (p - cam.pos).as_vec3() };
 
-        let st = time * 0.05 + 0.8;
-        let sun = Vec3::new(st.cos(), 0.25, st.sin()).normalize();
+        let u = &self.universe;
+        let home_i = u.home_index();
+        let home_r = rel(u.position(home_i, t));
+        let bary_r = rel(DVec3::ZERO);
+
+        // find star indices (0,1 by construction)
+        let star_a = rel(u.position(0, t));
+        let star_b = rel(u.position(1, t));
+
+        // home's first moon as the rendered "moon"
+        let moon_r = u
+            .bodies
+            .iter()
+            .position(|b| b.orbit.parent == Some(home_i))
+            .map(|mi| (rel(u.position(mi, t)), u.bodies[mi].radius as f32))
+            .unwrap_or((Vec3::ZERO, 0.0));
+
+        // circumbinary planets (excluding the textured home world)
+        let mut planets = [[0.0f32; 4]; 16];
+        let mut planet_col = [[0.0f32; 4]; 16];
+        let mut n = 0usize;
+        for (i, b) in u.bodies.iter().enumerate() {
+            if b.kind != Kind::Planet || b.is_home || n >= 16 {
+                continue;
+            }
+            let p = rel(u.position(i, t));
+            planets[n] = [p.x, p.y, p.z, b.radius as f32];
+            planet_col[n] = [b.color[0], b.color[1], b.color[2], 1.0];
+            n += 1;
+        }
+
+        // nearest moons to the camera, ray-marched as lit spheres up close
+        let mut moons = [[0.0f32; 4]; 8];
+        let mut cand: Vec<(f64, usize)> = u
+            .bodies
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.kind == Kind::Moon)
+            .map(|(i, _)| ((u.position(i, t) - cam.pos).length(), i))
+            .collect();
+        cand.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        let mut mc = 0usize;
+        for &(_, i) in cand.iter().take(8) {
+            let p = rel(u.position(i, t));
+            moons[mc] = [p.x, p.y, p.z, u.bodies[i].radius as f32];
+            mc += 1;
+        }
 
         SceneUniforms {
-            cam_pos: [cam.pos.x, cam.pos.y, cam.pos.z, 0.0],
+            cam_pos: [0.0, 0.0, 0.0, 0.0], // camera at origin (floating origin)
             cam_x: [cam.right.x, cam.right.y, cam.right.z, 0.0],
             cam_y: [cam.up.x, cam.up.y, cam.up.z, 0.0],
             cam_z: [cam.forward.x, cam.forward.y, cam.forward.z, 0.0],
-            sun: [sun.x, sun.y, sun.z, 0.0],
-            home: [0.0, 0.0, 0.0, self.home_radius_mm],
-            moon: [
-                self.moon_center_mm.x,
-                self.moon_center_mm.y,
-                self.moon_center_mm.z,
-                self.moon_radius_mm,
-            ],
-            params: [cam.fovscale, aspect, time, 0.0],
-            res: [res[0], res[1], 0.0, 0.0],
+            sun: [bary_r.x, bary_r.y, bary_r.z, 0.0], // barycentre (light source)
+            home: [home_r.x, home_r.y, home_r.z, self.home_radius_mm],
+            moon: [moon_r.0.x, moon_r.0.y, moon_r.0.z, moon_r.1],
+            sunbody: [star_a.x, star_a.y, star_a.z, u.bodies[0].radius as f32],
+            sunbody2: [star_b.x, star_b.y, star_b.z, u.bodies[1].radius as f32],
+            params: [cam.fovscale, aspect, time, n as f32],
+            res: [res[0], res[1], mc as f32, 0.0],
+            planets,
+            planet_col,
+            moons,
         }
     }
 
     /// Advance simulation by a real frame dt (seconds).
     fn advance(&mut self, frame_dt: f32) {
+        // On-rails orbital clock: warp is the time scale (1x .. 10000x).
+        self.sys_time += frame_dt as f64 * self.warp as f64;
+        // keep the camera following the (moving) focused body
+        self.sys_focus = self.focus_pos();
+
         let bodies = self.grav_bodies();
-        if let Some(craft) = self.flight.as_mut() {
-            let dt_sim = frame_dt * self.warp.min(8.0);
-            craft.integrate(&self.body, &bodies, dt_sim as f64);
-        } else if self.launched {
-            self.clock += frame_dt * self.warp;
+        let dt_sim = (frame_dt * self.warp.min(8.0)) as f64;
+        match (self.flight.as_mut(), self.moonbot.as_mut()) {
+            (Some(craft), maybe_bot) => {
+                // when the bot is engaged it sets the controls a human would
+                // (attitude target + throttle), flying relative to the moon.
+                if let Some(b) = maybe_bot {
+                    b.control(craft, &bodies[0]);
+                }
+                craft.integrate(&self.body, &bodies, dt_sim);
+            }
+            (None, _) => {
+                if self.launched {
+                    self.clock += frame_dt * self.warp;
+                }
+            }
+        }
+
+        // roll the assembled rocket out of the hangar across the flats to the pad
+        if self.rolling_out {
+            self.rollout = (self.rollout + frame_dt / 16.0).min(1.0);
+            if self.rollout >= 1.0 {
+                self.rolling_out = false;
+                self.vab_mode = false; // now on the pad, ready to launch
+            }
+        }
+
+        // player-controlled launch + any tumbling spent booster
+        if let Some(rk) = self.launch.as_mut() {
+            rk.just_staged = None;
+            let dt = (frame_dt * self.warp).min(2.0);
+            rk.integrate(&self.body, dt as f64);
+        }
+        self.capture_orbit_if_reached();
+        let fx_dt = (frame_dt * self.warp).min(0.5);
+        self.anim += fx_dt;
+        self.advance_sep(frame_dt * self.warp.min(8.0));
+        self.advance_smoke(fx_dt);
+
+        // Floating-origin reference: snap near the camera and rebuild the planet
+        // terrain when the camera has moved far from the last reference (also
+        // refreshes the LOD as the rocket climbs). Threshold grows with altitude
+        // so we rebuild often near the ground and rarely high up.
+        if self.view == View::Rocket {
+            let eye = self.camera_eye_local();
+            let alt = self.cam_world(eye).length() - self.body.radius;
+            let thresh = (alt.abs() * 0.04).clamp(25.0, 50_000.0);
+            if self.terrain_verts.is_empty() || (eye - self.ref_local).length() > thresh {
+                self.ref_local = eye;
+                self.rebuild_terrain();
+                self.terrain_dirty = true; // upload pending
+            }
+        }
+    }
+
+    /// World->local point in the launch-tangent frame (f64).
+    fn to_local_d(&self, w: DVec3) -> DVec3 {
+        let d = w - self.launch_origin;
+        DVec3::new(d.dot(self.launch_east), d.dot(self.launch_up), d.dot(self.launch_north))
+    }
+    /// World->local direction (f64, no translation).
+    fn dir_to_local_d(&self, d: DVec3) -> DVec3 {
+        DVec3::new(d.dot(self.launch_east), d.dot(self.launch_up), d.dot(self.launch_north))
+    }
+    /// Local->world point (f64).
+    fn cam_world(&self, local: DVec3) -> DVec3 {
+        self.launch_origin
+            + self.launch_east * local.x
+            + self.launch_up * local.y
+            + self.launch_north * local.z
+    }
+    /// `world - ref_local` collapsed to f32 (the floating-origin upload form).
+    fn rel(&self, local: DVec3) -> Vec3 {
+        (local - self.ref_local).as_vec3()
+    }
+
+    /// The resting rocket base in local metres: in the hangar during assembly,
+    /// sliding to the pad (origin) as roll-out animates.
+    fn resting_base_local(&self) -> DVec3 {
+        let hangar = HANGAR_POS.as_dvec3();
+        let pos = hangar.lerp(DVec3::ZERO, self.rollout as f64);
+        pos + DVec3::new(0.0, self.rocket_body.base_y as f64, 0.0)
+    }
+
+    /// The rocket the camera frames (its local position, f64).
+    fn cam_target_local(&self) -> DVec3 {
+        match self.launch.as_ref() {
+            Some(rk) => self.to_local_d(rk.r),
+            None => self.resting_base_local(),
+        }
+    }
+
+    /// The point the rocket-view camera looks at (launch-tangent metres, f64).
+    fn camera_look_local(&self) -> DVec3 {
+        let target = self.cam_target_local();
+        match self.launch.as_ref() {
+            Some(rk) => {
+                // Low and slow: look near the base so the pad + smoke stay framed;
+                // ease up the stack as the rocket climbs away.
+                let axis = self.dir_to_local_d(rk.point_dir());
+                let f = self.rocket_focus_y as f64 * (self.to_local_d(rk.r).y / 120.0).clamp(0.25, 1.0);
+                target + axis * f
+            }
+            None => target + DVec3::new(0.0, self.rocket_focus_y as f64, 0.0),
+        }
+    }
+
+    /// Camera ray (camera-relative origin + direction) through a cursor NDC.
+    fn cursor_ray(&self, ndc: [f32; 2], aspect: f32) -> (Vec3, Vec3) {
+        let (eye, _t, right, up, fwd, tan) = self.rocket_camera(aspect);
+        let dir = (fwd + right * (ndc[0] * tan * aspect) + up * (ndc[1] * tan)).normalize();
+        (eye, dir)
+    }
+
+    /// The rocket's stack attach slots (local pos, kind, stage) for drag-drop.
+    fn stack_slots(&self) -> Vec<(DVec3, rocket::PartKind, usize)> {
+        let base = self.resting_base_local();
+        let rb = &self.rocket_body;
+        let mut v = Vec::new();
+        for i in 0..self.vab.stages.len() {
+            let ny = rb.nozzle_y.get(i).copied().unwrap_or(0.0) as f64;
+            v.push((base + DVec3::new(0.0, ny, 0.0), rocket::PartKind::Engine, i));
+            v.push((base + DVec3::new(0.0, ny + 5.0, 0.0), rocket::PartKind::Tank, i));
+        }
+        v.push((base + DVec3::new(0.0, rb.height as f64 - 4.0, 0.0), rocket::PartKind::Payload, 0));
+        v
+    }
+
+    /// Pick a rack part under the cursor (start of a drag).
+    fn pick_rack(&self, ndc: [f32; 2], aspect: f32) -> Option<RackSlot> {
+        let (o, d) = self.cursor_ray(ndc, aspect);
+        let mut best = f32::MAX;
+        let mut hit = None;
+        for s in &self.rack_slots {
+            let c = self.rel(s.pos.as_dvec3());
+            if let Some(t) = ray_sphere_near(o, d, c, 1.8) {
+                if t < best {
+                    best = t;
+                    hit = Some(*s);
+                }
+            }
+        }
+        hit
+    }
+
+    /// The stack slot (matching `kind`) the cursor is over, with its local pos.
+    fn pick_stack_slot(&self, ndc: [f32; 2], aspect: f32, kind: rocket::PartKind) -> Option<(rocket::PartKind, usize, Vec3)> {
+        let (o, d) = self.cursor_ray(ndc, aspect);
+        let mut best = f32::MAX;
+        let mut hit = None;
+        for (pos, k, stage) in self.stack_slots() {
+            if k != kind {
+                continue;
+            }
+            let c = self.rel(pos);
+            if let Some(t) = ray_sphere_near(o, d, c, 3.2) {
+                if t < best {
+                    best = t;
+                    hit = Some((k, stage, c));
+                }
+            }
+        }
+        hit
+    }
+
+    /// While dragging, update the ghost position + the hovered target slot.
+    fn update_grab(&mut self, ndc: [f32; 2], aspect: f32) {
+        let Some(g) = self.grab else { return };
+        if let Some((k, stage, c)) = self.pick_stack_slot(ndc, aspect, g.kind) {
+            self.grab_target = Some((k, stage));
+            // snap the ghost to the slot, nudged toward the camera so it previews
+            // in front of the existing part instead of hiding inside it.
+            let (eye, _) = self.cursor_ray(ndc, aspect);
+            self.grab_ghost = c + (eye - c).normalize_or_zero() * 4.0;
+        } else {
+            self.grab_target = None;
+            let (o, d) = self.cursor_ray(ndc, aspect);
+            self.grab_ghost = o + d * 14.0; // float in front of the camera
+        }
+    }
+
+    /// Drop the grabbed part: fit it to the hovered slot if compatible.
+    fn drop_grab(&mut self) {
+        if let (Some(g), Some((k, stage))) = (self.grab, self.grab_target) {
+            if g.kind == k {
+                match k {
+                    rocket::PartKind::Engine => {
+                        if let Some(s) = self.vab.stages.get_mut(stage) {
+                            s.engine = g.idx;
+                        }
+                    }
+                    rocket::PartKind::Tank => {
+                        if let Some(s) = self.vab.stages.get_mut(stage) {
+                            s.tank = g.idx;
+                        }
+                    }
+                    rocket::PartKind::Payload => self.vab.payload = g.idx,
+                }
+                self.rebuild_vehicle();
+            }
+        }
+        self.grab = None;
+        self.grab_target = None;
+    }
+
+    /// Begin rolling the assembled rocket out of the hangar to the pad.
+    fn start_rollout(&mut self) {
+        if self.vab_mode {
+            self.rebuild_vehicle();
+            self.rolling_out = true;
+        }
+    }
+
+    /// Send the rocket back into the assembly building (between missions).
+    fn back_to_vab(&mut self) {
+        self.reset_launch();
+        self.vab_mode = true;
+        self.rolling_out = false;
+        self.rollout = 0.0;
+    }
+
+    /// Camera eye in launch-tangent metres (f64).
+    fn camera_eye_local(&self) -> DVec3 {
+        let tgt = self.camera_look_local();
+        let dir = DVec3::new(
+            (self.rocket_el.cos() * self.rocket_az.cos()) as f64,
+            self.rocket_el.sin() as f64,
+            (self.rocket_el.cos() * self.rocket_az.sin()) as f64,
+        );
+        let mut eye = tgt + dir * self.rocket_dist as f64;
+        // keep above the local ground plane
+        let ground = self.cam_world(eye).length() - self.body.radius;
+        if ground < 2.0 {
+            eye.y += 2.0 - ground;
+        }
+        eye
+    }
+
+    /// Emit + advect exhaust smoke particles in the local frame.
+    fn advance_smoke(&mut self, dt: f32) {
+        if dt <= 0.0 {
+            return;
+        }
+        // advect + age existing puffs (light buoyancy, gentle drag)
+        for s in self.smoke.iter_mut() {
+            s.age += dt;
+            s.vel *= 1.0 - (1.5 * dt).min(0.9);
+            s.vel.y += 1.2 * dt; // buoyant rise
+            s.pos += s.vel * dt;
+        }
+        self.smoke.retain(|s| s.age < s.life);
+
+        // emit at the nozzle while the active stage is burning
+        let Some(rk) = self.launch.as_ref() else {
+            self.smoke.clear();
+            return;
+        };
+        let thrust_frac = if rk.live_thrust() > 0.0 { rk.throttle as f32 } else { 0.0 };
+        if thrust_frac <= 0.0 {
+            return;
+        }
+        let alt = rk.altitude(&self.body);
+        // air density fraction: lots of smoke low down, little in the thin upper
+        // atmosphere, none in vacuum (the flame remains regardless).
+        let dens = (-(alt / 9000.0)).exp().clamp(0.0, 1.0) as f32;
+        let on_pad = alt < 30.0;
+        let base = self.to_local(rk.r);
+        let down = -self.dir_to_local(rk.point_dir()); // exhaust direction
+        // emit from the ACTIVE stage's nozzle (up the mesh by nozzle_y)
+        let q = Quat::from_rotation_arc(Vec3::Y, self.dir_to_local(rk.point_dir()));
+        let ny = self.rocket_body.nozzle_y.get(rk.stage_base).copied().unwrap_or(0.0);
+        let nozzle = base + q * Vec3::new(0.0, ny - 1.2, 0.0);
+        let er = self.rocket_body.engine_r.get(rk.stage_base).copied().unwrap_or(0.9);
+
+        // spawn rate: heavy at the pad (the ground billow), thinning with density.
+        let rate = thrust_frac * (8.0 + 120.0 * dens) * if on_pad { 2.5 } else { 1.0 };
+        self.smoke_accum += rate * dt;
+        let n = self.smoke_accum.floor() as i32;
+        self.smoke_accum -= n as f32;
+        let mut seed = (self.anim * 977.0).to_bits();
+        let mut rnd = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32
+        };
+        let ground = Vec3::new(base.x, rocket::PAD_TOP, base.z);
+        for _ in 0..n.min(40) {
+            let jit = Vec3::new(rnd() - 0.5, rnd() - 0.5, rnd() - 0.5);
+            if on_pad {
+                // exhaust deflects off the pad: billow outward + up from the ground
+                let a = rnd() * std::f32::consts::TAU;
+                let out = Vec3::new(a.cos(), 0.12, a.sin());
+                self.smoke.push(Smoke {
+                    pos: ground + Vec3::new(jit.x, jit.y.abs() * 0.5, jit.z) * 3.0,
+                    vel: out * (9.0 + rnd() * 12.0) + Vec3::Y * (2.0 + rnd() * 3.0),
+                    age: 0.0,
+                    life: 2.4 + rnd() * 1.8,
+                    size0: 3.0 + rnd() * 2.5,
+                    seed: rnd(),
+                });
+            } else {
+                self.smoke.push(Smoke {
+                    pos: nozzle + jit * (er * 0.8),
+                    vel: down * (6.0 + rnd() * 6.0) + jit * 3.0,
+                    age: 0.0,
+                    life: 1.1 + rnd() * 1.2,
+                    size0: er * (0.8 + rnd() * 0.7),
+                    seed: rnd(),
+                });
+            }
+        }
+        // keep the particle count bounded
+        if self.smoke.len() > 900 {
+            let drop = self.smoke.len() - 900;
+            self.smoke.drain(0..drop);
+        }
+    }
+
+    /// World->local point in the rocket-view tangent frame (metres).
+    fn to_local(&self, w: DVec3) -> Vec3 {
+        let d = w - self.launch_origin;
+        Vec3::new(
+            d.dot(self.launch_east) as f32,
+            d.dot(self.launch_up) as f32,
+            d.dot(self.launch_north) as f32,
+        )
+    }
+
+    /// World->local direction (no translation).
+    fn dir_to_local(&self, d: DVec3) -> Vec3 {
+        Vec3::new(
+            d.dot(self.launch_east) as f32,
+            d.dot(self.launch_up) as f32,
+            d.dot(self.launch_north) as f32,
+        )
+        .normalize_or_zero()
+    }
+
+    /// Rebuild the rocket-view geometry from the current VAB design (call after
+    /// the player edits the build).
+    fn rebuild_vehicle(&mut self) {
+        self.rocket_body = rocket::rocket_body(&self.vab.to_vehicle(), self.vab.payload().color, self.vab.payload().module);
+        self.rocket_focus_y = self.rocket_body.focus_y;
+    }
+
+    /// Ignite the assembled vehicle on the pad and begin a player launch.
+    fn ignite_launch(&mut self) {
+        self.rebuild_vehicle();
+        let veh = self.vab.to_vehicle();
+        // base of the rocket sits `base_y` above the pad surface, on the mount.
+        let r = self.launch_origin + self.launch_up * self.rocket_body.base_y as f64;
+        // Co-moving launch frame: ignite at rest relative to the (fixed) pad and
+        // terrain. We drop the planet's surface-rotation boost so the rocket
+        // doesn't drift sideways out of the local scene; the player flies the
+        // gravity turn from a standstill.
+        let v = DVec3::ZERO;
+        let mut rk = launch::Rocket::on_pad(&veh, r, v, self.launch_up, self.launch_east);
+        rk.throttle = 1.0;
+        self.launch = Some(rk);
+        self.sep = None;
+        self.smoke.clear();
+        self.mission_captured = false;
+        // you launch from the pad: ensure we're rolled out.
+        self.vab_mode = false;
+        self.rolling_out = false;
+        self.rollout = 1.0;
+        log::info!("Ignition: {} - throttle up, pitch over, stage when dry", veh.name);
+    }
+
+    /// Jettison the active stage; spawn the spent booster tumbling away.
+    fn stage_launch(&mut self) {
+        // capture the spent stage's pose + velocity (immutable borrow) first
+        let (r, pd, v, stage, can_stage) = match self.launch.as_ref() {
+            Some(rk) => (rk.r, rk.point_dir(), rk.v, rk.stage_base, rk.stages.len() > 1),
+            None => return,
+        };
+        if !can_stage {
+            return;
+        }
+        let range = self
+            .rocket_body
+            .stage_ranges
+            .get(stage)
+            .cloned()
+            .unwrap_or(0..0);
+        let base_local = self.to_local(r);
+        let pd_local = self.dir_to_local(pd);
+        let rot = Quat::from_rotation_arc(Vec3::Y, pd_local);
+        let vel_local = self.dir_to_local_vec(v);
+        self.launch.as_mut().unwrap().jettison();
+        self.sep = Some(SepBooster {
+            pos: base_local,
+            // a gentle retro push so it falls back below the climbing upper stage
+            vel: vel_local - pd_local * 12.0,
+            rot,
+            spin: Vec3::new(0.7, 0.15, 1.1),
+            age: 0.0,
+            range,
+        });
+    }
+
+    /// World->local velocity vector (unnormalised).
+    fn dir_to_local_vec(&self, d: DVec3) -> Vec3 {
+        Vec3::new(
+            d.dot(self.launch_east) as f32,
+            d.dot(self.launch_up) as f32,
+            d.dot(self.launch_north) as f32,
+        )
+    }
+
+    fn reset_launch(&mut self) {
+        self.launch = None;
+        self.sep = None;
+        self.smoke.clear();
+        self.mission_captured = false;
+    }
+
+    /// Whether the active launch has reached a stable parking orbit.
+    fn mission_complete(&self) -> bool {
+        self.mission_captured
+    }
+
+    /// On reaching a bound parking orbit, deposit the payload as a persistent
+    /// satellite circling the home world. Missions accumulate these.
+    fn capture_orbit_if_reached(&mut self) {
+        if self.mission_captured {
+            return;
+        }
+        let reached = self.launch.as_ref().map(|rk| rk.orbit_reached).unwrap_or(false);
+        if !reached {
+            return;
+        }
+        let rk = self.launch.as_ref().unwrap();
+        let orb = sim::orbit::orbit_from_state(rk.r, rk.v, self.body.mu);
+        let radius_m = rk.r.length();
+        let h = orb.h_vec.normalize_or_zero();
+        let aref = if h.x.abs() < 0.9 { DVec3::X } else { DVec3::Y };
+        let t1d = h.cross(aref).normalize_or_zero();
+        let t2d = h.cross(t1d).normalize_or_zero();
+        let phase0 = (rk.r.dot(t2d)).atan2(rk.r.dot(t1d)) as f32;
+        let rate = (sim::orbit::circular_speed(self.body.mu, radius_m) / radius_m) as f32;
+        let pay = self.vab.payload();
+        self.orbits.push(OrbitObject {
+            name: pay.name,
+            color: pay.color,
+            radius_mm: (radius_m / MM as f64) as f32,
+            t1: t1d.as_vec3(),
+            t2: t2d.as_vec3(),
+            rate,
+            phase0,
+            epoch: self.sys_time,
+        });
+        self.mission_captured = true;
+        log::info!("Payload to orbit: {} ({} satellites)", pay.name, self.orbits.len());
+    }
+
+    /// Transform a vertex range of the rocket body by pose `q`/`base` (local f64)
+    /// into `out`, camera-relative to `ref_local` (floating origin).
+    fn xform_into(
+        &self,
+        out: &mut Vec<rocket::MeshVertex>,
+        range: std::ops::Range<usize>,
+        q: Quat,
+        base: DVec3,
+    ) {
+        self.xform_into_off(out, range, q, base, Vec3::ZERO);
+    }
+
+    /// `xform_into` with an extra translation applied in the rocket's own local
+    /// frame before the pose (used to swing the fairing clamshell halves apart).
+    fn xform_into_off(
+        &self,
+        out: &mut Vec<rocket::MeshVertex>,
+        range: std::ops::Range<usize>,
+        q: Quat,
+        base: DVec3,
+        local_off: Vec3,
+    ) {
+        for v in &self.rocket_body.mesh.verts[range] {
+            let local = base + (q * (Vec3::from(v.pos) + local_off)).as_dvec3();
+            let n = q * Vec3::from(v.normal);
+            out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: n.into(), color: v.color });
+        }
+    }
+
+    /// Rebuild the full-planet LOD terrain, camera-relative to the current
+    /// `ref_local`, refined toward the camera. Called when the reference moves.
+    fn rebuild_terrain(&mut self) {
+        // Deep-space (asteroid) scenes have no planet underfoot.
+        if self.space {
+            self.terrain_verts.clear();
+            self.terrain_count = 0;
+            return;
+        }
+        let cam_world = self.cam_world(self.camera_eye_local());
+        let m = rocket::planet_terrain(
+            cam_world,
+            self.ref_local,
+            self.launch_origin,
+            self.launch_up,
+            self.launch_east,
+            self.launch_north,
+            19,
+            self.lunar,
+        );
+        self.terrain_count = (m.verts.len() as u64).min(TERRAIN_CAP) as u32;
+        self.terrain_verts = m.verts;
+        if std::env::var("MTS_DEBUG_VAB").is_ok() {
+            let rb = self.resting_base_local().as_vec3();
+            let r = self.ref_local.as_vec3();
+            let near: Vec<f32> = self
+                .terrain_verts
+                .iter()
+                .filter(|v| {
+                    let p = Vec3::from(v.pos) + r;
+                    (p.x - rb.x).abs() < 40.0 && (p.z - rb.z).abs() < 40.0
+                })
+                .map(|v| Vec3::from(v.pos).y + r.y)
+                .collect();
+            let lo = near.iter().cloned().fold(f32::MAX, f32::min);
+            let hi = near.iter().cloned().fold(f32::MIN, f32::max);
+            eprintln!("VAB resting_base.y={:.2} terrain near VAB y in [{:.2},{:.2}] ({} verts)", rb.y, lo, hi, near.len());
+        }
+    }
+
+    /// Per-frame dynamic rocket-view geometry, camera-relative (floating origin):
+    /// the pad + mount, the rocket at its current pose, and any tumbling spent
+    /// booster. The full planet terrain lives in its own (rebuilt-on-move) buffer.
+    fn build_dynamic_mesh(&self) -> Vec<rocket::MeshVertex> {
+        let rb = &self.rocket_body;
+        let mut out: Vec<rocket::MeshVertex> = Vec::new();
+
+        // static structures (camera-relative): pad + mount, the assembly hangar,
+        // and the parts rack beside it.
+        let push_static = |out: &mut Vec<rocket::MeshVertex>, mesh: &rocket::Mesh| {
+            for v in &mesh.verts {
+                out.push(rocket::MeshVertex {
+                    pos: self.rel(Vec3::from(v.pos).as_dvec3()).into(),
+                    normal: v.normal,
+                    color: v.color,
+                });
+            }
+        };
+        // the moon base on the surface (preview / overview), instead of the stack
+        if let Some(base) = self.base_mesh.as_ref() {
+            for v in &base.verts {
+                let local = Vec3::from(v.pos).as_dvec3();
+                out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: v.normal, color: v.color });
+            }
+            // optionally also show the lander parked at the base
+            if self.show_lander {
+                let b = DVec3::new(0.0, self.lander_alt as f64, 0.0);
+                for v in &self.lander_mesh.verts {
+                    let local = b + Vec3::from(v.pos).as_dvec3();
+                    out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: v.normal, color: v.color });
+                }
+            }
+            return out;
+        }
+        // the lunar lander on the surface (preview / landed), instead of the launch stack
+        if self.show_lander {
+            let base = DVec3::new(0.0, self.lander_alt as f64, 0.0);
+            for v in &self.lander_mesh.verts {
+                let local = base + Vec3::from(v.pos).as_dvec3();
+                out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: v.normal, color: v.color });
+            }
+            return out;
+        }
+
+        push_static(&mut out, &self.pad_mesh);
+        push_static(&mut out, &self.hangar_mesh);
+        push_static(&mut out, &self.rack_mesh);
+
+        // current rocket pose: in the hangar / rolling out when not launched
+        let (base_local, quat, active) = match self.launch.as_ref() {
+            Some(rk) => {
+                let base = self.to_local_d(rk.r);
+                let q = Quat::from_rotation_arc(Vec3::Y, self.dir_to_local(rk.point_dir()));
+                (base, q, rk.stage_base)
+            }
+            None => (self.resting_base_local(), Quat::IDENTITY, 0),
+        };
+
+        // draw the payload. When the fairing is closed, the whole payload range
+        // (module + clamshell) draws as one. When opening, draw the module in
+        // place and swing the two fairing halves out along local +/-X.
+        if self.fairing_open > 0.01 {
+            let off = self.fairing_open * 4.0;
+            self.xform_into(&mut out, rb.module_range.clone(), quat, base_local);
+            self.xform_into_off(&mut out, rb.fairing_l.clone(), quat, base_local, Vec3::new(-off, 0.0, 0.0));
+            self.xform_into_off(&mut out, rb.fairing_r.clone(), quat, base_local, Vec3::new(off, 0.0, 0.0));
+        } else {
+            self.xform_into(&mut out, rb.payload_range.clone(), quat, base_local);
+        }
+        for r in rb.stage_ranges.iter().skip(active) {
+            self.xform_into(&mut out, r.clone(), quat, base_local);
+        }
+
+        // tumbling spent stage
+        if let Some(s) = self.sep.as_ref() {
+            for v in &rb.mesh.verts[s.range.clone()] {
+                let local = s.pos.as_dvec3() + (s.rot * Vec3::from(v.pos)).as_dvec3();
+                let n = s.rot * Vec3::from(v.normal);
+                out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: n.into(), color: v.color });
+            }
+        }
+
+        // drag ghost: the part being dragged from the rack (grab_ghost is already
+        // camera-relative). Bright when snapped to a valid slot.
+        if let Some(g) = self.grab {
+            let col = if self.grab_target.is_some() { [0.5, 1.0, 0.7] } else { [0.8, 0.85, 1.0] };
+            let mut gm = rocket::Mesh::default();
+            rocket::append_part(&mut gm, g.kind, self.grab_ghost, col);
+            out.extend(gm.verts);
+        }
+
+        out
+    }
+
+    /// Thruster FX billboards for the rocket view: an emissive flame at the
+    /// active nozzle (axis-aligned cards facing the camera) and the smoke-
+    /// particle trail (camera-facing puffs). `right`/`up` are the camera basis.
+    fn build_fx(&self, eye: Vec3, right: Vec3, up: Vec3) -> Vec<FxVertex> {
+        let mut out: Vec<FxVertex> = Vec::new();
+
+        // ---- exhaust flame at the active nozzle ----
+        if let Some(rk) = self.launch.as_ref() {
+            let tf = if rk.live_thrust() > 0.0 { rk.throttle as f32 } else { 0.0 };
+            if tf > 0.0 {
+                let booster = rk.stage_base == 0;
+                let down = -self.dir_to_local(rk.point_dir()); // flame opposes thrust
+                let er = self.rocket_body.engine_r.get(rk.stage_base).copied().unwrap_or(0.9)
+                    * 1.6;
+                // Anchor at the ACTIVE stage's engine: its nozzle sits up the mesh
+                // by `nozzle_y`, so after a stage drops the flame stays at the new
+                // active engine instead of the old base.
+                let q = Quat::from_rotation_arc(Vec3::Y, self.dir_to_local(rk.point_dir()));
+                let ny = self.rocket_body.nozzle_y.get(rk.stage_base).copied().unwrap_or(0.0);
+                let mount = self.to_local_d(rk.r) + (q * Vec3::new(0.0, ny - 1.2, 0.0)).as_dvec3();
+                let nozzle = self.rel(mount);
+                let len = (if booster { 17.0 } else { 10.5 }) * (0.55 + 0.45 * tf);
+                // axis billboard: width axis is perpendicular to the flame and to
+                // the view ray, so the card faces the camera.
+                let view = (nozzle - eye).normalize_or_zero();
+                let mut w_axis = down.cross(view).normalize_or_zero();
+                if w_axis.length_squared() < 1e-4 {
+                    w_axis = right;
+                }
+                let mut card = |length: f32, half_w: f32, seed: f32, inten: f32| {
+                    let tip = nozzle + down * length;
+                    let wn = w_axis * half_w;
+                    let wt = w_axis * (half_w * 0.22);
+                    let col = [seed, inten, 0.0, 0.0];
+                    let q = [
+                        (nozzle - wn, [0.0f32, 0.0]),
+                        (nozzle + wn, [1.0, 0.0]),
+                        (tip + wt, [1.0, 1.0]),
+                        (tip - wt, [0.0, 1.0]),
+                    ];
+                    for &i in &[0usize, 1, 2, 0, 2, 3] {
+                        out.push(FxVertex { pos: q[i].0.into(), uv: q[i].1, color: col, kind: 0.0 });
+                    }
+                };
+                card(len, er * 1.9, 0.10, tf); // wide orange body
+                card(len * 0.5, er * 1.0, 0.63, tf * 1.3); // white-hot core
+            }
+        }
+
+        // ---- lunar descent-engine plume (under the lander's bell) ----
+        if self.show_lander && self.lander_firing {
+            let down = Vec3::new(0.0, -1.0, 0.0);
+            // the descent bell exits near y=0.9 in the lander mesh; the lander
+            // itself floats at lander_alt.
+            let mount = DVec3::new(0.0, self.lander_alt as f64 + 0.9, 0.0);
+            let nozzle = self.rel(mount);
+            let view = (nozzle - eye).normalize_or_zero();
+            let mut w_axis = down.cross(view).normalize_or_zero();
+            if w_axis.length_squared() < 1e-4 {
+                w_axis = right;
+            }
+            let mut card = |length: f32, half_w: f32, seed: f32, inten: f32| {
+                let tip = nozzle + down * length;
+                let wn = w_axis * half_w;
+                let wt = w_axis * (half_w * 0.18);
+                let col = [seed, inten, 0.0, 0.0];
+                let q = [
+                    (nozzle - wn, [0.0f32, 0.0]),
+                    (nozzle + wn, [1.0, 0.0]),
+                    (tip + wt, [1.0, 1.0]),
+                    (tip - wt, [0.0, 1.0]),
+                ];
+                for &i in &[0usize, 1, 2, 0, 2, 3] {
+                    out.push(FxVertex { pos: q[i].0.into(), uv: q[i].1, color: col, kind: 0.0 });
+                }
+            };
+            // a short, translucent-blue-ish vacuum plume: orange-ish edge, hot core
+            card(7.0, 1.5, 0.18, 0.9);
+            card(4.0, 0.7, 0.70, 1.2);
+        }
+
+        // ---- RCS attitude jets around the lander's upper body ----
+        if self.show_lander && self.lander_rcs > 0.01 {
+            // four thruster clusters at the corners of the descent stage, each
+            // firing a short blue-white jet outward (lateral attitude control).
+            let inten = self.lander_rcs.clamp(0.0, 1.0);
+            let y = self.lander_alt as f64 + 3.6; // upper body
+            let br = 2.3f64;
+            for k in 0..4 {
+                let a = (k as f64 + 0.5) * std::f64::consts::FRAC_PI_2;
+                let (cx, cz) = (a.cos(), a.sin());
+                // pulse opposite pairs so it reads as a control couple, not a flare
+                let pulse = if k % 2 == 0 {
+                    0.55 + 0.45 * (self.anim * 30.0).sin()
+                } else {
+                    0.55 + 0.45 * (self.anim * 30.0 + 3.14).sin()
+                };
+                let amp = (inten * pulse as f32).clamp(0.0, 1.0);
+                if amp < 0.05 {
+                    continue;
+                }
+                let nz_local = DVec3::new(cx * br, y, cz * br);
+                let nozzle = self.rel(nz_local);
+                let dir = Vec3::new(cx as f32, 0.0, cz as f32); // outward
+                let view = (nozzle - eye).normalize_or_zero();
+                let mut w_axis = dir.cross(view).normalize_or_zero();
+                if w_axis.length_squared() < 1e-4 {
+                    w_axis = up;
+                }
+                let len = 2.6f32 * (0.6 + 0.4 * amp);
+                let tip = nozzle + dir * len;
+                let wn = w_axis * 0.42;
+                let wt = w_axis * 0.07;
+                let col = [0.2f32, amp, 0.0, 0.0];
+                let q = [
+                    (nozzle - wn, [0.0f32, 0.0]),
+                    (nozzle + wn, [1.0, 0.0]),
+                    (tip + wt, [1.0, 1.0]),
+                    (tip - wt, [0.0, 1.0]),
+                ];
+                for &i in &[0usize, 1, 2, 0, 2, 3] {
+                    out.push(FxVertex { pos: q[i].0.into(), uv: q[i].1, color: col, kind: 2.0 });
+                }
+            }
+        }
+
+        // ---- smoke-particle trail (camera-facing billboards) ----
+        for s in &self.smoke {
+            let t = (s.age / s.life).clamp(0.0, 1.0);
+            let size = s.size0 * (1.0 + t * 3.0);
+            let fade_in = (s.age / 0.15).clamp(0.0, 1.0);
+            let alpha = fade_in * (1.0 - t) * 0.5;
+            if alpha <= 0.01 {
+                continue;
+            }
+            let g = 0.85 - 0.4 * t; // cools/darkens with age
+            let col = [g, g, g * 1.02, alpha];
+            let r = right * size;
+            let u = up * size;
+            let c = self.rel(s.pos.as_dvec3()); // camera-relative (floating origin)
+            let q = [
+                (c - r - u, [0.0f32, 0.0]),
+                (c + r - u, [1.0, 0.0]),
+                (c + r + u, [1.0, 1.0]),
+                (c - r + u, [0.0, 1.0]),
+            ];
+            for &i in &[0usize, 1, 2, 0, 2, 3] {
+                out.push(FxVertex { pos: q[i].0.into(), uv: q[i].1, color: col, kind: 1.0 });
+            }
+        }
+        out
+    }
+
+    /// Integrate the jettisoned booster (local frame, ~9.2 m/s^2 down).
+    fn advance_sep(&mut self, dt: f32) {
+        if let Some(s) = self.sep.as_mut() {
+            s.age += dt;
+            s.vel.y -= 9.2 * dt;
+            s.pos += s.vel * dt;
+            s.rot = (Quat::from_scaled_axis(s.spin * dt) * s.rot).normalize();
+            if s.age > 9.0 {
+                self.sep = None;
+            }
         }
     }
 
@@ -269,47 +1668,37 @@ impl World {
         log::info!("Manual flight control engaged");
     }
 
-    /// World-from-view rotation: column 2 is the world point facing the camera.
-    fn camera_rot(&self) -> Mat3 {
-        let d = Vec3::new(
-            self.el.cos() * self.az.cos(),
-            self.el.sin(),
-            self.el.cos() * self.az.sin(),
-        );
-        let xc = Vec3::Y.cross(d).normalize();
-        let yc = d.cross(xc).normalize();
-        Mat3::from_cols(xc, yc, d)
-    }
-
-    fn uniforms(&self, res: [f32; 2], time: f32) -> Uniforms {
-        let rot = self.camera_rot();
-        let st = time * 0.03 + self.mission.spaceport_lon;
-        let sun = Vec3::new(st.cos() * 0.95, 0.28, st.sin() * 0.95).normalize();
-        Uniforms {
-            resolution: res,
-            scale: self.scale,
-            time,
-            sun: [sun.x, sun.y, sun.z, 0.0],
-            cx: [rot.x_axis.x, rot.x_axis.y, rot.x_axis.z, 0.0],
-            cy: [rot.y_axis.x, rot.y_axis.y, rot.y_axis.z, 0.0],
-            cz: [rot.z_axis.x, rot.z_axis.y, rot.z_axis.z, 0.0],
+    /// Hand the active flight craft to the autonomous moon-landing bot (or take
+    /// back manual control). Engages a craft first if none is flying.
+    fn toggle_moonbot(&mut self) {
+        if self.moonbot.is_some() {
+            self.moonbot = None;
+            log::info!("Moon bot disengaged - you have control");
+            return;
+        }
+        if self.flight.is_none() {
+            self.toggle_flight();
+        }
+        if self.flight.is_some() {
+            self.moonbot = Some(bot::MoonBot::new());
+            log::info!("Moon bot engaged - flying to the surface");
         }
     }
 
-    /// Project a world unit-sphere point through the orthographic camera to
-    /// clip space. Returns `None` when the point is hidden behind the planet.
-    fn project(p: Vec3, rt: Mat3, aspect: f32, scale: f32) -> Option<[f32; 2]> {
-        let v = rt * p;
-        let occluded = v.z < 0.0 && (v.x * v.x + v.y * v.y) < 1.0;
-        if occluded {
-            None
-        } else {
-            Some([v.x / (aspect * scale), v.y / scale])
-        }
-    }
-
-    /// World position + colour of the surface-view craft/rocket marker.
+    /// World position (unit-sphere) + colour of the map craft/rocket marker.
     fn surface_marker(&self) -> (Vec3, [f32; 3]) {
+        if let Some(rk) = self.launch.as_ref() {
+            let u = rk.r / self.body.radius;
+            let pos = Vec3::new(u.x as f32, u.y as f32, u.z as f32);
+            let col = if rk.crashed {
+                [1.0, 0.25, 0.2]
+            } else if rk.orbit_reached {
+                [0.5, 0.9, 1.0]
+            } else {
+                [1.0, 0.55, 0.15]
+            };
+            return (pos, col);
+        }
         if let Some(craft) = self.flight.as_ref() {
             let col = if craft.crashed {
                 [1.0, 0.25, 0.2]
@@ -332,32 +1721,24 @@ impl World {
         }
     }
 
-    /// Draw the surface-view marker as a filled, outlined diamond (HUD pass) so
-    /// it is visible over both the lit surface and dark space.
-    fn append_surface_marker(&self, out: &mut Vec<OverlayVertex>, aspect: f32) {
-        let (pos, col) = self.surface_marker();
-        let rt = self.camera_rot().transpose();
-        if let Some(c) = Self::project(pos, rt, aspect, self.scale) {
-            push_filled_diamond(out, c, 0.026, aspect, [0.0, 0.0, 0.0]);
-            push_filled_diamond(out, c, 0.017, aspect, col);
-        }
-    }
-
-    fn build_overlay(&self, rot: Mat3, aspect: f32) -> Vec<OverlayVertex> {
-        if self.view == View::System {
-            // the system-view craft marker is drawn as a filled shape in the HUD
-            // pass (visible on bright bodies); nothing to draw as lines here.
-            let _ = aspect;
+    /// Launch/ascent/orbit trajectories projected into the perspective map.
+    /// Mission positions are unit-sphere (magnitude encodes altitude), so we
+    /// scale by the home radius (Mm) and project with the system camera.
+    fn build_overlay(&self, aspect: f32) -> Vec<OverlayVertex> {
+        if self.view != View::Map {
             return Vec::new();
         }
-        let rt = rot.transpose();
-        let scale = self.scale;
+        let cam = self.system_camera(aspect);
+        let r = self.home_radius_mm as f64;
+        let home_pos = self.universe.position(self.universe.home_index(), self.sys_time);
         let mut out: Vec<OverlayVertex> = Vec::new();
 
+        // trajectory positions are home-centred unit-sphere; place them at the
+        // home world's current orbital position.
         let polyline = |pts: &[Vec3], color: [f32; 3], out: &mut Vec<OverlayVertex>| {
             let mut prev: Option<[f32; 2]> = None;
             for &p in pts {
-                let cur = Self::project(p, rt, aspect, scale);
+                let cur = cam.project(home_pos + p.as_dvec3() * r);
                 if let (Some(a), Some(b)) = (prev, cur) {
                     out.push(OverlayVertex { pos: a, color });
                     out.push(OverlayVertex { pos: b, color });
@@ -366,13 +1747,20 @@ impl World {
             }
         };
 
-        // launch-pad marker on the surface
         polyline(&self.mission.pad_ring, [0.9, 0.6, 0.2], &mut out);
 
-        // trajectories (the marker itself is drawn filled in the HUD pass)
-        if let Some(craft) = self.flight.as_ref() {
+        if let Some(rk) = self.launch.as_ref() {
+            // the player launch's predicted conic (empty while still suborbital)
+            let pred = rk.predicted_orbit(&self.body);
+            polyline(&pred, [1.0, 0.7, 0.25], &mut out);
+        } else if let Some(craft) = self.flight.as_ref() {
             let pred = craft.predicted_orbit(&self.body);
             polyline(&pred, [0.5, 0.55, 0.25], &mut out);
+            // planned maneuver: the resulting orbit, in cyan
+            if let Some(n) = self.node {
+                let after = craft.node_orbit(&self.body, n.nu, n.pro, n.nrm, n.rad);
+                polyline(&after, [0.3, 0.85, 1.0], &mut out);
+            }
         } else {
             if self.mission.reached {
                 polyline(&self.mission.ring, [0.25, 0.7, 0.45], &mut out);
@@ -389,238 +1777,109 @@ impl World {
             polyline(&flown, [0.45, 0.9, 1.0], &mut out);
         }
 
-        out
-    }
-
-    fn build_hud(&self, hud: &Hud, res: (f32, f32)) -> Vec<OverlayVertex> {
-        if self.view == View::System {
-            return self.build_system_hud(hud, res);
-        }
-        if let Some(craft) = self.flight.as_ref() {
-            return self.build_flight_hud(hud, craft, res);
-        }
-        if !self.launched {
-            return self.build_vehicle_hud(hud, res);
-        }
-
-        let mut out: Vec<OverlayVertex> = Vec::new();
-        let dim = [0.55, 0.75, 0.85];
-        let val = [0.92, 0.96, 1.0];
-        let amber = [1.0, 0.78, 0.30];
-        let x = 16.0;
-        let step = hud::LINE_H;
-        let row = |out: &mut Vec<OverlayVertex>, label: &str, value: &str, y: f32| {
-            let cx = hud.text(out, label, x, y, dim, res);
-            hud.text(out, value, cx, y, val, res);
+        // Orbit rings sampled from the actual ellipses. Planet rings appear at
+        // system zoom; the focused planet's moon rings appear when zoomed in.
+        let t = self.sys_time;
+        let ring = |i: usize, color: [f32; 3], out: &mut Vec<OverlayVertex>| {
+            let mut prev: Option<[f32; 2]> = None;
+            for k in 0..=128 {
+                let cur = cam.project(self.universe.ring_point(i, k as f64 / 128.0, t));
+                if let (Some(u), Some(v)) = (prev, cur) {
+                    out.push(OverlayVertex { pos: u, color });
+                    out.push(OverlayVertex { pos: v, color });
+                }
+                prev = cur;
+            }
         };
-
-        let tel = self.mission.telemetry(self.launched, self.clock);
-        let mut y = 16.0;
-        hud.text(&mut out, self.mission.vehicle, x, y, amber, res);
-        y += step * 1.5;
-
-        let phase_col = match tel.phase {
-            "ASCENT" => [1.0, 0.55, 0.15],
-            "ORBIT" => [0.5, 0.9, 1.0],
-            _ => [0.5, 1.0, 0.5],
-        };
-        let cx = hud.text(&mut out, "PHASE    ", x, y, dim, res);
-        hud.text(&mut out, tel.phase, cx, y, phase_col, res);
-        y += step;
-
-        row(&mut out, "MET      ", &format!("T+{:.0}S", self.clock.max(0.0)), y);
-        y += step;
-        row(&mut out, "ALT      ", &format!("{:.1} KM", tel.alt_km), y);
-        y += step;
-        row(&mut out, "VEL      ", &format!("{:.0} M/S", tel.speed), y);
-        y += step;
-        if let Some((peri, apo)) = tel.orbit {
-            row(&mut out, "ORBIT    ", &format!("{:.0} X {:.0} KM", peri, apo), y);
-        } else {
-            row(&mut out, "RANGE    ", &format!("{:.0} KM", tel.downrange_km), y);
-        }
-        y += step;
-        row(
-            &mut out,
-            "STAGE    ",
-            &format!("{}/{}", tel.stage + 1, self.mission.stage_count),
-            y,
-        );
-        y += step;
-        row(&mut out, "WARP     ", &format!("{:.0}X", self.warp), y);
-
-        let mut hy = res.1 - step * 4.0 - 12.0;
-        for line in [
-            "SPACE LAUNCH/RESET",
-            "F  TAKE MANUAL CONTROL",
-            "DRAG ORBIT   SCROLL ZOOM",
-            "[ ] TIME WARP",
-        ] {
-            hud.text(&mut out, line, x, hy, dim, res);
-            hy += step;
-        }
-        out
-    }
-
-    fn build_flight_hud(&self, hud: &Hud, craft: &Craft, res: (f32, f32)) -> Vec<OverlayVertex> {
-        let mut out: Vec<OverlayVertex> = Vec::new();
-        let dim = [0.55, 0.75, 0.85];
-        let val = [0.92, 0.96, 1.0];
-        let amber = [1.0, 0.78, 0.30];
-        let x = 16.0;
-        let step = hud::LINE_H;
-        let row = |out: &mut Vec<OverlayVertex>, label: &str, value: &str, y: f32| {
-            let cx = hud.text(out, label, x, y, dim, res);
-            hud.text(out, value, cx, y, val, res);
-        };
-
-        let mut y = 16.0;
-        hud.text(&mut out, "MANUAL FLIGHT", x, y, amber, res);
-        y += step * 1.5;
-
-        let status = craft.status();
-        let scol = match status {
-            "CRASHED" => [1.0, 0.3, 0.25],
-            "LANDED" => [0.4, 1.0, 0.5],
-            _ => [1.0, 0.8, 0.3],
-        };
-        let cx = hud.text(&mut out, "STATUS   ", x, y, dim, res);
-        hud.text(&mut out, status, cx, y, scol, res);
-        y += step;
-
-        row(&mut out, "ALT      ", &format!("{:.1} KM", craft.altitude(&self.body) / 1000.0), y);
-        y += step;
-        row(&mut out, "VEL      ", &format!("{:.0} M/S", craft.speed()), y);
-        y += step;
-        row(&mut out, "VSPD     ", &format!("{:.0} M/S", craft.vertical_speed()), y);
-        y += step;
-        row(&mut out, "THROTTLE ", &format!("{:.0}", craft.throttle * 100.0), y);
-        y += step;
-        row(&mut out, "PROP     ", &format!("{:.0}", craft.prop_frac() * 100.0), y);
-        y += step;
-        row(&mut out, "MODE     ", craft.mode.label(), y);
-
-        let mut hy = res.1 - step * 4.0 - 12.0;
-        for line in [
-            "W / S  THROTTLE",
-            "1 PRO  2 RETRO  3 OUT  4 IN",
-            "F  RELEASE CONTROL",
-            "[ ] TIME WARP",
-        ] {
-            hud.text(&mut out, line, x, hy, dim, res);
-            hy += step;
-        }
-        out
-    }
-
-    fn build_vehicle_hud(&self, hud: &Hud, res: (f32, f32)) -> Vec<OverlayVertex> {
-        let mut out: Vec<OverlayVertex> = Vec::new();
-        let dim = [0.55, 0.75, 0.85];
-        let val = [0.92, 0.96, 1.0];
-        let amber = [1.0, 0.78, 0.30];
-        let green = [0.5, 1.0, 0.5];
-        let x = 16.0;
-        let step = hud::LINE_H;
-        let row = |out: &mut Vec<OverlayVertex>, label: &str, value: &str, y: f32, c: [f32; 3]| {
-            let cx = hud.text(out, label, x, y, dim, res);
-            hud.text(out, value, cx, y, c, res);
-        };
-
-        let m = &self.mission;
-        let mut y = 16.0;
-        hud.text(&mut out, "VEHICLE ASSEMBLY", x, y, amber, res);
-        y += step * 1.3;
-        hud.text(&mut out, m.vehicle, x, y, val, res);
-        y += step * 1.3;
-
-        // stages, top of the stack first
-        for (i, (name, wet_t, dv)) in m.stack.iter().enumerate().rev() {
-            let label = format!("S{} {}", i + 1, name);
-            let value = format!("{:.0} T  {:.0} M/S", wet_t, dv);
-            // pad the label column to align values
-            let padded = format!("{:<11}", label);
-            row(&mut out, &padded, &value, y, val);
-            y += step;
-        }
-        y += step * 0.5;
-        row(&mut out, "MASS     ", &format!("{:.0} T", m.liftoff_mass_t), y, val);
-        y += step;
-        row(&mut out, "TWR      ", &format!("{:.2}", m.liftoff_twr), y, val);
-        y += step;
-        row(&mut out, "DELTA-V  ", &format!("{:.0} M/S", m.total_dv), y, val);
-        y += step;
-        row(&mut out, "PAYLOAD  ", &format!("{:.0} T", m.payload_t), y, val);
-        y += step;
-        row(&mut out, "TARGET   ", &format!("{:.0} KM ORBIT", m.target_orbit_km()), y, val);
-        y += step * 1.3;
-        hud.text(&mut out, "SPACE  LAUNCH", x, y, green, res);
-
-        let mut hy = res.1 - step * 3.0 - 12.0;
-        for line in ["DRAG ORBIT   SCROLL ZOOM", "V  SYSTEM VIEW", "[ ] TIME WARP"] {
-            hud.text(&mut out, line, x, hy, dim, res);
-            hy += step;
-        }
-        out
-    }
-
-    fn build_system_hud(&self, hud: &Hud, res: (f32, f32)) -> Vec<OverlayVertex> {
-        let mut out: Vec<OverlayVertex> = Vec::new();
-        let dim = [0.55, 0.75, 0.85];
-        let val = [0.92, 0.96, 1.0];
-        let amber = [1.0, 0.78, 0.30];
-        let x = 16.0;
-        let step = hud::LINE_H;
-        let row = |out: &mut Vec<OverlayVertex>, label: &str, value: &str, y: f32| {
-            let cx = hud.text(out, label, x, y, dim, res);
-            hud.text(out, value, cx, y, val, res);
-        };
-
-        let mut y = 16.0;
-        hud.text(&mut out, "SYSTEM MAP", x, y, amber, res);
-        y += step * 1.5;
-
-        let moon_dist = self.moon_center_mm.length();
-        row(&mut out, "HOME     ", &format!("R {:.0} KM", self.home_radius_mm * 1000.0), y);
-        y += step;
-        row(&mut out, "MOON     ", &format!("R {:.0} KM", self.moon_radius_mm * 1000.0), y);
-        y += step;
-        row(&mut out, "RANGE    ", &format!("{:.0} MM", moon_dist), y);
-        y += step;
-        row(&mut out, "CAM DIST ", &format!("{:.0} MM", self.sys_dist), y);
-
-        if let Some(craft) = self.flight.as_ref() {
-            y += step * 1.5;
-            let to_moon = (craft.r - self.moon_center_m).length() / MM as f64;
-            let scol = match craft.status() {
-                "CRASHED" => [1.0, 0.3, 0.25],
-                "LANDED" => [0.4, 1.0, 0.5],
-                _ => [1.0, 0.8, 0.3],
-            };
-            let cx = hud.text(&mut out, "CRAFT    ", x, y, dim, res);
-            let label = if craft.landed && craft.landed_on == "MOON" {
-                "ON MOON"
-            } else {
-                craft.status()
-            };
-            hud.text(&mut out, label, cx, y, scol, res);
-            y += step;
-            row(&mut out, "TO MOON  ", &format!("{:.1} MM", to_moon), y);
-
-            // craft marker in the scene: filled diamond + dark outline so it is
-            // visible on both the dark sky and the bright moon.
-            let aspect = res.0 / res.1.max(1.0);
-            let cam = self.system_camera(aspect);
-            let p_mm = (craft.r / MM as f64).as_vec3();
-            if let Some(c) = cam.project(p_mm) {
-                push_filled_diamond(&mut out, c, 0.030, aspect, [0.0, 0.0, 0.0]);
-                push_filled_diamond(&mut out, c, 0.020, aspect, scol);
+        let focus_pos = self.focus_pos();
+        for (i, b) in self.universe.bodies.iter().enumerate() {
+            match b.kind {
+                Kind::Planet if self.sys_dist > 8.0e3 => {
+                    ring(i, [0.38, 0.38, 0.52], &mut out);
+                }
+                Kind::Moon => {
+                    // only the focused planet's moons, and only when zoomed near
+                    let center = self.universe.orbit_center(i, t);
+                    if self.sys_dist < 5.0e3 && (center - focus_pos).length() < 1.0 {
+                        ring(i, [0.35, 0.5, 0.75], &mut out);
+                    }
+                }
+                _ => {}
             }
         }
 
-        let mut hy = res.1 - step * 3.0 - 12.0;
-        for line in ["V  BACK TO SURFACE", "F  MANUAL CONTROL", "DRAG ORBIT   SCROLL ZOOM"] {
-            hud.text(&mut out, line, x, hy, dim, res);
-            hy += step;
+        // rings of payloads our missions placed in orbit (visible zoomed to home)
+        if self.sys_dist < 200.0 && !self.orbits.is_empty() {
+            let home_pos = self.universe.position(self.universe.home_index(), t);
+            for o in &self.orbits {
+                let col = [o.color[0] * 0.7, o.color[1] * 0.7, o.color[2] * 0.7];
+                let mut prev: Option<[f32; 2]> = None;
+                for k in 0..=96 {
+                    let th = k as f32 / 96.0 * std::f32::consts::TAU;
+                    let p = home_pos
+                        + (o.t1 * th.cos() + o.t2 * th.sin()).as_dvec3() * o.radius_mm as f64;
+                    let cur = cam.project(p);
+                    if let (Some(a), Some(b)) = (prev, cur) {
+                        out.push(OverlayVertex { pos: a, color: col });
+                        out.push(OverlayVertex { pos: b, color: col });
+                    }
+                    prev = cur;
+                }
+            }
+        }
+
+        out
+    }
+
+    /// In-scene overlay geometry for the map view: the home-world craft marker
+    /// and locator dots for every small body. All text panels live in egui now
+    /// (see `ui::build`), so this emits only diamonds/markers, never glyphs.
+    fn build_hud(&self, res: (f32, f32)) -> Vec<OverlayVertex> {
+        let mut out: Vec<OverlayVertex> = Vec::new();
+        if self.view != View::Map {
+            return out;
+        }
+
+        // Rocket/craft marker, placed at the home world's orbital position.
+        let aspect = res.0 / res.1.max(1.0);
+        let cam = self.system_camera(aspect);
+        let home_pos = self.universe.position(self.universe.home_index(), self.sys_time);
+        let (mpos, mcol) = self.surface_marker();
+        if let Some(c) = cam.project(home_pos + mpos.as_dvec3() * self.home_radius_mm as f64) {
+            push_filled_diamond(&mut out, c, 0.030, aspect, [0.0, 0.0, 0.0]);
+            push_filled_diamond(&mut out, c, 0.020, aspect, mcol);
+        }
+
+        // maneuver-node marker (cyan) on the craft's orbit
+        if let (Some(craft), Some(n)) = (self.flight.as_ref(), self.node) {
+            let np = craft.node_marker(&self.body, n.nu);
+            if let Some(c) = cam.project(home_pos + np.as_dvec3() * self.home_radius_mm as f64) {
+                push_filled_diamond(&mut out, c, 0.024, aspect, [0.0, 0.0, 0.0]);
+                push_filled_diamond(&mut out, c, 0.015, aspect, [0.3, 0.85, 1.0]);
+            }
+        }
+
+        // locator dots for every small body (moons, asteroids, comets) so the
+        // full system reads even though only stars/planets are ray-marched.
+        for (i, b) in self.universe.bodies.iter().enumerate() {
+            let sz = match b.kind {
+                Kind::Moon => 0.009,
+                Kind::AsteroidMajor | Kind::Comet => 0.007,
+                Kind::AsteroidMinor => 0.005,
+                _ => continue,
+            };
+            if let Some(c) = cam.project(self.universe.position(i, self.sys_time)) {
+                push_filled_diamond(&mut out, c, sz + 0.004, aspect, [0.0, 0.0, 0.0]);
+                push_filled_diamond(&mut out, c, sz, aspect, b.color);
+            }
+        }
+
+        // payloads our missions have placed in orbit around the home world
+        for o in &self.orbits {
+            if let Some(c) = cam.project(o.pos_mm(home_pos, self.sys_time)) {
+                push_filled_diamond(&mut out, c, 0.011, aspect, [0.0, 0.0, 0.0]);
+                push_filled_diamond(&mut out, c, 0.007, aspect, o.color);
+            }
         }
         out
     }
@@ -631,9 +1890,6 @@ impl World {
 // ---------------------------------------------------------------------------
 
 struct Gpu {
-    pipeline: wgpu::RenderPipeline,
-    uniform_buf: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
     scene_pipeline: wgpu::RenderPipeline,
     scene_uniform_buf: wgpu::Buffer,
     scene_bind_group: wgpu::BindGroup,
@@ -641,22 +1897,24 @@ struct Gpu {
     overlay_buf: wgpu::Buffer,
     hud_pipeline: wgpu::RenderPipeline,
     hud_buf: wgpu::Buffer,
+    mesh_pipeline: wgpu::RenderPipeline,
+    mesh_uniform_buf: wgpu::Buffer,
+    mesh_bind_group: wgpu::BindGroup,
+    /// Full-planet LOD terrain, rebuilt (camera-relative) when the camera moves.
+    terrain_vbuf: wgpu::Buffer,
+    /// Dynamic rocket-view geometry (pad, rocket pose, spent booster), rebuilt
+    /// every frame.
+    dyn_vbuf: wgpu::Buffer,
+    /// Thruster FX billboards (flame + smoke particles).
+    fx_pipeline: wgpu::RenderPipeline,
+    fx_vbuf: wgpu::Buffer,
+    sky_pipeline: wgpu::RenderPipeline,
+    sky_uniform_buf: wgpu::Buffer,
+    sky_bind_group: wgpu::BindGroup,
 }
 
 impl Gpu {
     fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Gpu {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("planet"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("planet.wgsl").into()),
-        });
-
-        let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("uniforms"),
-            size: std::mem::size_of::<Uniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         let planet_img = image::load_from_memory(include_bytes!("../assets/planet.png"))
             .expect("decode planet.png")
             .to_rgba8();
@@ -738,59 +1996,7 @@ impl Gpu {
             ],
         });
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("bind-group"),
-            layout: &bind_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&planet_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&planet_sampler),
-                },
-            ],
-        });
-
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("layout"),
-            bind_group_layouts: &[Some(&bind_layout)],
-            immediate_size: 0,
-        });
-
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("pipeline"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        // System view: same bind-group shape (uniform + planet texture +
-        // sampler), different uniform struct and shader.
+        // Map view: same bind-group shape (uniform + planet texture + sampler).
         let scene_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("scene"),
             source: wgpu::ShaderSource::Wgsl(include_str!("scene.wgsl").into()),
@@ -819,9 +2025,14 @@ impl Gpu {
                 },
             ],
         });
+        let scene_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("scene-layout"),
+            bind_group_layouts: &[Some(&bind_layout)],
+            immediate_size: 0,
+        });
         let scene_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("scene-pipeline"),
-            layout: Some(&layout),
+            layout: Some(&scene_layout),
             vertex: wgpu::VertexState {
                 module: &scene_shader,
                 entry_point: Some("vs"),
@@ -918,10 +2129,236 @@ impl Gpu {
             mapped_at_creation: false,
         });
 
+        // Rocket view: triangle-mesh pipeline with a depth buffer.
+        let mesh_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("rocket"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("rocket.wgsl").into()),
+        });
+        let mesh_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mesh-uniforms"),
+            size: std::mem::size_of::<MeshUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mesh_bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mesh-bind-layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let mesh_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mesh-bind-group"),
+            layout: &mesh_bind_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: mesh_uniform_buf.as_entire_binding(),
+            }],
+        });
+        let mesh_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("mesh-layout"),
+            bind_group_layouts: &[Some(&mesh_bind_layout)],
+            immediate_size: 0,
+        });
+        let mesh_vbuf_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<rocket::MeshVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 12, shader_location: 1 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 24, shader_location: 2 },
+            ],
+        };
+        let mesh_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("mesh-pipeline"),
+            layout: Some(&mesh_layout),
+            vertex: wgpu::VertexState {
+                module: &mesh_shader,
+                entry_point: Some("vs"),
+                buffers: &[mesh_vbuf_layout],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &mesh_shader,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        // Thruster-FX pipeline: flame + smoke billboards, premultiplied-alpha
+        // blend (additive flame + over smoke in one pass), depth-tested but never
+        // written. Reuses the mesh uniform (viewproj + log depth + time).
+        let fx_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("fx"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("fx.wgsl").into()),
+        });
+        let fx_vbuf_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<FxVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 12, shader_location: 1 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 20, shader_location: 2 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32, offset: 36, shader_location: 3 },
+            ],
+        };
+        let fx_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("fx-pipeline"),
+            layout: Some(&mesh_layout),
+            vertex: wgpu::VertexState {
+                module: &fx_shader,
+                entry_point: Some("vs"),
+                buffers: &[fx_vbuf_layout],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &fx_shader,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let fx_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fx-vbuf"),
+            size: FX_CAP * std::mem::size_of::<FxVertex>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Sky pipeline: fullscreen, depth-compatible with the mesh pass but
+        // never writes depth, so the terrain draws over it.
+        let sky_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("sky"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("sky.wgsl").into()),
+        });
+        let sky_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sky-uniforms"),
+            size: std::mem::size_of::<SkyUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let sky_bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("sky-bind-layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let sky_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sky-bind-group"),
+            layout: &sky_bind_layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: sky_uniform_buf.as_entire_binding() }],
+        });
+        let sky_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("sky-layout"),
+            bind_group_layouts: &[Some(&sky_bind_layout)],
+            immediate_size: 0,
+        });
+        let sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("sky-pipeline"),
+            layout: Some(&sky_layout),
+            vertex: wgpu::VertexState {
+                module: &sky_shader,
+                entry_point: Some("vs"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &sky_shader,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        // Full-planet terrain is a dynamic, camera-relative buffer rebuilt as the
+        // camera moves (floating origin); the rocket/pad are in dyn_vbuf.
+        let terrain_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("terrain-vbuf"),
+            size: TERRAIN_CAP * std::mem::size_of::<rocket::MeshVertex>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let dyn_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dyn-mesh-vbuf"),
+            size: DYN_MESH_CAP * std::mem::size_of::<rocket::MeshVertex>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Gpu {
-            pipeline,
-            uniform_buf,
-            bind_group,
             scene_pipeline,
             scene_uniform_buf,
             scene_bind_group,
@@ -929,60 +2366,112 @@ impl Gpu {
             overlay_buf,
             hud_pipeline,
             hud_buf,
+            mesh_pipeline,
+            mesh_uniform_buf,
+            mesh_bind_group,
+            terrain_vbuf,
+            dyn_vbuf,
+            fx_pipeline,
+            fx_vbuf,
+            sky_pipeline,
+            sky_uniform_buf,
+            sky_bind_group,
         }
     }
 
-    /// Upload this frame's uniforms + geometry. Returns (overlay verts, hud verts).
+    /// Upload this frame's uniforms + geometry. Returns (overlay verts, hud
+    /// verts, dynamic rocket-mesh verts).
     fn prepare(
         &self,
         queue: &wgpu::Queue,
-        world: &World,
-        hud: &Hud,
+        world: &mut World,
         w: u32,
         h: u32,
         time: f32,
-    ) -> (usize, usize) {
+    ) -> (usize, usize, u32, u32) {
         let res = [w as f32, h.max(1) as f32];
+        let mut dyn_n = 0u32;
+        let mut fx_n = 0u32;
         match world.view {
-            View::Surface => {
-                let uniforms = world.uniforms(res, time);
-                queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
-            }
-            View::System => {
+            View::Map => {
                 let su = world.scene_uniforms(res, time);
                 queue.write_buffer(&self.scene_uniform_buf, 0, bytemuck::bytes_of(&su));
+            }
+            View::Rocket => {
+                // (Re)build + upload the camera-relative planet terrain on demand.
+                if world.terrain_dirty {
+                    if world.terrain_verts.is_empty() {
+                        world.rebuild_terrain();
+                    }
+                    let tc = world.terrain_count as usize;
+                    if tc > 0 {
+                        queue.write_buffer(
+                            &self.terrain_vbuf,
+                            0,
+                            bytemuck::cast_slice(&world.terrain_verts[..tc]),
+                        );
+                    }
+                    world.terrain_dirty = false;
+                }
+                let mu = world.mesh_uniforms(res);
+                queue.write_buffer(&self.mesh_uniform_buf, 0, bytemuck::bytes_of(&mu));
+                let sk = world.sky_uniforms(res);
+                queue.write_buffer(&self.sky_uniform_buf, 0, bytemuck::bytes_of(&sk));
+                let dyn_verts = world.build_dynamic_mesh();
+                dyn_n = (dyn_verts.len() as u64).min(DYN_MESH_CAP) as u32;
+                if dyn_n > 0 {
+                    queue.write_buffer(
+                        &self.dyn_vbuf,
+                        0,
+                        bytemuck::cast_slice(&dyn_verts[..dyn_n as usize]),
+                    );
+                }
+                let (eye, _t, right, up, _f, _tan) = world.rocket_camera(res[0] / res[1].max(1.0));
+                let fx_verts = world.build_fx(eye, right, up);
+                fx_n = (fx_verts.len() as u64).min(FX_CAP) as u32;
+                if fx_n > 0 {
+                    queue.write_buffer(&self.fx_vbuf, 0, bytemuck::cast_slice(&fx_verts[..fx_n as usize]));
+                }
             }
         }
 
         let aspect = res[0] / res[1];
-        let verts = world.build_overlay(world.camera_rot(), aspect);
+        let verts = world.build_overlay(aspect);
         let n = verts.len().min(OVERLAY_CAP as usize);
         if n > 0 {
             queue.write_buffer(&self.overlay_buf, 0, bytemuck::cast_slice(&verts[..n]));
         }
-        let mut hud_verts = world.build_hud(hud, (res[0], res[1]));
-        if world.view == View::Surface {
-            world.append_surface_marker(&mut hud_verts, aspect);
-        }
+        let hud_verts = world.build_hud((res[0], res[1]));
         let hn = hud_verts.len().min(HUD_CAP as usize);
         if hn > 0 {
             queue.write_buffer(&self.hud_buf, 0, bytemuck::cast_slice(&hud_verts[..hn]));
         }
-        (n, hn)
+        (n, hn, dyn_n, fx_n)
     }
 
-    fn draw(&self, pass: &mut wgpu::RenderPass, view: View, n_overlay: usize, n_hud: usize) {
-        match view {
-            View::Surface => {
-                pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, &self.bind_group, &[]);
-            }
-            View::System => {
-                pass.set_pipeline(&self.scene_pipeline);
-                pass.set_bind_group(0, &self.scene_bind_group, &[]);
-            }
+    /// Draw the thruster FX billboards (flame + smoke), in the mesh pass.
+    fn draw_fx(&self, pass: &mut wgpu::RenderPass, fx_count: u32) {
+        if fx_count > 0 {
+            pass.set_pipeline(&self.fx_pipeline);
+            pass.set_bind_group(0, &self.mesh_bind_group, &[]);
+            pass.set_vertex_buffer(0, self.fx_vbuf.slice(..));
+            pass.draw(0..fx_count, 0..1);
         }
-        pass.draw(0..3, 0..1);
+    }
+
+    /// Map view: fullscreen multi-body raymarch + 2D overlay/HUD. The rocket
+    /// view does not use this; it draws meshes then `draw_overlay`.
+    fn draw(&self, pass: &mut wgpu::RenderPass, view: View, n_overlay: usize, n_hud: usize) {
+        if view == View::Map {
+            pass.set_pipeline(&self.scene_pipeline);
+            pass.set_bind_group(0, &self.scene_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        self.draw_overlay(pass, n_overlay, n_hud);
+    }
+
+    /// The 2D line overlay + HUD triangles (no depth).
+    fn draw_overlay(&self, pass: &mut wgpu::RenderPass, n_overlay: usize, n_hud: usize) {
         if n_overlay > 0 {
             pass.set_pipeline(&self.overlay_pipeline);
             pass.set_vertex_buffer(0, self.overlay_buf.slice(..));
@@ -993,6 +2482,27 @@ impl Gpu {
             pass.set_vertex_buffer(0, self.hud_buf.slice(..));
             pass.draw(0..n_hud as u32, 0..1);
         }
+    }
+
+    /// The 3D rocket/pad/terrain mesh (depth-tested). Used in its own pass.
+    fn draw_meshes(&self, pass: &mut wgpu::RenderPass, terrain_count: u32, dyn_count: u32) {
+        pass.set_pipeline(&self.mesh_pipeline);
+        pass.set_bind_group(0, &self.mesh_bind_group, &[]);
+        if terrain_count > 0 {
+            pass.set_vertex_buffer(0, self.terrain_vbuf.slice(..));
+            pass.draw(0..terrain_count, 0..1);
+        }
+        if dyn_count > 0 {
+            pass.set_vertex_buffer(0, self.dyn_vbuf.slice(..));
+            pass.draw(0..dyn_count, 0..1);
+        }
+    }
+
+    /// Fullscreen sky behind the terrain (no depth write).
+    fn draw_sky(&self, pass: &mut wgpu::RenderPass) {
+        pass.set_pipeline(&self.sky_pipeline);
+        pass.set_bind_group(0, &self.sky_bind_group, &[]);
+        pass.draw(0..3, 0..1);
     }
 }
 
@@ -1032,6 +2542,72 @@ fn render_pass<'a>(
     })
 }
 
+fn create_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("depth"),
+            size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
+        .create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// Mesh pass: clear color to sky, clear depth, depth-test enabled.
+fn mesh_pass<'a>(
+    encoder: &'a mut wgpu::CommandEncoder,
+    color: &'a wgpu::TextureView,
+    depth: &'a wgpu::TextureView,
+) -> wgpu::RenderPass<'a> {
+    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("mesh-pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: color,
+            resolve_target: None,
+            depth_slice: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.45, g: 0.62, b: 0.82, a: 1.0 }),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+            view: depth,
+            depth_ops: Some(wgpu::Operations {
+                load: wgpu::LoadOp::Clear(1.0),
+                store: wgpu::StoreOp::Store,
+            }),
+            stencil_ops: None,
+        }),
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    })
+}
+
+/// Overlay pass: keep existing color (load), no depth, for 2D HUD on top.
+fn overlay_pass<'a>(
+    encoder: &'a mut wgpu::CommandEncoder,
+    color: &'a wgpu::TextureView,
+) -> wgpu::RenderPass<'a> {
+    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("overlay-pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: color,
+            resolve_target: None,
+            depth_slice: None,
+            ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // State: the windowed client.
 // ---------------------------------------------------------------------------
@@ -1043,19 +2619,19 @@ struct State {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     gpu: Gpu,
-    hud: Hud,
     world: World,
     start: instant_now::Instant,
     last_t: f32,
     dragging: bool,
     last_cursor: (f64, f64),
+    egui_ctx: egui::Context,
+    egui_state: egui_winit::State,
+    egui_renderer: egui_wgpu::Renderer,
 }
 
 impl State {
     async fn new(window: Arc<Window>) -> State {
-        let size = window.inner_size();
-        let width = size.width.max(1);
-        let height = size.height.max(1);
+        let (width, height) = surface_size(&window);
 
         let instance = wgpu::Instance::new(
             wgpu::InstanceDescriptor::new_without_display_handle_from_env(),
@@ -1111,6 +2687,19 @@ impl State {
 
         let gpu = Gpu::new(&device, &queue, format);
 
+        // egui: context + winit input glue + wgpu renderer
+        let egui_ctx = egui::Context::default();
+        let egui_state = egui_winit::State::new(
+            egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            &*window,
+            None,
+            None,
+            None,
+        );
+        let egui_renderer =
+            egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
+
         State {
             window,
             surface,
@@ -1118,12 +2707,14 @@ impl State {
             queue,
             config,
             gpu,
-            hud: Hud::new(),
             world: World::new(),
             start: instant_now::Instant::now(),
             last_t: 0.0,
             dragging: false,
             last_cursor: (0.0, 0.0),
+            egui_ctx,
+            egui_state,
+            egui_renderer,
         }
     }
 
@@ -1136,14 +2727,25 @@ impl State {
     }
 
     fn render(&mut self) {
+        // On the web the canvas tracks the viewport via CSS; keep the surface
+        // (and thus the canvas backing buffer) in sync each frame.
+        #[cfg(target_arch = "wasm32")]
+        {
+            let (w, h) = surface_size(&self.window);
+            if w != self.config.width || h != self.config.height {
+                self.resize(w, h);
+            }
+        }
+
         let t = self.start.elapsed().as_secs_f32();
         let frame_dt = (t - self.last_t).clamp(0.0, 0.1);
         self.last_t = t;
         self.world.advance(frame_dt);
 
-        let (n, hn) = self
+        let (n, hn, dyn_n, fx_n) = self
             .gpu
-            .prepare(&self.queue, &self.world, &self.hud, self.config.width, self.config.height, t);
+            .prepare(&self.queue, &mut self.world, self.config.width, self.config.height, t);
+        let terrain_n = self.world.terrain_count;
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
@@ -1159,12 +2761,52 @@ impl State {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("enc") });
-        {
+
+        // --- egui: run the UI and prepare its draw data ---
+        let raw_input = self.egui_state.take_egui_input(&self.window);
+        self.egui_ctx.begin_pass(raw_input);
+        ui::build(&self.egui_ctx, &mut self.world);
+        let full = self.egui_ctx.end_pass();
+        self.egui_state
+            .handle_platform_output(&self.window, full.platform_output);
+        let ppp = self.egui_ctx.pixels_per_point();
+        let prims = self.egui_ctx.tessellate(full.shapes, ppp);
+        for (id, delta) in &full.textures_delta.set {
+            self.egui_renderer
+                .update_texture(&self.device, &self.queue, *id, delta);
+        }
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.config.width, self.config.height],
+            pixels_per_point: ppp,
+        };
+        self.egui_renderer
+            .update_buffers(&self.device, &self.queue, &mut encoder, &prims, &screen);
+
+        if self.world.view == View::Rocket {
+            let depth = create_depth(&self.device, self.config.width, self.config.height);
+            {
+                let mut pass = mesh_pass(&mut encoder, &view, &depth);
+                self.gpu.draw_sky(&mut pass);
+                self.gpu.draw_meshes(&mut pass, terrain_n, dyn_n);
+                self.gpu.draw_fx(&mut pass, fx_n);
+            }
+            {
+                let mut pass = overlay_pass(&mut encoder, &view);
+                self.gpu.draw_overlay(&mut pass, n, hn);
+            }
+        } else {
             let mut pass = render_pass(&mut encoder, &view);
             self.gpu.draw(&mut pass, self.world.view, n, hn);
         }
+        {
+            let mut pass = overlay_pass(&mut encoder, &view).forget_lifetime();
+            self.egui_renderer.render(&mut pass, &prims, &screen);
+        }
         self.queue.submit(Some(encoder.finish()));
         frame.present();
+        for id in &full.textures_delta.free {
+            self.egui_renderer.free_texture(id);
+        }
     }
 }
 
@@ -1182,6 +2824,7 @@ const SHOT_SCENARIOS: &[(&str, &str)] = &[
     ("flight", "out/flight.png"),
     ("system", "out/system.png"),
     ("moon", "out/moon.png"),
+    ("rocket", "out/rocket.png"),
 ];
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1208,67 +2851,674 @@ fn make_shot_device() -> (wgpu::Device, wgpu::Queue) {
 /// Build the world + sun time for a named validation scenario.
 #[cfg(not(target_arch = "wasm32"))]
 fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
+    let _ = (width, height);
     let mut world = World::new();
-    // sun phase that puts a terminator across the surface disk
-    let surface_time = |w: &World| (w.az + 1.66 - w.mission.spaceport_lon) / 0.03;
-    let frame_surface = |w: &mut World| {
-        w.view = View::Surface;
-        w.az = w.mission.spaceport_lon + 1.15;
-        w.el = w.mission.spaceport_lat + 0.25;
-        w.scale = 1.35;
+
+    // Fly a scripted player-style launch (open-loop gravity turn, auto-stage)
+    // for `dur` seconds, so the rocket-view launch is verifiable headlessly.
+    fn fly(w: &mut World, dur: f32) {
+        let mut t = 0.0;
+        while t < dur {
+            if let Some(rk) = w.launch.as_mut() {
+                rk.pitch = (((rk.met - 10.0) / 120.0).clamp(0.0, 1.0) * 78f64.to_radians()).min(1.5);
+                if rk.prop_frac() <= 0.0 && rk.stages.len() > 1 && rk.stage_base == 0 {
+                    w.stage_launch();
+                }
+            }
+            w.advance(0.1);
+            t += 0.1;
+        }
+    }
+    // Fly until the first booster is dry, stage it, then coast a moment so the
+    // jettisoned booster is visibly tumbling away.
+    fn fly_to_staging(w: &mut World) {
+        for _ in 0..4000 {
+            let dry = w
+                .launch
+                .as_ref()
+                .map(|rk| rk.stage_base == 0 && rk.prop_frac() <= 0.0)
+                .unwrap_or(true);
+            if dry {
+                break;
+            }
+            if let Some(rk) = w.launch.as_mut() {
+                rk.pitch = (((rk.met - 10.0) / 120.0).clamp(0.0, 1.0) * 78f64.to_radians()).min(1.5);
+            }
+            w.advance(0.2);
+        }
+        w.stage_launch();
+        // throttle the upper stage down a touch so its plume doesn't crowd the
+        // jettisoned booster, then coast so the booster drifts clear.
+        for _ in 0..30 {
+            w.advance(0.1);
+        }
+    }
+
+    // Autopilot: fly a closed-loop gravity turn + circularization until a stable
+    // parking orbit is reached (or fuel runs out). Used to verify the
+    // mission-to-orbit -> persistent-satellite loop headlessly.
+    fn fly_to_orbit(w: &mut World) {
+        let radius = w.body.radius;
+        for _ in 0..12000 {
+            let done = w
+                .launch
+                .as_ref()
+                .map(|rk| rk.orbit_reached || rk.crashed)
+                .unwrap_or(true);
+            if done {
+                break;
+            }
+            // read state, then steer
+            let (met, apo, dry) = {
+                let rk = w.launch.as_ref().unwrap();
+                let orb = sim::orbit::orbit_from_state(rk.r, rk.v, w.body.mu);
+                (rk.met, orb.ra - radius, rk.prop_frac() <= 0.0)
+            };
+            if dry {
+                if w.launch.as_ref().map(|r| r.stages.len() > 1).unwrap_or(false) {
+                    w.stage_launch();
+                } else {
+                    break; // out of fuel, no more stages
+                }
+            }
+            if let Some(rk) = w.launch.as_mut() {
+                // vertical, then gravity-turn to ~80 deg, then horizontal to raise
+                // periapsis once the apoapsis is high enough.
+                rk.pitch = if met < 12.0 {
+                    0.0
+                } else if apo < 180_000.0 {
+                    (((met - 12.0) / 110.0).clamp(0.0, 1.0) * 80f64.to_radians()).min(1.4)
+                } else {
+                    90f64.to_radians()
+                };
+            }
+            w.advance(0.25);
+        }
+    }
+
+    // Frame the map on the home world (where the launch/orbit is drawn).
+    let frame_map = |w: &mut World| {
+        w.view = View::Map;
+        let hi = w.nav.iter().position(|&i| w.universe.bodies[i].is_home).unwrap_or(0);
+        w.set_focus(hi);
+        w.sys_az = 1.4;
+        w.sys_el = 0.32;
     };
     let time = match scenario {
+        "rocket" | "pad" => {
+            // rolled out, standing on the pad
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.rocket_az = 4.97; // face inland (land), coast to the sides
+            world.rocket_el = 0.12;
+            0.0
+        }
+        "lander" => {
+            // the 3D lunar descent module standing on the surface
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.show_lander = true;
+            world.rocket_az = 5.4;
+            world.rocket_el = 0.16;
+            world.rocket_dist = 22.0;
+            world.rocket_focus_y = 3.0;
+            0.0
+        }
+        "vab" => {
+            // inside the assembly building, looking at the rocket (default start)
+            world.view = View::Rocket;
+            world.vab_mode = true;
+            world.rollout = 0.0;
+            world.rocket_az = 0.7;
+            world.rocket_el = 0.18;
+            world.rocket_dist = 52.0;
+            0.0
+        }
+        "grabdemo" => {
+            // verify the pick -> drop -> rebuild path headlessly: grab the X-Large
+            // tank off the rack, target stage 0's tank slot, and drop it. The
+            // rocket should rebuild with a fat first stage.
+            world.view = View::Rocket;
+            world.vab_mode = true;
+            world.rollout = 0.0;
+            world.rocket_az = 0.7;
+            world.rocket_el = 0.16;
+            world.rocket_dist = 70.0;
+            world.grab = world
+                .rack_slots
+                .iter()
+                .find(|s| s.kind == rocket::PartKind::Tank && s.idx == 3) // X-Large
+                .copied();
+            world.grab_target = Some((rocket::PartKind::Tank, 0));
+            world.drop_grab();
+            0.0
+        }
+        "rollout" => {
+            // mid roll-out: the rocket part-way between hangar and pad
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 0.84; // just clear of the building, nearing the pad
+            world.rocket_az = 5.2;
+            world.rocket_el = 0.16;
+            world.rocket_dist = 120.0;
+            0.0
+        }
+        "liftoff" => {
+            world.view = View::Rocket;
+            world.rocket_az = 4.97;
+            world.rocket_el = 0.07;
+            world.rocket_dist = 60.0;
+            world.rocket_el = 0.12;
+            world.ignite_launch();
+            fly(&mut world, 1.4); // ignition: plume + billowing pad smoke
+            0.0
+        }
+        "liftoff2" => {
+            world.view = View::Rocket;
+            world.rocket_az = 4.6;
+            world.rocket_el = 0.16;
+            world.rocket_dist = 110.0;
+            world.ignite_launch();
+            fly(&mut world, 22.0); // pitched into the gravity turn, smoke trailing
+            0.0
+        }
+        "staging" => {
+            world.view = View::Rocket;
+            world.rocket_az = 3.6;
+            world.rocket_el = 0.18;
+            world.rocket_dist = 130.0;
+            world.ignite_launch();
+            fly_to_staging(&mut world); // spent booster tumbling away
+            0.0
+        }
+        "upperflame" => {
+            // close-up of the upper stage firing, to check the flame sits at its
+            // own nozzle (not the dropped booster's).
+            world.view = View::Rocket;
+            world.rocket_az = 4.2;
+            world.rocket_el = 0.08;
+            world.ignite_launch();
+            fly_to_staging(&mut world);
+            fly(&mut world, 4.0);
+            world.rocket_dist = 42.0;
+            0.0
+        }
+        "orbit" => {
+            // high up: pull the camera back to frame the planet against space.
+            world.view = View::Rocket;
+            world.rocket_az = 3.4;
+            world.rocket_el = 0.30;
+            world.ignite_launch();
+            fly(&mut world, 130.0);
+            world.rocket_dist = 900.0;
+            0.0
+        }
+        "deploy" => {
+            // fly a full mission to orbit, then frame the deployed satellite +
+            // its orbit ring around the home world on the map.
+            world.ignite_launch();
+            fly_to_orbit(&mut world);
+            frame_map(&mut world);
+            world.sys_dist = 22.0;
+            world.sys_el = 0.45;
+            6.0
+        }
+        "constellation" => {
+            // several back-to-back missions: each successful flight leaves another
+            // payload in orbit, so they accumulate around the home world.
+            for p in 0..4usize {
+                world.vab.payload = p % build::PAYLOADS.len();
+                world.ignite_launch();
+                fly_to_orbit(&mut world);
+                world.reset_launch();
+            }
+            frame_map(&mut world);
+            world.sys_dist = 22.0;
+            world.sys_el = 0.45;
+            6.0
+        }
+        "launchmap" => {
+            // a player launch shown on the orbital map: live marker + predicted
+            // conic as the upper stage builds its parking orbit.
+            world.ignite_launch();
+            fly(&mut world, 200.0);
+            frame_map(&mut world);
+            world.sys_dist = 26.0;
+            world.sys_el = 0.5;
+            6.0
+        }
         "system" => {
-            world.view = View::System;
+            // wide system shot: the binary + planet orbits, framed on the barycentre
+            world.view = View::Map;
+            world.sys_focus = DVec3::ZERO;
+            world.sys_dist = 4.0e6; // ~27 AU
             world.sys_az = 1.4;
-            world.sys_el = 0.30;
-            world.sys_dist = 120.0;
+            world.sys_el = 0.55;
             6.0
         }
         "moon" => {
-            world.view = View::System;
-            world.sys_focus = world.moon_center_mm;
-            world.sys_az = 1.2;
-            world.sys_el = 0.25;
-            world.sys_dist = 4.5;
-            let cam = world.system_camera(width as f32 / height as f32);
-            let to_cam = (cam.pos * MM).as_dvec3() - world.moon_center_m;
-            let up = to_cam.normalize();
-            let mut craft =
-                Craft::maneuvering(world.moon_center_m + up * world.moon_radius_m, DVec3::ZERO);
-            craft.landed = true;
-            craft.landed_on = "MOON";
-            world.flight = Some(craft);
+            // home + its moon
+            frame_map(&mut world);
+            world.sys_dist = 60.0;
             6.0
         }
-        "pad" => {
-            frame_surface(&mut world);
-            world.launched = false;
-            surface_time(&world)
+        "moons" => {
+            // focus a moon up close so it ray-marches as a real sphere, with its
+            // gas giant looming behind.
+            world.view = View::Map;
+            let midx = world
+                .universe
+                .bodies
+                .iter()
+                .position(|b| b.kind == Kind::Moon)
+                .unwrap_or(0);
+            world.set_focus(midx);
+            world.sys_dist = world.universe.bodies[midx].radius * 6.0;
+            world.sys_az = 1.1;
+            world.sys_el = 0.20;
+            6.0
+        }
+        "binary" => {
+            // frame both stars of the binary so both coronas are visible together
+            world.view = View::Map;
+            world.sys_focus = DVec3::ZERO; // barycentre
+            world.sys_dist = 17000.0;
+            world.sys_az = 1.57;
+            world.sys_el = 0.16;
+            6.0
+        }
+        "starb" => {
+            // close-up of the red companion star to show its ruddy corona.
+            world.view = View::Map;
+            let bi = world
+                .universe
+                .bodies
+                .iter()
+                .position(|b| b.kind == Kind::StarB)
+                .unwrap_or(1);
+            world.set_focus(bi);
+            world.sys_dist = world.universe.bodies[bi].radius * 9.0;
+            world.sys_az = 1.0;
+            world.sys_el = 0.10;
+            6.0
         }
         "ascent" => {
-            frame_surface(&mut world);
+            frame_map(&mut world);
             world.launched = true;
             world.clock = world.mission.meco_t * 0.5; // mid powered ascent
-            surface_time(&world)
+            6.0
         }
         "flight" => {
-            frame_surface(&mut world);
+            frame_map(&mut world);
             world.launched = true;
             world.clock = world.mission.meco_t + 10.0;
             let (r, v) = world.mission.orbit_state_at(world.clock);
             let mut craft = Craft::maneuvering(r, v);
             craft.throttle = 0.6;
-            craft.mode = Mode::Retrograde;
+            craft.aim(Mode::Retrograde, &world.body); // already pointed retro
             world.flight = Some(craft);
-            surface_time(&world)
+            6.0
+        }
+        "node" => {
+            // a craft in low orbit with a planned prograde burn that raises the
+            // apoapsis - the maneuver planner: green current orbit, cyan result.
+            frame_map(&mut world);
+            world.launched = true;
+            world.sys_dist = 22.0;
+            world.sys_el = 0.5;
+            world.clock = world.mission.meco_t + 10.0;
+            let (r, v) = world.mission.orbit_state_at(world.clock);
+            world.flight = Some(Craft::maneuvering(r, v));
+            world.node = Some(ManeuverNode { nu: std::f64::consts::PI, pro: 1600.0, nrm: 0.0, rad: 0.0 });
+            6.0
+        }
+        // ---- Lunar-lander mission, stage by stage ----
+        "m1_vab" => {
+            // the assembled rocket in the VAB, carrying the Lunar Lander payload.
+            world.vab.payload = 4; // Lunar Lander
+            world.rebuild_vehicle();
+            world.view = View::Rocket;
+            world.vab_mode = true;
+            world.rollout = 0.0;
+            world.rocket_az = 0.7;
+            world.rocket_el = 0.16;
+            world.rocket_dist = 56.0;
+            0.0
+        }
+        "m2_liftoff" => {
+            // lift off from the home world with the lander folded inside the fairing.
+            world.vab.payload = 4;
+            world.rebuild_vehicle();
+            world.view = View::Rocket;
+            world.rocket_az = 4.97;
+            world.rocket_el = 0.10;
+            world.rocket_dist = 70.0;
+            world.ignite_launch();
+            fly(&mut world, 6.0);
+            0.0
+        }
+        "m3_orbit" => {
+            // parking orbit around the home world with a trans-lunar injection
+            // burn planned at the node (green current orbit, cyan result).
+            world.vab.payload = 4;
+            frame_map(&mut world);
+            world.launched = true;
+            world.sys_dist = 30.0;
+            world.sys_el = 0.5;
+            world.clock = world.mission.meco_t + 10.0;
+            let (r, v) = world.mission.orbit_state_at(world.clock);
+            world.flight = Some(Craft::maneuvering(r, v));
+            world.node = Some(ManeuverNode { nu: std::f64::consts::PI, pro: 3050.0, nrm: 0.0, rad: 0.0 });
+            6.0
+        }
+        "m4_transfer" => {
+            // coasting along the trans-lunar transfer ellipse: the conic reaches
+            // out to the moon. Framed to show home, the transfer, and the moon.
+            world.view = View::Map;
+            let hi = world
+                .nav
+                .iter()
+                .position(|&i| world.universe.bodies[i].is_home)
+                .unwrap_or(0);
+            world.set_focus(hi);
+            world.launched = true;
+            // a transfer ellipse: periapsis just above home, apoapsis at the moon.
+            let mu = world.body.mu;
+            let rp = world.body.radius + 250_000.0;
+            let moon_dir = world.moon_center_m.normalize();
+            let ra = world.moon_center_m.length();
+            let a = 0.5 * (rp + ra);
+            let vp = (mu * (2.0 / rp - 1.0 / a)).sqrt();
+            // periapsis on the opposite side, velocity perpendicular toward the moon
+            let r0 = -moon_dir * rp;
+            let tangent = DVec3::new(-moon_dir.z, 0.0, moon_dir.x).normalize();
+            let v0 = tangent * vp;
+            let mut craft = Craft::maneuvering(r0, v0);
+            // coast partway out along the transfer so the craft sits mid-flight.
+            for _ in 0..4000 {
+                craft.integrate(&world.body, &world.grav_bodies(), 5.0);
+                if craft.r.length() > ra * 0.55 {
+                    break;
+                }
+            }
+            world.flight = Some(craft);
+            world.sys_az = 1.4;
+            world.sys_el = 0.55;
+            world.sys_dist = 240.0;
+            6.0
+        }
+        "m5_approach" => {
+            // high on final approach: the lander hangs over a cratered regolith
+            // field, descent engine lit, craters running out to the horizon.
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.lunar = true;
+            world.show_lander = true;
+            world.lander_alt = 700.0;
+            world.lander_firing = true;
+            world.rocket_az = 5.5;
+            world.rocket_el = 0.62; // look down over the cratered field
+            world.rocket_dist = 170.0;
+            world.rocket_focus_y = 700.0;
+            0.0
+        }
+        "m5_descent" => {
+            // powered descent over the lunar surface: grey regolith, black airless
+            // sky, the lander firing its descent engine just above the ground.
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.lunar = true;
+            world.show_lander = true;
+            world.lander_alt = 18.0;
+            world.lander_firing = true;
+            world.lander_rcs = 0.9; // attitude jets trimming the descent
+            world.rocket_az = 5.4;
+            world.rocket_el = 0.10;
+            world.rocket_dist = 38.0;
+            world.rocket_focus_y = 10.0;
+            0.0
+        }
+        "rcsdemo" => {
+            // close-up of the RCS attitude jets firing around the lander's upper
+            // body (the blue-white cold-gas puffs), on the lunar surface.
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.lunar = true;
+            world.show_lander = true;
+            world.lander_alt = 0.0;
+            world.lander_firing = false;
+            world.lander_rcs = 1.0;
+            world.rocket_az = 5.5;
+            world.rocket_el = 0.22;
+            world.rocket_dist = 13.0;
+            world.rocket_focus_y = 4.0;
+            0.0
+        }
+        "botland" => {
+            // the autonomous moon-landing bot, flown from low lunar orbit down
+            // to the surface, shown at a mid-descent instant with its descent
+            // engine + RCS attitude jets firing. The lander's height comes from
+            // the bot's actual moon-relative altitude.
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.lunar = true;
+            world.show_lander = true;
+            // fly the bot until it is on short final, then read its altitude.
+            let moon = world.grav_bodies()[0];
+            let r0 = moon.center + DVec3::X * (moon.radius + 30_000.0);
+            let vc = (moon.mu / (moon.radius + 30_000.0)).sqrt();
+            let mut craft = Craft::maneuvering(r0, DVec3::Z * vc);
+            let mut moonbot = bot::MoonBot::new();
+            // step until the bot is low (short final), capped so the shot is reproducible
+            let dt = 0.1;
+            for _ in 0..20_000 {
+                moonbot.control(&mut craft, &moon);
+                craft.integrate(&world.body, std::slice::from_ref(&moon), dt);
+                if bot::MoonBot::altitude(&craft, &moon) < 30.0 || craft.landed || craft.crashed {
+                    break;
+                }
+            }
+            let alt = bot::MoonBot::altitude(&craft, &moon).max(0.0) as f32;
+            world.lander_alt = alt;
+            world.lander_firing = craft.throttle > 0.02;
+            // RCS activity from the bot's actual attitude-control torque (floored
+            // so the short still clearly shows the jets).
+            let rcs_act = (craft.torque_report.rcs.length() / 1500.0) as f32;
+            world.lander_rcs = rcs_act.clamp(0.4, 1.0);
+            world.rocket_az = 5.4;
+            world.rocket_el = 0.12;
+            world.rocket_dist = 40.0;
+            world.rocket_focus_y = (alt * 0.5 + 4.0).min(20.0);
+            0.0
+        }
+        "m6_landed" => {
+            // touched down on the moon: the lander standing on grey regolith under
+            // a black, star-flecked sky.
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.lunar = true;
+            world.show_lander = true;
+            world.lander_alt = 0.0;
+            world.lander_firing = false;
+            world.rocket_az = 5.4;
+            world.rocket_el = 0.13;
+            world.rocket_dist = 22.0;
+            world.rocket_focus_y = 3.0;
+            0.0
+        }
+        "cargo" => {
+            // a rocket on the pad with the fairing clamshell open, revealing the
+            // refinery cargo module packed inside.
+            world.vab.payload = 5; // Refinery Module
+            world.rebuild_vehicle();
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.fairing_open = 0.55; // clamshell cracked open
+            let top = world.rocket_body.height;
+            world.rocket_az = 5.05;
+            world.rocket_el = 0.05;
+            world.rocket_focus_y = top - 7.5;
+            world.rocket_dist = 15.0;
+            0.0
+        }
+        "cargoparts" => {
+            // the fairing-packed module catalog, unpacked in a row on the moon.
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.lunar = true;
+            world.base_mesh = Some(rocket::cargo_catalog());
+            world.rocket_az = 4.71;
+            world.rocket_el = 0.14;
+            world.rocket_dist = 26.0;
+            world.rocket_focus_y = 2.6;
+            0.0
+        }
+        "delivery" => {
+            // a delivered cargo module standing on the lunar surface, ready to be
+            // unfolded and assembled on site.
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.lunar = true;
+            world.base_mesh = Some(rocket::cargo_module(0)); // refinery
+            world.rocket_az = 5.4;
+            world.rocket_el = 0.12;
+            world.rocket_dist = 15.0;
+            world.rocket_focus_y = 2.6;
+            0.0
+        }
+        "ast_orbit" => {
+            // a large asteroid seen from orbit, lit against a starfield.
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.lunar = true; // airless lighting
+            world.space = true; // no planet, starfield sky
+            world.base_mesh = Some(rocket::asteroid_preset(0));
+            world.space_label = rocket::ASTEROID_NAMES[0];
+            world.rocket_az = 0.55;
+            world.rocket_el = 0.33;
+            world.rocket_dist = 1350.0;
+            world.rocket_focus_y = 0.0;
+            0.0
+        }
+        "ast_orbit2" => {
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.lunar = true;
+            world.space = true;
+            world.base_mesh = Some(rocket::asteroid_preset(2)); // elongated peanut
+            world.space_label = rocket::ASTEROID_NAMES[2];
+            world.rocket_az = 0.55;
+            world.rocket_el = 0.33;
+            world.rocket_dist = 1050.0;
+            world.rocket_focus_y = 0.0;
+            0.0
+        }
+        "ast_orbit3" => {
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.lunar = true;
+            world.space = true;
+            world.base_mesh = Some(rocket::asteroid_preset(3)); // long shard
+            world.space_label = rocket::ASTEROID_NAMES[3];
+            world.rocket_az = 0.5;
+            world.rocket_el = 0.34;
+            world.rocket_dist = 1300.0;
+            world.rocket_focus_y = 0.0;
+            0.0
+        }
+        "ast_surf" => {
+            // down near the surface of a large asteroid: rubble horizon + space.
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.lunar = true;
+            world.space = true;
+            world.base_mesh = Some(rocket::asteroid_preset(1)); // squat, cratered
+            world.space_label = rocket::ASTEROID_NAMES[1];
+            world.rocket_az = 0.9;
+            world.rocket_el = 0.07;
+            world.rocket_dist = 545.0;
+            world.rocket_focus_y = 250.0;
+            0.0
+        }
+        "ast_surf2" => {
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.lunar = true;
+            world.space = true;
+            world.base_mesh = Some(rocket::asteroid_preset(2));
+            world.space_label = rocket::ASTEROID_NAMES[2];
+            world.rocket_az = 0.6;
+            world.rocket_el = 0.08;
+            world.rocket_dist = 430.0;
+            world.rocket_focus_y = 170.0;
+            0.0
+        }
+        "moonbase" => {
+            // an assembled moon base on the cratered surface: HQ, mining,
+            // reactor, lunar VAB, printer, tourist dome, spaceport, hotel and
+            // refueling station around a central habitat plaza.
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.lunar = true;
+            world.base_mesh = Some(rocket::moon_base());
+            world.base_panel = true;
+            world.rocket_az = 5.5;
+            world.rocket_el = 0.42; // look down over the colony
+            world.rocket_dist = 165.0;
+            world.rocket_focus_y = 6.0;
+            0.0
+        }
+        "basetour" => {
+            // a ground-level view across the colony, close enough to read the
+            // building detail (plaza dome, hotel, refuel tanks, reactor beyond).
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.lunar = true;
+            world.base_mesh = Some(rocket::moon_base());
+            world.base_panel = true;
+            world.rocket_az = 4.71;
+            world.rocket_el = 0.12;
+            world.rocket_dist = 62.0;
+            world.rocket_focus_y = 6.0;
+            0.0
+        }
+        "baseparts" => {
+            // the parts catalog: every structure lined up in a row.
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.lunar = true;
+            world.base_mesh = Some(rocket::base_catalog());
+            world.base_panel = true;
+            world.rocket_az = 4.45; // 3/4 view along the row
+            world.rocket_el = 0.20;
+            world.rocket_dist = 150.0;
+            world.rocket_focus_y = 9.0;
+            0.0
         }
         _ => {
-            // surface / launch view: craft coasting in the parking orbit.
-            frame_surface(&mut world);
+            // map view: craft coasting in the parking orbit.
+            frame_map(&mut world);
             world.launched = true;
             world.clock = world.mission.meco_t + 240.0;
-            surface_time(&world)
+            6.0
         }
     };
     (world, time)
@@ -1278,9 +3528,8 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
 fn screenshot_all(width: u32, height: u32) {
     let (device, queue) = make_shot_device();
     let gpu = Gpu::new(&device, &queue, wgpu::TextureFormat::Rgba8UnormSrgb);
-    let hud = Hud::new();
     for (scenario, path) in SHOT_SCENARIOS {
-        render_shot(&device, &queue, &gpu, &hud, scenario, path, width, height);
+        render_shot(&device, &queue, &gpu, scenario, path, width, height);
     }
 }
 
@@ -1288,8 +3537,7 @@ fn screenshot_all(width: u32, height: u32) {
 fn screenshot(path: &str, width: u32, height: u32, scenario: &str) {
     let (device, queue) = make_shot_device();
     let gpu = Gpu::new(&device, &queue, wgpu::TextureFormat::Rgba8UnormSrgb);
-    let hud = Hud::new();
-    render_shot(&device, &queue, &gpu, &hud, scenario, path, width, height);
+    render_shot(&device, &queue, &gpu, scenario, path, width, height);
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1297,14 +3545,13 @@ fn render_shot(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     gpu: &Gpu,
-    hud: &Hud,
     scenario: &str,
     path: &str,
     width: u32,
     height: u32,
 ) {
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
-    let (world, time) = setup_world(scenario, width, height);
+    let (mut world, time) = setup_world(scenario, width, height);
 
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("shot-target"),
@@ -1322,7 +3569,8 @@ fn render_shot(
     });
     let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
-    let (n, hn) = gpu.prepare(queue, &world, hud, width, height, time);
+    let (n, hn, dyn_n, fx_n) = gpu.prepare(queue, &mut world, width, height, time);
+    let terrain_n = world.terrain_count;
 
     // 256-byte aligned row pitch for the readback copy.
     let unpadded = width * 4;
@@ -1337,10 +3585,57 @@ fn render_shot(
 
     let mut encoder =
         device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("shot-enc") });
-    {
+    if world.view == View::Rocket {
+        let depth = create_depth(device, width, height);
+        {
+            let mut pass = mesh_pass(&mut encoder, &target_view, &depth);
+            gpu.draw_sky(&mut pass);
+            gpu.draw_meshes(&mut pass, terrain_n, dyn_n);
+            gpu.draw_fx(&mut pass, fx_n);
+        }
+        {
+            let mut pass = overlay_pass(&mut encoder, &target_view);
+            gpu.draw_overlay(&mut pass, n, hn);
+        }
+    } else {
         let mut pass = render_pass(&mut encoder, &target_view);
         gpu.draw(&mut pass, world.view, n, hn);
     }
+
+    // egui overlay (so the panels are verifiable headlessly), in every view.
+    {
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(width as f32, height as f32),
+            )),
+            ..Default::default()
+        };
+        let mut w = world;
+        ctx.set_pixels_per_point(1.0);
+        // frame 1 warms up fonts/layout (and builds the font atlas); frame 2
+        // emits the real shapes. Upload textures from both.
+        ctx.begin_pass(raw.clone());
+        ui::build(&ctx, &mut w);
+        let warm = ctx.end_pass();
+        ctx.begin_pass(raw);
+        ui::build(&ctx, &mut w);
+        let full = ctx.end_pass();
+        let prims = ctx.tessellate(full.shapes, 1.0);
+        let mut renderer =
+            egui_wgpu::Renderer::new(device, format, egui_wgpu::RendererOptions::default());
+        for (id, delta) in warm.textures_delta.set.iter().chain(full.textures_delta.set.iter()) {
+            renderer.update_texture(device, queue, *id, delta);
+        }
+        let screen = egui_wgpu::ScreenDescriptor { size_in_pixels: [width, height], pixels_per_point: 1.0 };
+        renderer.update_buffers(device, queue, &mut encoder, &prims, &screen);
+        {
+            let mut pass = overlay_pass(&mut encoder, &target_view).forget_lifetime();
+            renderer.render(&mut pass, &prims, &screen);
+        }
+    }
+
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
             texture: &target,
@@ -1430,7 +3725,19 @@ impl ApplicationHandler<UserEvent> for App {
         let win = window.clone();
         #[cfg(target_arch = "wasm32")]
         wasm_bindgen_futures::spawn_local(async move {
+            if !webx::has_webgpu() {
+                webx::set_status(
+                    "WebGPU is not available in this browser. Use Chrome/Edge 113+ \
+                     (or Safari 18+) on a machine with a supported GPU.",
+                );
+                return;
+            }
+            webx::set_status("Starting renderer...");
             let state = State::new(win).await;
+            webx::set_status(
+                "Tab: map / rocket view  -  drag: orbit  -  scroll: zoom  -  \
+                 Space: launch  -  F: manual flight",
+            );
             let _ = proxy.send_event(UserEvent::Ready(state));
         });
         #[cfg(not(target_arch = "wasm32"))]
@@ -1458,6 +3765,24 @@ impl ApplicationHandler<UserEvent> for App {
         let Some(state) = self.state.as_mut() else {
             return;
         };
+
+        // Let egui see the event first; if it consumed a pointer/keyboard input
+        // (i.e. the user is interacting with the UI), don't also drive the game.
+        let egui_resp = state.egui_state.on_window_event(&state.window, &event);
+        if egui_resp.repaint {
+            state.window.request_redraw();
+        }
+        if egui_resp.consumed
+            && matches!(
+                event,
+                WindowEvent::MouseInput { .. }
+                    | WindowEvent::MouseWheel { .. }
+                    | WindowEvent::KeyboardInput { .. }
+            )
+        {
+            return;
+        }
+
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -1466,22 +3791,62 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::MouseInput { state: btn_state, button, .. } => {
                 if button == MouseButton::Left {
-                    state.dragging = btn_state == ElementState::Pressed;
+                    let pressed = btn_state == ElementState::Pressed;
+                    let w = state.config.width as f32;
+                    let h = state.config.height.max(1) as f32;
+                    let aspect = w / h;
+                    let (cx, cy) = (state.last_cursor.0 as f32, state.last_cursor.1 as f32);
+                    let ndc = [cx / w * 2.0 - 1.0, 1.0 - cy / h * 2.0];
+                    if pressed {
+                        // map: click a body to focus it
+                        if state.world.view == View::Map {
+                            if let Some(b) = state.world.pick_body((w, h), cx, cy) {
+                                state.world.set_focus(b);
+                                return;
+                            }
+                        }
+                        // VAB: grab a 3D part off the rack instead of orbiting
+                        if state.world.view == View::Rocket
+                            && state.world.vab_mode
+                            && state.world.launch.is_none()
+                        {
+                            if let Some(slot) = state.world.pick_rack(ndc, aspect) {
+                                state.world.grab = Some(slot);
+                                state.world.update_grab(ndc, aspect);
+                                state.dragging = false;
+                                return;
+                            }
+                        }
+                        state.dragging = true;
+                    } else {
+                        // release: drop the grabbed part onto the hovered slot
+                        if state.world.grab.is_some() {
+                            state.world.drop_grab();
+                        }
+                        state.dragging = false;
+                    }
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let (x, y) = (position.x, position.y);
-                if state.dragging {
+                if state.world.grab.is_some() {
+                    let w = state.config.width as f32;
+                    let h = state.config.height.max(1) as f32;
+                    let ndc = [x as f32 / w * 2.0 - 1.0, 1.0 - y as f32 / h * 2.0];
+                    state.world.update_grab(ndc, w / h);
+                    state.window.request_redraw();
+                } else if state.dragging {
                     let dx = (x - state.last_cursor.0) as f32;
                     let dy = (y - state.last_cursor.1) as f32;
                     match state.world.view {
-                        View::Surface => {
-                            state.world.az += dx * 0.005;
-                            state.world.el = (state.world.el + dy * 0.005).clamp(-1.5, 1.5);
-                        }
-                        View::System => {
+                        View::Map => {
                             state.world.sys_az += dx * 0.005;
                             state.world.sys_el = (state.world.sys_el + dy * 0.005).clamp(-1.5, 1.5);
+                        }
+                        View::Rocket => {
+                            state.world.rocket_az += dx * 0.006;
+                            state.world.rocket_el =
+                                (state.world.rocket_el + dy * 0.006).clamp(-0.2, 1.4);
                         }
                     }
                 }
@@ -1493,13 +3858,14 @@ impl ApplicationHandler<UserEvent> for App {
                     MouseScrollDelta::PixelDelta(p) => (p.y as f32) / 60.0,
                 };
                 match state.world.view {
-                    View::Surface => {
-                        state.world.scale =
-                            (state.world.scale * (1.0 - dy * 0.12)).clamp(0.12, 3.0);
-                    }
-                    View::System => {
+                    View::Map => {
+                        // zoom spans body-radius to far outer system (~150 AU)
                         state.world.sys_dist =
-                            (state.world.sys_dist * (1.0 - dy * 0.12)).clamp(15.0, 600.0);
+                            (state.world.sys_dist * (1.0 - dy as f64 * 0.12)).clamp(2.0, 2.2e7);
+                    }
+                    View::Rocket => {
+                        state.world.rocket_dist =
+                            (state.world.rocket_dist * (1.0 - dy * 0.12)).clamp(12.0, 400.0);
                     }
                 }
             }
@@ -1516,39 +3882,98 @@ impl ApplicationHandler<UserEvent> for App {
                             _ => {}
                         }
                     }
+                    // player-controlled launch: pitch (W/S), throttle (Shift/Ctrl,
+                    // Z full / X cut). These repeat while held.
+                    if let Some(rk) = state.world.launch.as_mut() {
+                        let step = 2f64.to_radians();
+                        match code {
+                            KeyCode::KeyW | KeyCode::ArrowUp => {
+                                rk.pitch = (rk.pitch + step).min(110f64.to_radians())
+                            }
+                            KeyCode::KeyS | KeyCode::ArrowDown => {
+                                rk.pitch = (rk.pitch - step).max(0.0)
+                            }
+                            KeyCode::ShiftLeft | KeyCode::ShiftRight => {
+                                rk.throttle = (rk.throttle + 0.06).min(1.0)
+                            }
+                            KeyCode::ControlLeft | KeyCode::ControlRight => {
+                                rk.throttle = (rk.throttle - 0.06).max(0.0)
+                            }
+                            KeyCode::KeyZ => rk.throttle = 1.0,
+                            KeyCode::KeyX => rk.throttle = 0.0,
+                            _ => {}
+                        }
+                    }
                     if key_event.repeat {
                         return;
                     }
                     match code {
-                        KeyCode::KeyV => state.world.toggle_view(),
+                        KeyCode::Tab | KeyCode::KeyV => state.world.toggle_view(),
+                        KeyCode::KeyC if state.world.view == View::Map => {
+                            state.world.cycle_focus()
+                        }
                         KeyCode::KeyF => state.world.toggle_flight(),
-                        KeyCode::Space if state.world.flight.is_none() => {
-                            state.world.toggle_launch()
+                        KeyCode::KeyB => state.world.toggle_moonbot(),
+                        KeyCode::Space => {
+                            if state.world.view == View::Rocket {
+                                if state.world.vab_mode {
+                                    state.world.start_rollout(); // roll out to the pad
+                                } else if state.world.launch.is_none() {
+                                    state.world.ignite_launch();
+                                } else {
+                                    state.world.stage_launch();
+                                }
+                            } else if state.world.flight.is_none() {
+                                state.world.toggle_launch();
+                            }
+                        }
+                        KeyCode::KeyR if state.world.view == View::Rocket => {
+                            state.world.back_to_vab()
                         }
                         KeyCode::BracketRight => {
-                            state.world.warp = (state.world.warp * 2.0).min(256.0);
+                            state.world.warp = (state.world.warp * 2.0).min(10000.0);
                         }
                         KeyCode::BracketLeft => {
                             state.world.warp = (state.world.warp * 0.5).max(1.0);
                         }
-                        KeyCode::Digit1 => {
-                            if let Some(c) = state.world.flight.as_mut() {
-                                c.mode = Mode::Prograde;
-                            }
-                        }
-                        KeyCode::Digit2 => {
-                            if let Some(c) = state.world.flight.as_mut() {
-                                c.mode = Mode::Retrograde;
-                            }
-                        }
-                        KeyCode::Digit3 => {
-                            if let Some(c) = state.world.flight.as_mut() {
-                                c.mode = Mode::RadialOut;
-                            }
-                        }
-                        KeyCode::Digit4 => {
-                            if let Some(c) = state.world.flight.as_mut() {
-                                c.mode = Mode::RadialIn;
+                        KeyCode::Digit1
+                        | KeyCode::Digit2
+                        | KeyCode::Digit3
+                        | KeyCode::Digit4
+                        | KeyCode::Digit5
+                        | KeyCode::Digit6
+                        | KeyCode::Digit7
+                        | KeyCode::Digit8
+                        | KeyCode::Digit9 => {
+                            let idx = match code {
+                                KeyCode::Digit1 => 0,
+                                KeyCode::Digit2 => 1,
+                                KeyCode::Digit3 => 2,
+                                KeyCode::Digit4 => 3,
+                                KeyCode::Digit5 => 4,
+                                KeyCode::Digit6 => 5,
+                                KeyCode::Digit7 => 6,
+                                KeyCode::Digit8 => 7,
+                                _ => 8,
+                            };
+                            // In the map (no manual flight), number keys jump to
+                            // a body; in flight they select the thrust mode.
+                            if state.world.view == View::Map && state.world.flight.is_none() {
+                                if let Some(&bi) = state.world.nav.get(idx) {
+                                    state.world.set_focus(bi);
+                                }
+                            } else if let Some(c) = state.world.flight.as_mut() {
+                                // 1..6 select the six orbital attitudes; 7 frees the autopilot.
+                                c.mode = match idx {
+                                    0 => Mode::Prograde,
+                                    1 => Mode::Retrograde,
+                                    2 => Mode::Normal,
+                                    3 => Mode::AntiNormal,
+                                    4 => Mode::RadialOut,
+                                    5 => Mode::RadialIn,
+                                    6 => Mode::Free,
+                                    _ => c.mode,
+                                };
                             }
                         }
                         _ => {}
@@ -1570,29 +3995,141 @@ fn main() {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let args: Vec<String> = std::env::args().collect();
+        if args.iter().any(|a| a == "catalog") {
+            let w = World::new();
+            let md = w.universe.catalog_markdown();
+            let path = "docs/system_catalog.md";
+            if let Some(p) = std::path::Path::new(path).parent() {
+                let _ = std::fs::create_dir_all(p);
+            }
+            std::fs::write(path, &md).expect("write catalog");
+            println!("{md}");
+            println!("wrote {path}");
+            return;
+        }
         if args.iter().any(|a| a == "shot" || a == "--shot") {
             env_logger::init();
             if args.iter().any(|a| a == "all") {
                 screenshot_all(1280, 800);
                 return;
             }
-            let scenario = if args.iter().any(|a| a == "moon") {
+            let scenario = if args.iter().any(|a| a == "m1_vab") {
+                "m1_vab"
+            } else if args.iter().any(|a| a == "m2_liftoff") {
+                "m2_liftoff"
+            } else if args.iter().any(|a| a == "m3_orbit") {
+                "m3_orbit"
+            } else if args.iter().any(|a| a == "m4_transfer") {
+                "m4_transfer"
+            } else if args.iter().any(|a| a == "m5_approach") {
+                "m5_approach"
+            } else if args.iter().any(|a| a == "m5_descent") {
+                "m5_descent"
+            } else if args.iter().any(|a| a == "m6_landed") {
+                "m6_landed"
+            } else if args.iter().any(|a| a == "botland") {
+                "botland"
+            } else if args.iter().any(|a| a == "rcsdemo") {
+                "rcsdemo"
+            } else if args.iter().any(|a| a == "ast_orbit2") {
+                "ast_orbit2"
+            } else if args.iter().any(|a| a == "ast_orbit3") {
+                "ast_orbit3"
+            } else if args.iter().any(|a| a == "ast_orbit") {
+                "ast_orbit"
+            } else if args.iter().any(|a| a == "ast_surf2") {
+                "ast_surf2"
+            } else if args.iter().any(|a| a == "ast_surf") {
+                "ast_surf"
+            } else if args.iter().any(|a| a == "cargoparts") {
+                "cargoparts"
+            } else if args.iter().any(|a| a == "cargo") {
+                "cargo"
+            } else if args.iter().any(|a| a == "delivery") {
+                "delivery"
+            } else if args.iter().any(|a| a == "moonbase") {
+                "moonbase"
+            } else if args.iter().any(|a| a == "basetour") {
+                "basetour"
+            } else if args.iter().any(|a| a == "baseparts") {
+                "baseparts"
+            } else if args.iter().any(|a| a == "moons") {
+                "moons"
+            } else if args.iter().any(|a| a == "moon") {
                 "moon"
+            } else if args.iter().any(|a| a == "rocket") {
+                "rocket"
+            } else if args.iter().any(|a| a == "starb") {
+                "starb"
+            } else if args.iter().any(|a| a == "binary") {
+                "binary"
             } else if args.iter().any(|a| a == "system") {
                 "system"
+            } else if args.iter().any(|a| a == "grabdemo") {
+                "grabdemo"
+            } else if args.iter().any(|a| a == "lander") {
+                "lander"
+            } else if args.iter().any(|a| a == "vab") {
+                "vab"
+            } else if args.iter().any(|a| a == "rollout") {
+                "rollout"
             } else if args.iter().any(|a| a == "pad") {
                 "pad"
+            } else if args.iter().any(|a| a == "liftoff2") {
+                "liftoff2"
+            } else if args.iter().any(|a| a == "liftoff") {
+                "liftoff"
+            } else if args.iter().any(|a| a == "staging") {
+                "staging"
+            } else if args.iter().any(|a| a == "launchmap") {
+                "launchmap"
+            } else if args.iter().any(|a| a == "upperflame") {
+                "upperflame"
+            } else if args.iter().any(|a| a == "constellation") {
+                "constellation"
+            } else if args.iter().any(|a| a == "deploy") {
+                "deploy"
+            } else if args.iter().any(|a| a == "orbit") {
+                "orbit"
             } else if args.iter().any(|a| a == "ascent") {
                 "ascent"
+            } else if args.iter().any(|a| a == "node") {
+                "node"
             } else if args.iter().any(|a| a == "flight") {
                 "flight"
             } else {
                 "surface"
             };
             let default = match scenario {
+                "m1_vab" => "out/m1_vab.png",
+                "m2_liftoff" => "out/m2_liftoff.png",
+                "m3_orbit" => "out/m3_orbit.png",
+                "m4_transfer" => "out/m4_transfer.png",
+                "m5_approach" => "out/m5_approach.png",
+                "m5_descent" => "out/m5_descent.png",
+                "m6_landed" => "out/m6_landed.png",
+                "botland" => "out/botland.png",
+                "rcsdemo" => "out/rcsdemo.png",
+                "ast_orbit" => "out/ast_orbit.png",
+                "ast_orbit2" => "out/ast_orbit2.png",
+                "ast_orbit3" => "out/ast_orbit3.png",
+                "ast_surf" => "out/ast_surf.png",
+                "ast_surf2" => "out/ast_surf2.png",
+                "cargo" => "out/cargo.png",
+                "cargoparts" => "out/cargoparts.png",
+                "delivery" => "out/delivery.png",
+                "moonbase" => "out/moonbase.png",
+                "basetour" => "out/basetour.png",
+                "baseparts" => "out/baseparts.png",
+                "moons" => "out/moons.png",
                 "moon" => "out/moon.png",
+                "rocket" => "out/rocket.png",
                 "system" => "out/system.png",
                 "pad" => "out/pad.png",
+                "liftoff" => "out/liftoff.png",
+                "liftoff2" => "out/liftoff2.png",
+                "staging" => "out/staging.png",
+                "launchmap" => "out/launchmap.png",
                 "ascent" => "out/ascent.png",
                 "flight" => "out/flight.png",
                 _ => "out/client.png",

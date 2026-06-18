@@ -16,6 +16,10 @@ bytemuck = { version = "1", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 glam = "0.30"
 sim = { path = "../sim" }
+terrain = { path = "../terrain" }
+egui = "0.34"
+egui-wgpu = "0.34"
+egui-winit = { version = "0.34", default-features = false }
 log = "0.4"
 cfg-if = "1"
 
@@ -26,11 +30,13 @@ env_logger = "0.11"
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
 console_error_panic_hook = "0.1"
 console_log = "1"
 web-sys = { version = "0.3", features = [
     "Document",
     "Window",
+    "Navigator",
     "Element",
     "HtmlElement",
     "HtmlCanvasElement",

@@ -6,6 +6,9 @@
 //! thrusting, otherwise stay on rails" rule).
 
 use glam::{DVec3, Vec3};
+use sim::attitude::{
+    allocate, AttitudeController, Gimbal, Rcs, ReactionWheels, RigidBody, TorqueReport,
+};
 use sim::body::CentralBody;
 use sim::orbit::orbit_from_state;
 use sim::vehicle::G0;
@@ -13,24 +16,10 @@ use sim::vehicle::G0;
 const CDA: f64 = 6.0; // Cd * frontal area (m^2), matches the ascent model
 const LAND_SPEED: f64 = 18.0; // m/s surface-relative: under this you land, over it you crash
 
-#[derive(Clone, Copy, PartialEq)]
-pub enum Mode {
-    Prograde,
-    Retrograde,
-    RadialOut,
-    RadialIn,
-}
-
-impl Mode {
-    pub fn label(self) -> &'static str {
-        match self {
-            Mode::Prograde => "PROGRADE",
-            Mode::Retrograde => "RETRO",
-            Mode::RadialOut => "RADIAL OUT",
-            Mode::RadialIn => "RADIAL IN",
-        }
-    }
-}
+/// The attitude reference modes are the six orbital directions from the
+/// rotational-dynamics module (prograde/retro, normal/anti-normal, radial
+/// in/out), plus Free.
+pub use sim::attitude::AttitudeMode as Mode;
 
 pub struct Craft {
     pub r: DVec3,
@@ -42,10 +31,25 @@ pub struct Craft {
     pub isp: f64,
     pub throttle: f64, // 0..1
     pub mode: Mode,
+    /// Optional explicit world-direction the autopilot should point at,
+    /// overriding `mode` (used by the moon-landing bot for moon-relative
+    /// pointing). `None` falls back to the mode.
+    pub hold_dir: Option<DVec3>,
     pub landed: bool,
     pub crashed: bool,
     /// Which body the craft last touched ("HOME" / "MOON" / "").
     pub landed_on: &'static str,
+
+    // ---- rotational dynamics + attitude control ----
+    /// Rigid-body orientation + angular velocity (the ship actually has to turn
+    /// before its thrust points where you want).
+    pub rb: RigidBody,
+    pub wheels: ReactionWheels,
+    pub rcs: Rcs,
+    pub gimbal: Gimbal,
+    pub ctrl: AttitudeController,
+    /// Per-effector torque contribution on the last control step (for the HUD).
+    pub torque_report: TorqueReport,
 }
 
 /// An extra point-mass gravity source (e.g. the moon), positioned in the same
@@ -62,6 +66,11 @@ impl Craft {
     /// A modest maneuvering ship: enough delta-v to deorbit and fly a powered
     /// landing once atmospheric drag has bled off most of the orbital speed.
     pub fn maneuvering(r: DVec3, v: DVec3) -> Craft {
+        // ~14 t wet, roughly a 2 m radius, 8 m long can. Reaction wheels for
+        // fine, propellant-free pointing; RCS for fast slews + wheel dumping; a
+        // gimbaled main engine for control authority while burning.
+        let mut rb = RigidBody::cylinder(14_000.0, 2.0, 4.0);
+        rb.point_at(v); // start pointed prograde
         Craft {
             r,
             v,
@@ -72,9 +81,26 @@ impl Craft {
             isp: 320.0,
             throttle: 0.0,
             mode: Mode::Prograde,
+            hold_dir: None,
             landed: false,
             crashed: false,
             landed_on: "",
+            rb,
+            wheels: ReactionWheels::new(800.0, 250.0),
+            rcs: Rcs::new(4_000.0, 230.0, 2.5, 200.0),
+            gimbal: Gimbal::new(5.0, 6.0),
+            ctrl: AttitudeController::new(),
+            torque_report: TorqueReport::default(),
+        }
+    }
+
+    /// Set the attitude mode and snap the orientation straight onto it (no slew)
+    /// - for scenario/test setup where the ship is already aligned.
+    pub fn aim(&mut self, mode: Mode, body: &CentralBody) {
+        self.mode = mode;
+        let _ = body;
+        if let Some(t) = sim::attitude::target_dir(mode, self.r, self.v) {
+            self.rb.point_at(t);
         }
     }
 
@@ -86,13 +112,57 @@ impl Craft {
         (self.prop / self.prop_full).clamp(0.0, 1.0) as f32
     }
 
+    /// Thrust acts along the ship's actual nose direction (it has to be turned
+    /// there by the autopilot first - thrust is no longer magically aligned).
     fn thrust_dir(&self) -> DVec3 {
-        match self.mode {
-            Mode::Prograde => self.v.normalize_or_zero(),
-            Mode::Retrograde => -self.v.normalize_or_zero(),
-            Mode::RadialOut => self.r.normalize_or_zero(),
-            Mode::RadialIn => -self.r.normalize_or_zero(),
+        self.rb.nose()
+    }
+
+    /// The world direction the autopilot is currently trying to point at: an
+    /// explicit `hold_dir` if set, otherwise the current orbital mode.
+    pub fn target_dir(&self) -> Option<DVec3> {
+        self.hold_dir
+            .map(|d| d.normalize_or_zero())
+            .filter(|d| *d != DVec3::ZERO)
+            .or_else(|| sim::attitude::target_dir(self.mode, self.r, self.v))
+    }
+
+    /// Pointing error of the nose from the commanded attitude (degrees).
+    pub fn pointing_error_deg(&self) -> f64 {
+        match self.target_dir() {
+            Some(t) => AttitudeController::error(&self.rb, t).length().to_degrees(),
+            None => 0.0,
         }
+    }
+
+    /// Body angular rate magnitude (deg/s).
+    pub fn rate_deg_s(&self) -> f64 {
+        self.rb.omega.length().to_degrees()
+    }
+
+    /// Reaction-wheel saturation (0..1) and RCS propellant fraction (0..1).
+    pub fn wheel_saturation(&self) -> f64 {
+        self.wheels.saturation()
+    }
+    pub fn rcs_frac(&self) -> f64 {
+        self.rcs.prop_frac()
+    }
+
+    /// Run one attitude-control step: autopilot -> torque allocation across
+    /// gimbal/wheels/RCS -> rigid-body rotation update.
+    fn step_attitude(&mut self, thrust_n: f64, dt: f64) {
+        let target = self.target_dir();
+        let cmd = self.ctrl.command_torque(&self.rb, target, dt);
+        let (tau, report) = allocate(
+            cmd,
+            &mut self.wheels,
+            &mut self.rcs,
+            self.gimbal,
+            thrust_n,
+            dt,
+        );
+        self.rb.integrate(tau, dt);
+        self.torque_report = report;
     }
 
     fn accel(
@@ -143,6 +213,10 @@ impl Craft {
             } else {
                 0.0
             };
+
+            // Turn the ship first (real rotational dynamics), then thrust along
+            // wherever the nose actually ends up this step.
+            self.step_attitude(thrust_n, h);
             let tdir = self.thrust_dir();
 
             let r = self.r;
@@ -235,31 +309,102 @@ impl Craft {
     /// Predicted conic from the current state, as unit-sphere points (empty for
     /// hyperbolic / escape trajectories).
     pub fn predicted_orbit(&self, body: &CentralBody) -> Vec<Vec3> {
-        let orb = orbit_from_state(self.r, self.v, body.mu);
-        if orb.e >= 1.0 || orb.a <= 0.0 {
-            return Vec::new();
-        }
-        let w_hat = orb.h_vec.normalize_or_zero();
-        let p_hat = if orb.e > 1e-4 {
+        conic_points(self.r, self.v, body.mu, body.radius)
+    }
+
+    /// Orbit-plane basis (periapsis dir, in-plane perp) for the current conic.
+    fn plane_basis(&self, mu: f64) -> (DVec3, DVec3, DVec3) {
+        let orb = orbit_from_state(self.r, self.v, mu);
+        let w = orb.h_vec.normalize_or_zero();
+        let p = if orb.e > 1e-4 {
             orb.e_vec.normalize_or_zero()
         } else {
-            // circular: any vector in the plane
-            let a = if w_hat.x.abs() < 0.9 { DVec3::X } else { DVec3::Y };
-            w_hat.cross(a).normalize_or_zero()
+            let a = if w.x.abs() < 0.9 { DVec3::X } else { DVec3::Y };
+            w.cross(a).normalize_or_zero()
         };
-        let q_hat = w_hat.cross(p_hat).normalize_or_zero();
-        let p = orb.a * (1.0 - orb.e * orb.e);
-        let radius = body.radius;
-        (0..=180)
-            .map(|i| {
-                let nu = i as f32 / 180.0 * std::f32::consts::TAU;
-                let nu64 = nu as f64;
-                let rad = p / (1.0 + orb.e * nu64.cos());
-                let pos = (rad * (nu64.cos() * p_hat + nu64.sin() * q_hat)) / radius;
-                Vec3::new(pos.x as f32, pos.y as f32, pos.z as f32)
-            })
-            .collect()
+        (p, w.cross(p).normalize_or_zero(), w)
     }
+
+    /// Position + velocity at true anomaly `nu` on the current conic.
+    pub fn state_at_nu(&self, mu: f64, nu: f64) -> (DVec3, DVec3) {
+        let orb = orbit_from_state(self.r, self.v, mu);
+        let (p_hat, q_hat, _) = self.plane_basis(mu);
+        let p = orb.a * (1.0 - orb.e * orb.e);
+        let r = p / (1.0 + orb.e * nu.cos());
+        let pos = r * (nu.cos() * p_hat + nu.sin() * q_hat);
+        let sp = (mu / p).max(0.0).sqrt();
+        let vel = sp * (-nu.sin() * p_hat + (orb.e + nu.cos()) * q_hat);
+        (pos, vel)
+    }
+
+    /// The post-burn state if a maneuver of (prograde, normal, radial) m/s is
+    /// applied at true anomaly `nu` on the current orbit.
+    pub fn node_state(&self, mu: f64, nu: f64, pro: f64, nrm: f64, rad: f64) -> (DVec3, DVec3) {
+        let (rn, vn) = self.state_at_nu(mu, nu);
+        let vh = vn.normalize_or_zero();
+        let rh = rn.normalize_or_zero();
+        let hh = rn.cross(vn).normalize_or_zero();
+        (rn, vn + vh * pro + hh * nrm + rh * rad)
+    }
+
+    /// Predicted conic resulting from a maneuver node (unit-sphere points).
+    pub fn node_orbit(&self, body: &CentralBody, nu: f64, pro: f64, nrm: f64, rad: f64) -> Vec<Vec3> {
+        let (rn, vn) = self.node_state(body.mu, nu, pro, nrm, rad);
+        conic_points(rn, vn, body.mu, body.radius)
+    }
+
+    /// Unit-sphere position of the maneuver node (for its marker).
+    pub fn node_marker(&self, body: &CentralBody, nu: f64) -> Vec3 {
+        let (rn, _) = self.state_at_nu(body.mu, nu);
+        let u = rn / body.radius;
+        Vec3::new(u.x as f32, u.y as f32, u.z as f32)
+    }
+
+    /// Apoapsis / periapsis altitude (km) of the node's resulting orbit.
+    pub fn node_apsides(&self, body: &CentralBody, nu: f64, pro: f64, nrm: f64, rad: f64) -> (f32, f32) {
+        let (rn, vn) = self.node_state(body.mu, nu, pro, nrm, rad);
+        let orb = orbit_from_state(rn, vn, body.mu);
+        if orb.a <= 0.0 || orb.e >= 1.0 {
+            return (f32::INFINITY, f32::NEG_INFINITY);
+        }
+        (
+            ((orb.ra - body.radius) / 1000.0) as f32,
+            ((orb.rp - body.radius) / 1000.0) as f32,
+        )
+    }
+
+    /// Jump the craft to the node and apply its burn impulsively (execute).
+    pub fn execute_node(&mut self, mu: f64, nu: f64, pro: f64, nrm: f64, rad: f64) {
+        let (rn, vn) = self.node_state(mu, nu, pro, nrm, rad);
+        self.r = rn;
+        self.v = vn;
+    }
+}
+
+/// A conic's points (unit-sphere, magnitude encodes altitude) from a state
+/// vector; empty for hyperbolic / escape trajectories.
+fn conic_points(r: DVec3, v: DVec3, mu: f64, radius: f64) -> Vec<Vec3> {
+    let orb = orbit_from_state(r, v, mu);
+    if orb.e >= 1.0 || orb.a <= 0.0 {
+        return Vec::new();
+    }
+    let w_hat = orb.h_vec.normalize_or_zero();
+    let p_hat = if orb.e > 1e-4 {
+        orb.e_vec.normalize_or_zero()
+    } else {
+        let a = if w_hat.x.abs() < 0.9 { DVec3::X } else { DVec3::Y };
+        w_hat.cross(a).normalize_or_zero()
+    };
+    let q_hat = w_hat.cross(p_hat).normalize_or_zero();
+    let p = orb.a * (1.0 - orb.e * orb.e);
+    (0..=180)
+        .map(|i| {
+            let nu = (i as f64 / 180.0) * std::f64::consts::TAU;
+            let rad = p / (1.0 + orb.e * nu.cos());
+            let pos = (rad * (nu.cos() * p_hat + nu.sin() * q_hat)) / radius;
+            Vec3::new(pos.x as f32, pos.y as f32, pos.z as f32)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -292,7 +437,7 @@ mod tests {
         let body = CentralBody::home();
         let mut c = circular(&body, 300_000.0);
         let before = orbit_from_state(c.r, c.v, body.mu).rp;
-        c.mode = Mode::Retrograde;
+        c.aim(Mode::Retrograde, &body); // already pointed retro
         c.throttle = 1.0;
         for _ in 0..20 {
             c.integrate(&body, &[], 1.0); // 20 s retro burn
@@ -300,6 +445,31 @@ mod tests {
         let after = orbit_from_state(c.r, c.v, body.mu).rp;
         assert!(after < before - 1_000.0, "periapsis {} -> {}", before, after);
         assert!(c.prop < c.prop_full, "burn consumed no propellant");
+    }
+
+    #[test]
+    fn autopilot_slews_then_burn_is_effective() {
+        // With the ship starting prograde, commanding retrograde must turn it
+        // (real rotation, not instant) and then the burn lowers periapsis.
+        let body = CentralBody::home();
+        let mut c = circular(&body, 300_000.0);
+        let before = orbit_from_state(c.r, c.v, body.mu).rp;
+        c.mode = Mode::Retrograde; // slew, do NOT snap
+        // first let it turn around (no throttle), then burn
+        for _ in 0..40 {
+            c.integrate(&body, &[], 1.0);
+        }
+        assert!(
+            c.pointing_error_deg() < 3.0,
+            "autopilot failed to slew to retrograde: {} deg",
+            c.pointing_error_deg()
+        );
+        c.throttle = 1.0;
+        for _ in 0..20 {
+            c.integrate(&body, &[], 1.0);
+        }
+        let after = orbit_from_state(c.r, c.v, body.mu).rp;
+        assert!(after < before - 1_000.0, "periapsis {} -> {}", before, after);
     }
 
     #[test]

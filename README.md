@@ -29,6 +29,11 @@ See **[docs/DESIGN.md](docs/DESIGN.md)** for the full design document covering:
   rivers/deltas via flow accumulation, coastal-delta major cities, river-corridor
   minor cities, a great-circle MST road network, night-light emission, and an
   auto-sited equatorial launch complex. Includes a CPU PNG preview renderer.
+- `crates/terrain` - cube-sphere quadtree LOD terrain. Continuous procedural
+  elevation (a pure function of sphere direction, so it is seamless across LOD
+  transitions and detailed at any zoom), distance-based patch refinement, and
+  crack-hiding skirts. The `lod` bin renders CPU proof images (LOD quadtree map
+  + hillshaded relief). This is the foundation of the rocket-view renderer.
 - `crates/sim` - orbital mechanics and launch-to-orbit: analytic two-body
   ("on-rails") state/elements, a central body + atmosphere, staged launch
   vehicles, an RK4 powered-ascent integrator with a programmed gravity turn and
