@@ -11,9 +11,50 @@ struct U {
     fog: vec4<f32>,    // rgb = horizon haze, w = fog density
     lights: array<vec4<f32>, 8>,    // xyz = position (camera-relative), w = range
     light_col: array<vec4<f32>, 8>, // rgb = colour * intensity
+    detail: vec4<f32>,              // xyz = body centre (camera-rel), w = radius (0=off)
 };
 
 @group(0) @binding(0) var<uniform> u: U;
+
+// --- procedural surface detail (value noise + fbm), used for airless bodies ---
+fn dhash(p: vec3<f32>) -> f32 {
+    let q = fract(p * 0.3183099 + vec3<f32>(0.1, 0.2, 0.3));
+    let r = q * 17.0;
+    return fract(r.x * r.y * r.z * (r.x + r.y + r.z));
+}
+fn dnoise(p: vec3<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let w = f * f * (3.0 - 2.0 * f);
+    let c000 = dhash(i + vec3<f32>(0.0, 0.0, 0.0));
+    let c100 = dhash(i + vec3<f32>(1.0, 0.0, 0.0));
+    let c010 = dhash(i + vec3<f32>(0.0, 1.0, 0.0));
+    let c110 = dhash(i + vec3<f32>(1.0, 1.0, 0.0));
+    let c001 = dhash(i + vec3<f32>(0.0, 0.0, 1.0));
+    let c101 = dhash(i + vec3<f32>(1.0, 0.0, 1.0));
+    let c011 = dhash(i + vec3<f32>(0.0, 1.0, 1.0));
+    let c111 = dhash(i + vec3<f32>(1.0, 1.0, 1.0));
+    let x00 = mix(c000, c100, w.x);
+    let x10 = mix(c010, c110, w.x);
+    let x01 = mix(c001, c101, w.x);
+    let x11 = mix(c011, c111, w.x);
+    return mix(mix(x00, x10, w.y), mix(x01, x11, w.y), w.z);
+}
+fn dfbm(p: vec3<f32>) -> f32 {
+    var s = 0.0;
+    var a = 0.5;
+    var pp = p;
+    for (var i = 0; i < 4; i = i + 1) {
+        s = s + a * (dnoise(pp) * 2.0 - 1.0);
+        pp = pp * 2.0;
+        a = a * 0.5;
+    }
+    return s;
+}
+// Multi-scale regolith height at a surface direction (unit), in [-1,1]-ish.
+fn detail_height(dir: vec3<f32>) -> f32 {
+    return dfbm(dir * 14.0) + 0.5 * dfbm(dir * 38.0 + vec3<f32>(11.0));
+}
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -50,9 +91,43 @@ fn vs(
 
 @fragment
 fn fs(in: VsOut) -> FsOut {
-    let n = normalize(in.normal);
+    var n = normalize(in.normal);
     let s = normalize(u.sun.xyz);
-    let diff = max(dot(n, s), 0.0);
+
+    // Procedural surface detail: perturb the (smooth) geometry normal with the
+    // gradient of a regolith height field, and add a micro self-shadow toward
+    // the sun. This is a continuous function of the body-space direction, so it
+    // is identical across LOD patch seams and brings crater/rubble relief at
+    // altitude without needing fine geometry.
+    var micro_shadow = 1.0;
+    if (u.detail.w > 0.5) {
+        let bp = in.wpos - u.detail.xyz;       // body-space position
+        let dir = normalize(bp);
+        // tangent frame on the sphere
+        var t = cross(select(vec3<f32>(0.0,0.0,1.0), vec3<f32>(1.0,0.0,0.0), abs(dir.x) < 0.9), dir);
+        t = normalize(t);
+        let b = cross(dir, t);
+        let e = 0.012;                          // angular sample step
+        let h0 = detail_height(dir);
+        let ht = detail_height(normalize(dir + t * e));
+        let hb = detail_height(normalize(dir + b * e));
+        // surface-tangent gradient -> tilt the normal (strength fades with view dist)
+        let grad = (ht - h0) * t + (hb - h0) * b;
+        let fade = clamp(1.0 - (in.flogz - 1.0) / (u.detail.w * 10.0), 0.25, 1.0);
+        n = normalize(n - grad * (2.2 * fade));
+        // cheap micro self-shadow: step toward the sun and see if the field rises
+        let st = dot(s, t);
+        let sb = dot(s, b);
+        var occ = 0.0;
+        for (var k = 1; k <= 3; k = k + 1) {
+            let st_e = e * f32(k) * 1.5;
+            let sd = normalize(dir + (t * st + b * sb) * st_e);
+            occ = max(occ, (detail_height(sd) - h0) / (st_e * 6.0 + 1e-3));
+        }
+        micro_shadow = clamp(1.0 - 0.55 * clamp(occ, 0.0, 1.0), 0.3, 1.0);
+    }
+
+    let diff = max(dot(n, s), 0.0) * micro_shadow;
     // Airless (lunar) bodies have no sky-fill: ambient is near-black so the only
     // light is the direct sun, giving stark crater shadows. On worlds with air,
     // use the bluish hemispheric sky/ground ambient.

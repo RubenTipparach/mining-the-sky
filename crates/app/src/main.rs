@@ -186,6 +186,9 @@ struct MeshUniforms {
     lights: [[f32; 4]; 8],
     /// rgb = colour * intensity for each light.
     light_col: [[f32; 4]; 8],
+    /// Procedural surface detail (asteroid/airless bodies): xyz = body centre in
+    /// camera-relative space, w = body radius (m). w = 0 disables.
+    detail: [f32; 4],
 }
 
 const MAX_LIGHTS: usize = 8;
@@ -711,6 +714,15 @@ impl World {
         } else {
             SUN_LOCAL
         };
+        // Procedural surface detail for the asteroid (fragment-level normal
+        // mapping + micro self-shadow). Body centre in camera-relative space is
+        // rel(origin); w carries the radius (0 = off for other scenes).
+        let detail = if self.ast_elev.is_some() {
+            let c = self.rel(DVec3::ZERO);
+            [c.x, c.y, c.z, self.ast_radius as f32]
+        } else {
+            [0.0, 0.0, 0.0, 0.0]
+        };
         MeshUniforms {
             viewproj: vp.to_cols_array_2d(),
             sun: [sun_l.x, sun_l.y, sun_l.z, lunar],
@@ -720,6 +732,7 @@ impl World {
             fog,
             lights,
             light_col,
+            detail,
         }
     }
 

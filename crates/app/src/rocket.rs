@@ -1336,12 +1336,13 @@ pub fn asteroid_terrain(cam_local: DVec3, radius: f64, elev: &Elevation, max_dep
     let n = 9;
     // The true surface point at a direction (same field build_mesh displaced by).
     let surf = |d: DVec3| -> DVec3 { d * (radius + elev.land_height_m(d)) };
-    // Analytic normal from the height-field gradient: sample the surface a tiny
-    // step along two tangents and cross them. This is a continuous function of
-    // direction, so neighbouring (and different-LOD) patches that share an edge
-    // get IDENTICAL normals - no per-patch lighting seams.
-    let eps = 4.0e-4;
-    let normal_at = |d: DVec3| -> Vec3 {
+    // Analytic normal from the height-field gradient, sampled at a step `eps`
+    // (radians) that matches the local mesh spacing. Tying the step to the patch
+    // size keeps the normal at the resolution actually being drawn: coarse far
+    // patches read big features (no sub-triangle speckle), near patches resolve
+    // fine relief. It is a pure function of direction, so patches that share an
+    // edge get identical normals - seamless blending across patches and LODs.
+    let normal_at = |d: DVec3, eps: f64| -> Vec3 {
         let (t, b) = terrain::cubesphere::tangent_basis(d);
         let p0 = surf(d);
         let pt = surf((d + t * eps).normalize());
@@ -1358,10 +1359,12 @@ pub fn asteroid_terrain(cam_local: DVec3, radius: f64, elev: &Elevation, max_dep
     for patch in &lod.patches {
         let skirt = (patch.edge * 0.35).clamp(2.0, 5_000.0);
         let pm = build_mesh(&planet, patch, n, elev, skirt);
+        // one vertex spacing of this patch, as an angular step on the unit sphere
+        let eps = ((patch.edge / (n as f64 - 1.0)) / radius).clamp(2.0e-4, 0.2);
         let nv = pm.positions.len();
         let local: Vec<Vec3> = pm.positions.iter().map(|&w| w.as_vec3()).collect();
         let radial: Vec<Vec3> = pm.positions.iter().map(|&w| w.normalize_or_zero().as_vec3()).collect();
-        let nrm: Vec<Vec3> = pm.positions.iter().map(|&w| normal_at(w.normalize())).collect();
+        let nrm: Vec<Vec3> = pm.positions.iter().map(|&w| normal_at(w.normalize(), eps)).collect();
         let col: Vec<[f32; 3]> = (0..nv)
             .map(|i| {
                 let h_frac = ((local[i].length() - radius as f32) / amp).clamp(0.0, 1.0);
