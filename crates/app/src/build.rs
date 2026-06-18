@@ -27,6 +27,9 @@ pub struct Payload {
     pub name: &'static str,
     pub mass: f64, // kg
     pub color: [f32; 3],
+    /// Cargo-module geometry shown inside the fairing (index into
+    /// `rocket::cargo_module`), or -1 for a plain boxed satellite.
+    pub module: i32,
 }
 
 pub const ENGINES: &[Engine] = &[
@@ -45,11 +48,19 @@ pub const TANKS: &[Tank] = &[
 ];
 
 pub const PAYLOADS: &[Payload] = &[
-    Payload { name: "CubeSat", mass: 200.0, color: [0.7, 0.8, 0.9] },
-    Payload { name: "ComSat", mass: 1_400.0, color: [0.9, 0.8, 0.3] },
-    Payload { name: "Station Module", mass: 5_000.0, color: [0.6, 0.85, 1.0] },
-    Payload { name: "Fuel Depot", mass: 9_000.0, color: [1.0, 0.6, 0.3] },
-    Payload { name: "Lunar Lander", mass: 6_500.0, color: [0.82, 0.66, 0.26] },
+    Payload { name: "CubeSat", mass: 200.0, color: [0.7, 0.8, 0.9], module: -1 },
+    Payload { name: "ComSat", mass: 1_400.0, color: [0.9, 0.8, 0.3], module: -1 },
+    Payload { name: "Station Module", mass: 5_000.0, color: [0.6, 0.85, 1.0], module: -1 },
+    Payload { name: "Fuel Depot", mass: 9_000.0, color: [1.0, 0.6, 0.3], module: -1 },
+    Payload { name: "Lunar Lander", mass: 6_500.0, color: [0.82, 0.66, 0.26], module: -1 },
+    // Surface base cargo: compact, fairing-packed modules that unfold and are
+    // assembled on site. A refinery needs power, so deliver a reactor or a
+    // solar generator alongside it.
+    Payload { name: "Refinery Module", mass: 8_000.0, color: [0.80, 0.62, 0.22], module: 0 },
+    Payload { name: "Fission Reactor", mass: 7_000.0, color: [0.85, 0.86, 0.90], module: 1 },
+    Payload { name: "Solar Generator", mass: 4_500.0, color: [0.30, 0.40, 0.70], module: 2 },
+    Payload { name: "Habitat Module", mass: 6_000.0, color: [0.84, 0.86, 0.90], module: 3 },
+    Payload { name: "ISRU Drill Rig", mass: 7_500.0, color: [0.78, 0.62, 0.22], module: 4 },
 ];
 
 #[derive(Clone, Copy)]

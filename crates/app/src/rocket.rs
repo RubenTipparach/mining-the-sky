@@ -536,6 +536,118 @@ pub fn base_catalog() -> Mesh {
     m
 }
 
+// ----------------------------------------------------------------------------
+// Fairing-packed cargo modules. Compact, "packaged for launch" versions of the
+// surface buildings (folded radiators, stowed arrays, etc.) that ride inside
+// the fairing and unfold / are assembled on site. Built about y=0, kept within
+// a ~0.78 m radius / ~4.8 m tall envelope so they fit a standard fairing.
+// ----------------------------------------------------------------------------
+
+/// A docking/berthing collar at the base of a cargo module.
+fn mod_collar(m: &mut Mesh) {
+    m.frustum(0.0, 0.0, 0.0, 0.45, 0.78, 0.78, 16, BB_STEEL, true, false);
+    m.frustum(0.0, 0.0, 0.45, 0.6, 0.62, 0.62, 16, BB_DARK, false, true);
+}
+
+fn mod_refinery(m: &mut Mesh) {
+    mod_collar(m);
+    // main process drum
+    m.frustum(0.0, 0.0, 0.6, 3.6, 0.7, 0.7, 16, BB_INDUST, true, false);
+    m.dome(0.0, 0.0, 3.6, 0.7, 0.5, 16, 3, BB_STEEL);
+    // stowed fractionating column alongside
+    m.frustum(0.46, 0.0, 0.6, 4.4, 0.18, 0.16, 10, BB_WHITE, true, true);
+    // a couple of process pipes wrapping the drum
+    m.strut(Vec3::new(0.0, 1.0, 0.72), Vec3::new(0.0, 3.2, 0.72), 0.07, BB_STEEL);
+    m.strut(Vec3::new(0.0, 1.0, -0.72), Vec3::new(0.0, 3.0, -0.72), 0.07, BB_STEEL);
+    // intake hopper at the base
+    m.frustum(-0.5, 0.0, 0.6, 1.3, 0.28, 0.12, 8, BB_TRIM, false, true);
+}
+
+fn mod_reactor(m: &mut Mesh) {
+    mod_collar(m);
+    // containment cylinder + dome
+    m.frustum(0.0, 0.0, 0.6, 3.4, 0.6, 0.58, 16, BB_WHITE, true, false);
+    m.frustum(0.0, 0.0, 2.3, 2.7, 0.62, 0.62, 16, BB_RED, false, false); // hazard band
+    m.dome(0.0, 0.0, 3.4, 0.58, 0.5, 16, 3, BB_STEEL);
+    // four radiator panels folded flat against the body (deploy on site)
+    for k in 0..4 {
+        let a = (k as f32 + 0.5) * std::f32::consts::FRAC_PI_2;
+        let (cx, cz) = (a.cos() * 0.7, a.sin() * 0.7);
+        m.bx(Vec3::new(cx, 2.0, cz), Vec3::new(0.06 + 0.5 * a.sin().abs(), 1.3, 0.06 + 0.5 * a.cos().abs()), BB_TRIM);
+    }
+}
+
+fn mod_generator(m: &mut Mesh) {
+    mod_collar(m);
+    // power core box
+    m.bx(Vec3::new(0.0, 1.6, 0.0), Vec3::new(0.6, 1.0, 0.6), BB_WHITE);
+    // stowed (folded) solar array stacks on two sides
+    for s in [-1.0f32, 1.0] {
+        for k in 0..4 {
+            let y = 0.9 + k as f32 * 0.45;
+            m.bx(Vec3::new(s * 0.72, y, 0.0), Vec3::new(0.05, 0.18, 0.55), BB_SOLAR);
+        }
+    }
+    // battery / inverter drum + radiator stub on top
+    m.frustum(0.0, 0.0, 2.6, 3.4, 0.4, 0.36, 12, BB_TRIM, false, true);
+    m.bx(Vec3::new(0.0, 3.7, 0.0), Vec3::new(0.5, 0.4, 0.05), BB_DARK);
+}
+
+fn mod_habitat(m: &mut Mesh) {
+    mod_collar(m);
+    // pressurised can with a window band + end dome
+    m.frustum(0.0, 0.0, 0.6, 3.8, 0.74, 0.74, 18, BB_WHITE, true, false);
+    m.frustum(0.0, 0.0, 1.8, 2.4, 0.76, 0.76, 18, BB_WIN, false, false);
+    m.dome(0.0, 0.0, 3.8, 0.74, 0.6, 18, 3, BB_WHITE);
+    // top docking node + a side berthing port
+    m.frustum(0.0, 0.0, 4.4, 4.7, 0.28, 0.28, 12, BB_TRIM, false, true);
+    m.frustum(0.76, 0.0, 2.0, 2.0, 0.0, 0.0, 4, BB_TRIM, false, false); // (placeholder, see nub below)
+    m.bx(Vec3::new(0.82, 2.0, 0.0), Vec3::new(0.12, 0.3, 0.3), BB_TRIM);
+}
+
+fn mod_drill(m: &mut Mesh) {
+    mod_collar(m);
+    // stowed drill mast + auger bit, hopper and folded outrigger legs
+    m.frustum(0.0, 0.0, 0.6, 4.6, 0.16, 0.13, 8, BB_STEEL, false, false); // mast
+    m.frustum(0.0, 0.0, 0.5, 0.95, 0.0, 0.3, 8, BB_DARK, false, true); // auger bit (point down-ish)
+    m.bx(Vec3::new(0.0, 1.5, 0.0), Vec3::new(0.5, 0.9, 0.5), BB_INDUST); // machinery box
+    m.frustum(0.0, 0.0, 2.6, 3.4, 0.6, 0.4, 8, BB_TRIM, false, true); // hopper
+    for k in 0..3 {
+        let a = k as f32 / 3.0 * TAU;
+        m.strut(Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.62 * a.cos(), 0.7, 0.62 * a.sin()), 0.07, BB_STEEL);
+    }
+}
+
+/// A fairing-packed cargo module (index matches the `module` field in the
+/// payload catalog: 0 refinery, 1 reactor, 2 generator, 3 habitat, 4 drill).
+pub fn cargo_module(idx: usize) -> Mesh {
+    let mut m = Mesh::default();
+    match idx {
+        0 => mod_refinery(&mut m),
+        1 => mod_reactor(&mut m),
+        2 => mod_generator(&mut m),
+        3 => mod_habitat(&mut m),
+        _ => mod_drill(&mut m),
+    }
+    m
+}
+
+/// The five cargo modules lined up in a row (for a parts preview), each
+/// unpacked/standing on the ground, spaced along +X centred on the origin.
+pub fn cargo_catalog() -> Mesh {
+    let mut m = Mesh::default();
+    let spacing = 4.0f32;
+    for i in 0..5usize {
+        let cx = (i as f32 - 2.0) * spacing;
+        let cm = cargo_module(i);
+        for v in &cm.verts {
+            let p = Vec3::new(v.pos[0] + cx, v.pos[1], v.pos[2]);
+            m.verts.push(MeshVertex { pos: p.into(), normal: v.normal, color: v.color });
+        }
+    }
+    m
+}
+
 /// The flyable rocket body, built about its base at y=0 and pointing +Y. The
 /// pad and mount are separate (they stay behind on liftoff). `stage_ranges[i]`
 /// is the vertex range of stage i (bottom-first), so a spent stage can be split
@@ -555,6 +667,11 @@ pub struct RocketBody {
     pub engine_r: Vec<f32>,
     /// Mesh-Y of each stage's engine mount (where its exhaust exits).
     pub nozzle_y: Vec<f32>,
+    /// The cargo module inside the fairing (subset of `payload_range`).
+    pub module_range: std::ops::Range<usize>,
+    /// The two clamshell fairing halves (each swings out along local +/-X).
+    pub fairing_l: std::ops::Range<usize>,
+    pub fairing_r: std::ops::Range<usize>,
 }
 
 pub const PAD_TOP: f32 = 1.2;
@@ -670,7 +787,7 @@ pub fn append_part(m: &mut Mesh, kind: PartKind, c: Vec3, col: [f32; 3]) {
 /// Build the rocket body for `veh` about its base at y=0, proportional to each
 /// stage's tank (radius/height) and engine (cluster). `payload_col` tints the
 /// payload section.
-pub fn rocket_body(veh: &Vehicle, payload_col: [f32; 3]) -> RocketBody {
+pub fn rocket_body(veh: &Vehicle, payload_col: [f32; 3], module_id: i32) -> RocketBody {
     let mut m = Mesh::default();
     let n = veh.stages.len().max(1);
     let radii: Vec<f32> = veh.stages.iter().map(|s| stage_radius(s.prop)).collect();
@@ -727,13 +844,64 @@ pub fn rocket_body(veh: &Vehicle, payload_col: [f32; 3]) -> RocketBody {
         stage_ranges.push(start..m.verts.len());
     }
 
-    // payload fairing + nose cone
+    // payload section: the cargo module inside a clamshell fairing + nose.
     let pstart = m.verts.len();
-    let pr = radii.last().copied().unwrap_or(1.5) * 0.85;
-    m.frustum(0.0, 0.0, y, y + 4.0, pr, pr, 24, payload_col, false, false);
-    y += 4.0;
-    m.frustum(0.0, 0.0, y, y + 4.0, pr, 0.0, 24, [0.93, 0.93, 0.96], false, false);
-    y += 4.0;
+    let has_module = module_id >= 0;
+    // fairing inner radius: wide enough to enclose a cargo module if present.
+    let last_r = radii.last().copied().unwrap_or(1.5);
+    let pr = if has_module { (last_r * 0.95).max(1.05) } else { last_r * 0.85 };
+    let fy0 = y; // fairing base
+    let cyl_h = if has_module { 5.0 } else { 4.0 };
+    let nose_h = 4.0;
+    let fy1 = fy0 + cyl_h; // shoulder
+    let ny = fy1 + nose_h; // nose tip
+
+    // 1) the payload itself, sitting on the upper-stage forward dome
+    let mstart = m.verts.len();
+    if has_module {
+        // place a fairing-fit cargo module (scaled to clear the fairing wall)
+        let cm = cargo_module(module_id as usize);
+        let s = ((pr * 0.82) / 0.78).min(1.25);
+        for v in &cm.verts {
+            let p = Vec3::new(v.pos[0] * s, fy0 + 0.2 + v.pos[1] * s.min(1.05), v.pos[2] * s);
+            m.verts.push(MeshVertex { pos: p.into(), normal: v.normal, color: v.color });
+        }
+    } else {
+        // a plain boxed satellite
+        m.frustum(0.0, 0.0, fy0 + 0.4, fy0 + 3.4, pr * 0.6, pr * 0.55, 12, payload_col, true, true);
+    }
+    let module_range = mstart..m.verts.len();
+
+    // 2) the fairing as two clamshell halves (each a 180-deg arc of the
+    // cylinder + ogive nose), so they can be swung apart to reveal the module.
+    let half = |m: &mut Mesh, a_start: f32, a_end: f32| {
+        let segs = 12usize;
+        let apex = Vec3::new(0.0, ny, 0.0);
+        for i in 0..segs {
+            let a0 = a_start + (a_end - a_start) * i as f32 / segs as f32;
+            let a1 = a_start + (a_end - a_start) * (i + 1) as f32 / segs as f32;
+            let am = 0.5 * (a0 + a1);
+            // cylinder wall
+            let c00 = Vec3::new(pr * a0.cos(), fy0, pr * a0.sin());
+            let c10 = Vec3::new(pr * a1.cos(), fy0, pr * a1.sin());
+            let c11 = Vec3::new(pr * a1.cos(), fy1, pr * a1.sin());
+            let c01 = Vec3::new(pr * a0.cos(), fy1, pr * a0.sin());
+            let nwall = Vec3::new(am.cos(), 0.0, am.sin());
+            m.quad(c00, c10, c11, c01, nwall, payload_col);
+            // ogive nose triangle to the apex
+            let nnose = Vec3::new(am.cos(), 0.5, am.sin()).normalize();
+            m.tri(c01, c11, apex, nnose, [0.93, 0.93, 0.96]);
+        }
+    };
+    use std::f32::consts::{FRAC_PI_2, PI};
+    let flstart = m.verts.len();
+    half(&mut m, FRAC_PI_2, FRAC_PI_2 + PI); // -X half
+    let fairing_l = flstart..m.verts.len();
+    let frstart = m.verts.len();
+    half(&mut m, -FRAC_PI_2, FRAC_PI_2); // +X half
+    let fairing_r = frstart..m.verts.len();
+
+    y = ny;
     let payload_range = pstart..m.verts.len();
 
     let _ = n;
@@ -747,6 +915,9 @@ pub fn rocket_body(veh: &Vehicle, payload_col: [f32; 3]) -> RocketBody {
         cam_dist: y * 1.7,
         engine_r,
         nozzle_y,
+        module_range,
+        fairing_l,
+        fairing_r,
     }
 }
 

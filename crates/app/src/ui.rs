@@ -16,8 +16,10 @@ pub fn build(ctx: &egui::Context, world: &mut World) {
     apply_theme(ctx);
     match world.view {
         View::Rocket => {
-            if world.base_mesh.is_some() {
+            if world.base_mesh.is_some() && world.base_panel {
                 moonbase_panel(ctx, world); // surveying the colony
+            } else if world.base_mesh.is_some() {
+                // a single delivered cargo module on the surface: no panel
             } else if world.show_lander {
                 lander_panel(ctx, world); // on the lunar surface
             } else if world.launch.is_some() {

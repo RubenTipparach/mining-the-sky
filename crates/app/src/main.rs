@@ -384,6 +384,12 @@ struct World {
     show_lander: bool,
     /// An assembled/previewed moon base mesh to draw on the surface, if any.
     base_mesh: Option<rocket::Mesh>,
+    /// Fairing clamshell open fraction (0 = closed, 1 = halves fully swung out
+    /// revealing the cargo module).
+    fairing_open: f32,
+    /// Show the MOON BASE structures-catalog panel (only for the full colony,
+    /// not single delivered modules).
+    base_panel: bool,
     /// Render the surface as the moon: grey regolith + black airless sky.
     lunar: bool,
     /// Height (m) the lander floats above the surface (0 = landed).
@@ -458,7 +464,7 @@ impl World {
         let mission = Mission::pioneer_from_spaceport();
         let body = CentralBody::home();
         let vab = build::Vab::default_build();
-        let rocket_body = rocket::rocket_body(&vab.to_vehicle(), vab.payload().color);
+        let rocket_body = rocket::rocket_body(&vab.to_vehicle(), vab.payload().color, vab.payload().module);
         let rocket_frame = (rocket_body.focus_y, rocket_body.cam_dist);
         let (rack_mesh_init, rack_slots) = build_rack();
         let (launch_origin, launch_up, launch_east, launch_north) = rocket::launch_frame();
@@ -496,6 +502,8 @@ impl World {
             lander_mesh: rocket::lander(),
             show_lander: false,
             base_mesh: None,
+            fairing_open: 0.0,
+            base_panel: false,
             lunar: false,
             lander_alt: 0.0,
             lander_firing: false,
@@ -1171,7 +1179,7 @@ impl World {
     /// Rebuild the rocket-view geometry from the current VAB design (call after
     /// the player edits the build).
     fn rebuild_vehicle(&mut self) {
-        self.rocket_body = rocket::rocket_body(&self.vab.to_vehicle(), self.vab.payload().color);
+        self.rocket_body = rocket::rocket_body(&self.vab.to_vehicle(), self.vab.payload().color, self.vab.payload().module);
         self.rocket_focus_y = self.rocket_body.focus_y;
     }
 
@@ -1295,8 +1303,21 @@ impl World {
         q: Quat,
         base: DVec3,
     ) {
+        self.xform_into_off(out, range, q, base, Vec3::ZERO);
+    }
+
+    /// `xform_into` with an extra translation applied in the rocket's own local
+    /// frame before the pose (used to swing the fairing clamshell halves apart).
+    fn xform_into_off(
+        &self,
+        out: &mut Vec<rocket::MeshVertex>,
+        range: std::ops::Range<usize>,
+        q: Quat,
+        base: DVec3,
+        local_off: Vec3,
+    ) {
         for v in &self.rocket_body.mesh.verts[range] {
-            let local = base + (q * Vec3::from(v.pos)).as_dvec3();
+            let local = base + (q * (Vec3::from(v.pos) + local_off)).as_dvec3();
             let n = q * Vec3::from(v.normal);
             out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: n.into(), color: v.color });
         }
@@ -1394,8 +1415,17 @@ impl World {
             None => (self.resting_base_local(), Quat::IDENTITY, 0),
         };
 
-        // draw the payload + every still-attached stage (active stage and above)
-        self.xform_into(&mut out, rb.payload_range.clone(), quat, base_local);
+        // draw the payload. When the fairing is closed, the whole payload range
+        // (module + clamshell) draws as one. When opening, draw the module in
+        // place and swing the two fairing halves out along local +/-X.
+        if self.fairing_open > 0.01 {
+            let off = self.fairing_open * 4.0;
+            self.xform_into(&mut out, rb.module_range.clone(), quat, base_local);
+            self.xform_into_off(&mut out, rb.fairing_l.clone(), quat, base_local, Vec3::new(-off, 0.0, 0.0));
+            self.xform_into_off(&mut out, rb.fairing_r.clone(), quat, base_local, Vec3::new(off, 0.0, 0.0));
+        } else {
+            self.xform_into(&mut out, rb.payload_range.clone(), quat, base_local);
+        }
         for r in rb.stage_ranges.iter().skip(active) {
             self.xform_into(&mut out, r.clone(), quat, base_local);
         }
@@ -3294,6 +3324,49 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.rocket_focus_y = 3.0;
             0.0
         }
+        "cargo" => {
+            // a rocket on the pad with the fairing clamshell open, revealing the
+            // refinery cargo module packed inside.
+            world.vab.payload = 5; // Refinery Module
+            world.rebuild_vehicle();
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.fairing_open = 0.55; // clamshell cracked open
+            let top = world.rocket_body.height;
+            world.rocket_az = 5.05;
+            world.rocket_el = 0.05;
+            world.rocket_focus_y = top - 7.5;
+            world.rocket_dist = 15.0;
+            0.0
+        }
+        "cargoparts" => {
+            // the fairing-packed module catalog, unpacked in a row on the moon.
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.lunar = true;
+            world.base_mesh = Some(rocket::cargo_catalog());
+            world.rocket_az = 4.71;
+            world.rocket_el = 0.14;
+            world.rocket_dist = 26.0;
+            world.rocket_focus_y = 2.6;
+            0.0
+        }
+        "delivery" => {
+            // a delivered cargo module standing on the lunar surface, ready to be
+            // unfolded and assembled on site.
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.lunar = true;
+            world.base_mesh = Some(rocket::cargo_module(0)); // refinery
+            world.rocket_az = 5.4;
+            world.rocket_el = 0.12;
+            world.rocket_dist = 15.0;
+            world.rocket_focus_y = 2.6;
+            0.0
+        }
         "moonbase" => {
             // an assembled moon base on the cratered surface: HQ, mining,
             // reactor, lunar VAB, printer, tourist dome, spaceport, hotel and
@@ -3303,6 +3376,7 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.rollout = 1.0;
             world.lunar = true;
             world.base_mesh = Some(rocket::moon_base());
+            world.base_panel = true;
             world.rocket_az = 5.5;
             world.rocket_el = 0.42; // look down over the colony
             world.rocket_dist = 165.0;
@@ -3317,6 +3391,7 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.rollout = 1.0;
             world.lunar = true;
             world.base_mesh = Some(rocket::moon_base());
+            world.base_panel = true;
             world.rocket_az = 4.71;
             world.rocket_el = 0.12;
             world.rocket_dist = 62.0;
@@ -3330,6 +3405,7 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.rollout = 1.0;
             world.lunar = true;
             world.base_mesh = Some(rocket::base_catalog());
+            world.base_panel = true;
             world.rocket_az = 4.45; // 3/4 view along the row
             world.rocket_el = 0.20;
             world.rocket_dist = 150.0;
@@ -3854,6 +3930,12 @@ fn main() {
                 "botland"
             } else if args.iter().any(|a| a == "rcsdemo") {
                 "rcsdemo"
+            } else if args.iter().any(|a| a == "cargoparts") {
+                "cargoparts"
+            } else if args.iter().any(|a| a == "cargo") {
+                "cargo"
+            } else if args.iter().any(|a| a == "delivery") {
+                "delivery"
             } else if args.iter().any(|a| a == "moonbase") {
                 "moonbase"
             } else if args.iter().any(|a| a == "basetour") {
@@ -3917,6 +3999,9 @@ fn main() {
                 "m6_landed" => "out/m6_landed.png",
                 "botland" => "out/botland.png",
                 "rcsdemo" => "out/rcsdemo.png",
+                "cargo" => "out/cargo.png",
+                "cargoparts" => "out/cargoparts.png",
+                "delivery" => "out/delivery.png",
                 "moonbase" => "out/moonbase.png",
                 "basetour" => "out/basetour.png",
                 "baseparts" => "out/baseparts.png",
