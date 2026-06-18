@@ -707,34 +707,45 @@ fn asteroid_color(dir: Vec3, disp: f32, n: Vec3) -> [f32; 3] {
 /// scale) and roughened by `seed`. `craters` impact basins are gouged in.
 pub fn asteroid(seed: f32, radius: f32, elong: Vec3, craters: usize) -> Mesh {
     let off = Vec3::splat(seed * 13.7 + 4.0);
+    // Craters with a power-law size mix (many small, a few large basins).
     let crat: Vec<(Vec3, f32, f32)> = (0..craters)
         .map(|k| {
             let dir = sphere_rand(seed + 7.0, k);
             let a = hash31(Vec3::new(seed, k as f32, 3.0));
             let b = hash31(Vec3::new(seed, k as f32, 5.0));
-            (dir, 0.20 + 0.55 * a, 0.10 + 0.16 * b)
+            let cr = 0.05 + 0.5 * a.powf(2.5); // angular radius, biased small
+            let depth = (0.16 + 0.12 * b) * (0.5 + cr); // bigger craters dig deeper
+            (dir, cr, depth)
         })
         .collect();
 
     let displace = |dir: Vec3| -> f32 {
+        // Keep the base body fairly round (modest lumps) so the craters read as
+        // the dominant relief rather than getting lost in noise.
         let lump = fbm3(dir * 2.0 + off, 5);
-        let fine = fbm3(dir * 6.5 + off, 3);
-        let mut h = 1.0 + 0.30 * lump + 0.08 * fine;
+        let fine = fbm3(dir * 7.0 + off, 4);
+        let mut h = 1.0 + 0.13 * lump + 0.035 * fine;
         for &(c, cr, depth) in &crat {
             let ang = (1.0 - dir.dot(c).clamp(-1.0, 1.0)).max(0.0); // 0 at centre
-            let t = (ang / cr).min(1.0);
-            let bowl = 1.0 - t;
-            let bowl = bowl * bowl * (3.0 - 2.0 * bowl); // smooth bowl
-            h -= depth * bowl;
+            let s = ang / cr; // 0 centre, 1 rim
+            if s < 1.5 {
+                // depressed parabolic floor that rises to the rim ...
+                if s < 1.0 {
+                    h -= depth * (1.0 - s * s);
+                }
+                // ... plus a sharp raised rim ring + a little ejecta outside it
+                let rim = 0.45 * depth * (-(((s - 1.0) / 0.18).powi(2))).exp();
+                h += rim;
+            }
         }
-        h.max(0.45)
+        h.max(0.42)
     };
     let surf = |dir: Vec3| -> Vec3 {
         let d = displace(dir);
         Vec3::new(dir.x * elong.x, dir.y * elong.y, dir.z * elong.z) * (radius * d)
     };
 
-    let n = 44usize;
+    let n = 60usize; // resolves the small craters (~125k verts, under DYN cap)
     let mut m = Mesh::default();
     for face in 0..6 {
         let mut pos = vec![Vec3::ZERO; n * n];
@@ -792,10 +803,10 @@ pub fn asteroid(seed: f32, radius: f32, elong: Vec3, craters: usize) -> Mesh {
 /// A few named large asteroids with distinct silhouettes.
 pub fn asteroid_preset(idx: usize) -> Mesh {
     match idx {
-        0 => asteroid(2.0, 520.0, Vec3::new(1.04, 0.96, 1.0), 6), // near-spherical
-        1 => asteroid(8.0, 470.0, Vec3::new(1.12, 0.84, 1.05), 9), // squat, cratered
-        2 => asteroid(15.0, 360.0, Vec3::new(1.7, 0.78, 0.86), 5), // elongated peanut
-        _ => asteroid(23.0, 430.0, Vec3::new(1.55, 0.82, 0.95), 7), // long shard
+        0 => asteroid(2.0, 520.0, Vec3::new(1.04, 0.96, 1.0), 20), // near-spherical
+        1 => asteroid(8.0, 470.0, Vec3::new(1.12, 0.84, 1.05), 30), // squat, cratered
+        2 => asteroid(15.0, 360.0, Vec3::new(1.7, 0.78, 0.86), 16), // elongated peanut
+        _ => asteroid(23.0, 430.0, Vec3::new(1.55, 0.82, 0.95), 22), // long shard
     }
 }
 

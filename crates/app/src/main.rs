@@ -3440,6 +3440,22 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.rocket_focus_y = 0.0;
             0.0
         }
+        "ast_craters" => {
+            // a closer look down over the heavily-cratered surface so the
+            // rimmed impact craters of many sizes read clearly.
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.lunar = true;
+            world.space = true;
+            world.base_mesh = Some(rocket::asteroid_preset(1)); // most cratered
+            world.space_label = rocket::ASTEROID_NAMES[1];
+            world.rocket_az = 0.45;
+            world.rocket_el = 0.32;
+            world.rocket_dist = 1080.0;
+            world.rocket_focus_y = 0.0;
+            0.0
+        }
         "ast_surf" => {
             // down near the surface of a large asteroid: rubble horizon + space.
             world.view = View::Rocket;
@@ -4038,6 +4054,8 @@ fn main() {
                 "ast_orbit3"
             } else if args.iter().any(|a| a == "ast_orbit") {
                 "ast_orbit"
+            } else if args.iter().any(|a| a == "ast_craters") {
+                "ast_craters"
             } else if args.iter().any(|a| a == "ast_surf2") {
                 "ast_surf2"
             } else if args.iter().any(|a| a == "ast_surf") {
@@ -4116,6 +4134,7 @@ fn main() {
                 "ast_orbit3" => "out/ast_orbit3.png",
                 "ast_surf" => "out/ast_surf.png",
                 "ast_surf2" => "out/ast_surf2.png",
+                "ast_craters" => "out/ast_craters.png",
                 "cargo" => "out/cargo.png",
                 "cargoparts" => "out/cargoparts.png",
                 "delivery" => "out/delivery.png",
