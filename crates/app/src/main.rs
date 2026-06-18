@@ -133,8 +133,9 @@ const OVERLAY_CAP: u64 = 8192;
 const HUD_CAP: u64 = 40000;
 /// Thruster-FX billboards (flame + smoke particles).
 const FX_CAP: u64 = 60000;
-/// Dynamic rocket-view geometry (pad + rocket + spent booster).
-const DYN_MESH_CAP: u64 = 40000;
+/// Dynamic rocket-view geometry (pad + rocket + spent booster, or a surface
+/// mesh: moon base / cargo module / a full procedural asteroid ~66k verts).
+const DYN_MESH_CAP: u64 = 200_000;
 /// Full-planet LOD terrain (rebuilt as the camera moves).
 const TERRAIN_CAP: u64 = 500_000;
 

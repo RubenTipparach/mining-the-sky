@@ -759,17 +759,22 @@ pub fn asteroid(seed: f32, radius: f32, elong: Vec3, craters: usize) -> Mesh {
                 let du = pos[j * n + ip] - pos[j * n + im];
                 let dv = pos[jp * n + i] - pos[jm * n + i];
                 let mut nn = du.cross(dv).normalize_or_zero();
-                if nn.dot(dir[j * n + i]) < 0.0 {
+                // Orient outward using the position vector from the origin. The
+                // body is star-convex (radius always > 0), so the outward normal
+                // always has a positive dot with `pos`; the sphere direction is
+                // an unreliable proxy on elongated bodies and flipped whole faces.
+                if nn.dot(pos[j * n + i]) < 0.0 {
                     nn = -nn;
                 }
                 if nn.length_squared() < 1e-6 {
-                    nn = dir[j * n + i];
+                    nn = pos[j * n + i].normalize_or_zero();
                 }
                 nrm[j * n + i] = nn;
             }
         }
-        let col: Vec<[f32; 3]> =
-            (0..n * n).map(|k| asteroid_color(dir[k], displace(dir[k]), nrm[k])).collect();
+        let col: Vec<[f32; 3]> = (0..n * n)
+            .map(|k| asteroid_color(pos[k].normalize_or_zero(), displace(dir[k]), nrm[k]))
+            .collect();
         for j in 0..n - 1 {
             for i in 0..n - 1 {
                 let a = j * n + i;
