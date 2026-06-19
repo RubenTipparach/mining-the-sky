@@ -5025,6 +5025,109 @@ fn render_shot(
     println!("wrote {path} ({width}x{height})");
 }
 
+/// Render a horizontal "filmstrip" animation of a rocket-view scenario: render
+/// `frames` frames at `fw`x`fh`, advancing the sim by `dt` between each (so the
+/// vehicle falls and the volumetric FX boil), and tile them left-to-right into a
+/// single PNG. No GIF dependency needed.
+#[cfg(not(target_arch = "wasm32"))]
+fn render_anim(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    gpu: &Gpu,
+    scenario: &str,
+    path: &str,
+    fw: u32,
+    fh: u32,
+    frames: u32,
+    dt: f32,
+) {
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let (mut world, _time) = setup_world(scenario, fw, fh);
+
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("anim-target"),
+        size: wgpu::Extent3d { width: fw, height: fh, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+    let depth = create_depth(device, fw, fh);
+
+    let unpadded = fw * 4;
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded = unpadded.div_ceil(align) * align;
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("anim-readback"),
+        size: (padded * fh) as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let mut strip = image::RgbaImage::new(fw * frames, fh);
+    for f in 0..frames {
+        let anim = world.anim;
+        let (n, hn, dyn_n, fx_n, plasma_on, plume_on) =
+            gpu.prepare(queue, &mut world, fw, fh, anim);
+        let terrain_n = world.terrain_count;
+        let mut enc =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("anim-enc") });
+        {
+            let mut pass = mesh_pass(&mut enc, &target_view, &depth);
+            gpu.draw_sky(&mut pass);
+            gpu.draw_meshes(&mut pass, terrain_n, dyn_n);
+            gpu.draw_plume(&mut pass, plume_on);
+            gpu.draw_plasma(&mut pass, plasma_on);
+            gpu.draw_fx(&mut pass, fx_n);
+        }
+        {
+            let mut pass = overlay_pass(&mut enc, &target_view);
+            gpu.draw_overlay(&mut pass, n, hn);
+        }
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(fh),
+                },
+            },
+            wgpu::Extent3d { width: fw, height: fh, depth_or_array_layers: 1 },
+        );
+        queue.submit(Some(enc.finish()));
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |r| r.expect("map"));
+        device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        {
+            let data = slice.get_mapped_range();
+            for row in 0..fh {
+                let start = (row * padded) as usize;
+                for col in 0..fw {
+                    let i = start + (col * 4) as usize;
+                    strip.put_pixel(f * fw + col, row, image::Rgba([data[i], data[i + 1], data[i + 2], 255]));
+                }
+            }
+        }
+        readback.unmap();
+        world.advance(dt); // fall + boil for the next frame
+    }
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    strip.save(path).expect("write png");
+    println!("wrote {path} ({}x{fh}, {frames} frames)", fw * frames);
+}
+
 // ---------------------------------------------------------------------------
 // winit app + entry point.
 // ---------------------------------------------------------------------------
@@ -5368,6 +5471,27 @@ fn main() {
             std::fs::write(path, &md).expect("write catalog");
             println!("{md}");
             println!("wrote {path}");
+            return;
+        }
+        // `anim <scenario> [out.png]`: a horizontal filmstrip of the scenario
+        // playing out (the rocket falling + the volumetric FX boiling).
+        if args.iter().any(|a| a == "anim") {
+            env_logger::init();
+            let scenario = args
+                .iter()
+                .position(|a| a == "anim")
+                .and_then(|i| args.get(i + 1))
+                .filter(|a| !a.ends_with(".png"))
+                .cloned()
+                .unwrap_or_else(|| "reentry".to_string());
+            let path = args
+                .iter()
+                .find(|a| a.ends_with(".png"))
+                .cloned()
+                .unwrap_or_else(|| format!("out/{scenario}_anim.png"));
+            let (device, queue) = make_shot_device();
+            let gpu = Gpu::new(&device, &queue, wgpu::TextureFormat::Rgba8UnormSrgb);
+            render_anim(&device, &queue, &gpu, &scenario, &path, 420, 320, 6, 0.12);
             return;
         }
         if args.iter().any(|a| a == "shot" || a == "--shot") {
