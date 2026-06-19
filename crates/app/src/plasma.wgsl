@@ -1,20 +1,24 @@
-// Volumetric re-entry plasma. The fireball volume is raymarched in a local frame
-// anchored at the rocket (+Y = downwind / airflow direction) and composited
-// premultiplied-over on top of the scene, so the vehicle glows inside a real
-// boiling shock layer rather than behind flat billboards.
+// Volumetric re-entry plasma driven by the vehicle SDF. The whole vehicle is a
+// union of round-cone SDF primitives (one or more per part); this pass raymarches
+// the shock layer that hugs the windward surfaces of that real geometry plus a
+// downwind wake, in camera-relative scene space (metres), composited
+// premultiplied-over on top of the scene.
 //
-// The volume density, turbulence and colour grade are adapted from nimitz's
-// "Re-entry" (Shadertoy 4dGyRh), License CC BY-NC-SA 3.0 - attribution retained.
+// Density turbulence + colour grade adapted from nimitz's "Re-entry"
+// (Shadertoy 4dGyRh), License CC BY-NC-SA 3.0 - attribution retained.
+
+const MAX_PRIMS: u32 = 24u;
 
 struct P {
-    right: vec4<f32>,   // camera basis (camera-relative scene space)
+    right: vec4<f32>,
     up: vec4<f32>,
     fwd: vec4<f32>,
-    eye: vec4<f32>,     // camera position (same space)
-    center: vec4<f32>,  // plasma centre; w = metres per plasma unit (scale)
-    axis: vec4<f32>,    // +Y plasma axis = downwind (airflow) direction
-    side: vec4<f32>,    // +X plasma axis (perpendicular)
+    eye: vec4<f32>,
+    center: vec4<f32>,  // xyz vehicle centre, w = bounding radius
+    flow: vec4<f32>,    // xyz airflow/velocity dir (unit), w = vehicle radius
     params: vec4<f32>,  // x = tan(fov/2), y = aspect, z = time, w = heat
+    nprims: vec4<f32>,  // x = primitive count
+    prims: array<vec4<f32>, 48>, // MAX_PRIMS*2: [a.xyz,r1] then [b.xyz,r2]
 };
 @group(0) @binding(0) var<uniform> u: P;
 
@@ -59,32 +63,48 @@ fn tnoise(pin: vec3<f32>, spd: f32, t: f32) -> f32 {
     return rz;
 }
 
-// Comet-style plasma density. The local frame has +Y = downwind (the trail
-// direction), so the bright head sits at the windward leading face (s ~ 0) and
-// a long boiling tail streams up +Y, fading out as it cools. `s` is the
-// distance downwind from the head; the tail widens and thins downstream.
-fn map_vol(pin: vec3<f32>, spd: f32, t: f32) -> f32 {
-    var p = pin;
-    let s = p.y;                 // 0 at the windward head, grows up the tail
-    let rad = length(p.xz);
-    // axial profile: rises sharply at the head, exponential cooling up the tail
-    let axial = smoothstep(-0.9, 0.15, s) * exp(-max(s, 0.0) * 0.42);
-    // the tail spreads a little downstream
-    let width = 0.38 + max(s, 0.0) * 0.16;
-    let radialf = smoothstep(width, 0.0, rad);
-    let f = axial * radialf;
-    var q = p;
-    q.y = q.y * 0.5 + t * 5.0;   // scroll the boil up the tail
-    var d = tnoise(q * vec3<f32>(0.5, 0.32, 0.5), spd * 0.7, t) * 1.6 + 0.02;
-    d = d * f;
-    return clamp(d, 0.0, 1.0);
+// Round-cone SDF between a (radius r1) and b (radius r2). (iq, MIT.)
+fn sd_round_cone(p: vec3<f32>, a: vec3<f32>, b: vec3<f32>, r1: f32, r2: f32) -> f32 {
+    let ba = b - a;
+    let l2 = dot(ba, ba);
+    let rr = r1 - r2;
+    let a2 = l2 - rr * rr;
+    let il2 = 1.0 / l2;
+    let pa = p - a;
+    let y = dot(pa, ba);
+    let z = y - l2;
+    let d2v = pa * l2 - ba * y;
+    let x2 = dot(d2v, d2v);
+    let y2 = y * y * l2;
+    let z2 = z * z * l2;
+    let k = sign(rr) * rr * rr * x2;
+    if (sign(z) * a2 * z2 > k) {
+        return sqrt(x2 + z2) * il2 - r2;
+    }
+    if (sign(y) * a2 * y2 < k) {
+        return sqrt(x2 + y2) * il2 - r1;
+    }
+    return (sqrt(x2 * a2 * il2) + y * rr) * il2 - r1;
 }
 
-// Ray/sphere interval (near, far) around the origin; far < 0 means a miss.
-fn sphere_iv(ro: vec3<f32>, rd: vec3<f32>, r: f32) -> vec2<f32> {
-    let b = dot(ro, rd);
-    let c = dot(ro, ro) - r * r;
-    let h = b * b - c;
+// Signed distance to the whole vehicle (union of the round-cone primitives).
+fn vehicle_sdf(p: vec3<f32>) -> f32 {
+    var d = 1.0e9;
+    let n = i32(u.nprims.x);
+    for (var i = 0; i < n; i = i + 1) {
+        let pa = u.prims[i * 2];
+        let pb = u.prims[i * 2 + 1];
+        d = min(d, sd_round_cone(p, pa.xyz, pb.xyz, pa.w, pb.w));
+    }
+    return d;
+}
+
+// Ray/sphere interval (near, far) around a centre; far < 0 means a miss.
+fn sphere_iv(ro: vec3<f32>, rd: vec3<f32>, c: vec3<f32>, r: f32) -> vec2<f32> {
+    let oc = ro - c;
+    let b = dot(oc, rd);
+    let cc = dot(oc, oc) - r * r;
+    let h = b * b - cc;
     if (h < 0.0) {
         return vec2<f32>(-1.0, -1.0);
     }
@@ -96,48 +116,66 @@ fn sphere_iv(ro: vec3<f32>, rd: vec3<f32>, r: f32) -> vec2<f32> {
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let t = u.params.z;
     let heat = clamp(u.params.w, 0.0, 1.4);
+    let center = u.center.xyz;
+    let bound = u.center.w;
+    let vhat = normalize(u.flow.xyz);   // airflow / velocity direction
+    let vrad = max(u.flow.w, 1.0);      // vehicle radius scale
 
-    // per-pixel camera ray, then into the plasma's local frame
     let rd = normalize(u.fwd.xyz
         + u.right.xyz * (in.uv.x * u.params.x * u.params.y)
         + u.up.xyz * (in.uv.y * u.params.x));
-    let yax = u.axis.xyz;
-    let xax = u.side.xyz;
-    let zax = cross(xax, yax);
-    let scl = u.center.w;
-    let o = u.eye.xyz - u.center.xyz;
-    let op = vec3<f32>(dot(o, xax), dot(o, yax), dot(o, zax)) / scl;
-    let dp = vec3<f32>(dot(rd, xax), dot(rd, yax), dot(rd, zax)); // unit (orthonormal basis)
+    let ro = u.eye.xyz;
 
-    let RB = 5.5;
-    let iv = sphere_iv(op, dp, RB);
+    let iv = sphere_iv(ro, rd, center, bound);
     if (iv.y < 0.0) {
         return vec4<f32>(0.0);
     }
+
+    let shell = vrad * 0.95;            // shock-layer thickness off the surface
     var tt = max(iv.x, 0.0);
     let tmax = iv.y;
     var rz = vec4<f32>(0.0);
-    for (var i = 0; i < 64; i = i + 1) {
+    let step = bound / 40.0;
+    for (var i = 0; i < 80; i = i + 1) {
         if (rz.a > 0.99 || tt > tmax) {
             break;
         }
-        let pos = op + dp * tt;
-        let r = map_vol(pos, 0.1, t);
-        // windward (-y) density gradient -> a cool blue-white compression front
-        // on the leading face the air hits.
-        let gr = clamp((r - map_vol(pos - vec3<f32>(0.0, 0.7, 0.0), 0.1, t)) / 0.3, 0.0, 1.0);
-        // cooling along the tail: white-hot/orange head -> deep red, fading out.
-        let cool = clamp(max(pos.y, 0.0) * 0.22, 0.0, 1.0);
-        var lg = mix(vec3<f32>(1.0, 0.58, 0.18), vec3<f32>(0.58, 0.11, 0.04), cool);
-        lg = lg + 1.5 * vec3<f32>(0.55, 0.77, 0.95) * gr * (1.0 - cool); // blue-white front at the head
-        // translucent gas: thin per-step opacity, a touch denser at the hot head
-        let dens = r * r * r * (1.5 + 1.2 * (1.0 - cool));
-        var col = vec4<f32>(lg, dens);
-        col = vec4<f32>(col.rgb * col.a, col.a);
-        rz = rz + col * (1.0 - rz.a);
-        tt = tt + 0.16;
+        let pos = ro + rd * tt;
+        let dv = vehicle_sdf(pos);
+        let rel = pos - center;
+        let along = dot(rel, vhat);              // + = windward (leading) side
+        let perp = length(rel - vhat * along);
+
+        // shock layer hugging the windward surfaces (a band just outside, killed
+        // inside the body so it doesn't paint over the leeward hull).
+        let band = smoothstep(shell, 0.0, dv) * smoothstep(-shell * 0.4, 0.15, dv);
+        let windward = smoothstep(-0.10 * bound, 0.34 * bound, along);
+        let sheath = band * windward;
+
+        // downwind wake: a translucent tail streaming behind, fading as it cools.
+        let s = -along;                          // downwind distance from centre
+        let wake = smoothstep(0.0, 0.12 * bound, s)
+            * exp(-max(s, 0.0) / (0.42 * bound))
+            * smoothstep(vrad * 4.0, 0.0, perp);
+
+        let f = max(sheath, wake * 0.65);
+        if (f > 0.001) {
+            // boiling turbulence (sampled in vehicle radii)
+            let q = pos / vrad - vhat * (t * 3.0);
+            let tb = tnoise(q * 0.6, 0.1, t);
+            let dens = clamp(f * (0.3 + 1.5 * tb), 0.0, 1.0);
+            // windward density gradient -> cool blue-white compression front
+            let gr = clamp((dv - vehicle_sdf(pos - vhat * shell * 0.6)) / shell, 0.0, 1.0);
+            // cooling along the wake: white-hot/orange head -> deep red, fading
+            let cool = clamp(max(s, 0.0) / (0.5 * bound), 0.0, 1.0);
+            var lg = mix(vec3<f32>(1.0, 0.6, 0.2), vec3<f32>(0.55, 0.1, 0.04), cool);
+            lg = lg + 1.5 * vec3<f32>(0.55, 0.77, 0.95) * gr * (1.0 - cool);
+            var col = vec4<f32>(lg, dens * dens * 1.25);
+            col = vec4<f32>(col.rgb * col.a, col.a);
+            rz = rz + col * (1.0 - rz.a);
+        }
+        tt = tt + step;
     }
-    // scale by heat and keep it translucent overall (alpha capped).
     rz = rz * heat;
     rz.a = min(rz.a, 0.72);
     return clamp(rz, vec4<f32>(0.0), vec4<f32>(1.0));

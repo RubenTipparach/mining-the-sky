@@ -228,8 +228,12 @@ struct SkyUniforms {
     params: [f32; 4],
 }
 
+/// Max SDF primitives (round cones) describing the vehicle for the plasma pass.
+const MAX_PLASMA_PRIMS: usize = 24;
+
 /// Uniforms for the volumetric re-entry plasma pass (camera-relative scene
-/// space): the camera basis + a local frame anchored at the rocket.
+/// space, metres): the camera basis plus the vehicle's SDF (a union of round
+/// cones) and the airflow, so the shock wraps the real built geometry.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct PlasmaUniforms {
@@ -237,14 +241,16 @@ struct PlasmaUniforms {
     up: [f32; 4],
     fwd: [f32; 4],
     eye: [f32; 4],
-    /// xyz = plasma centre (camera-relative), w = metres per plasma unit.
+    /// xyz = vehicle centre (camera-relative), w = bounding radius to march.
     center: [f32; 4],
-    /// +Y plasma axis (downwind/airflow direction).
-    axis: [f32; 4],
-    /// +X plasma axis (perpendicular).
-    side: [f32; 4],
+    /// xyz = airflow / velocity direction (unit), w = vehicle radius scale.
+    flow: [f32; 4],
     /// x = tan(fov/2), y = aspect, z = time, w = heat (0..~1.3).
     params: [f32; 4],
+    /// x = primitive count.
+    nprims: [f32; 4],
+    /// Per primitive: [a.xyz, r1] then [b.xyz, r2], camera-relative.
+    prims: [[f32; 4]; MAX_PLASMA_PRIMS * 2],
 }
 
 /// Far plane for the rocket-view log-depth buffer (m): beyond planet diameter.
@@ -979,31 +985,54 @@ impl World {
     fn plasma_uniforms(&self, res: [f32; 2]) -> PlasmaUniforms {
         let aspect = res[0] / res[1].max(1.0);
         let (eye, _t, right, up, fwd, tan) = self.rocket_camera(aspect);
-        let (axis, side, center, scale) = match self.launch.as_ref() {
+        let mut prims = [[0.0f32; 4]; MAX_PLASMA_PRIMS * 2];
+        let mut np = 0usize;
+        let (center, bound, flow, vrad) = match self.launch.as_ref() {
             Some(rk) => {
-                let vdir = self.dir_to_local(rk.v.normalize_or_zero());
-                let body_axis = self.dir_to_local(rk.point_dir());
-                let downwind = if vdir.length_squared() > 1e-6 { -vdir } else { -body_axis };
-                let pick = if downwind.y.abs() < 0.9 { Vec3::Y } else { Vec3::X };
-                let x = downwind.cross(pick).normalize_or_zero();
-                let _ = body_axis;
+                // Pose the model-space SDF primitives into camera-relative space
+                // (same transform as the drawn mesh) for the attached geometry.
+                let base = self.to_local_d(rk.r);
+                let quat = Quat::from_rotation_arc(Vec3::Y, self.dir_to_local(rk.point_dir()));
+                {
+                    let mut push = |am: [f32; 3], r1: f32, bm: [f32; 3], r2: f32| {
+                        if np >= MAX_PLASMA_PRIMS {
+                            return;
+                        }
+                        let a = self.rel(base + (quat * Vec3::from(am)).as_dvec3());
+                        let b = self.rel(base + (quat * Vec3::from(bm)).as_dvec3());
+                        prims[np * 2] = [a.x, a.y, a.z, r1];
+                        prims[np * 2 + 1] = [b.x, b.y, b.z, r2];
+                        np += 1;
+                    };
+                    for (si, pr) in &self.rocket_body.sdf_stage {
+                        if *si >= rk.stage_base {
+                            push(pr.a, pr.r1, pr.b, pr.r2);
+                        }
+                    }
+                    for pr in &self.rocket_body.sdf_payload {
+                        push(pr.a, pr.r1, pr.b, pr.r2);
+                    }
+                }
                 let height = self.rocket_body.height.max(8.0);
-                // anchor the comet head at the windward leading face (just into
-                // the wind); the tail streams downwind (+Y) past the body.
-                let head = self.to_local_d(rk.r) + vdir.as_dvec3() * (height as f64 * 0.06);
-                (downwind, x, self.rel(head), height * 0.30)
+                let center = self.rel(base + (quat * Vec3::new(0.0, height * 0.45, 0.0)).as_dvec3());
+                let vrad = self.rocket_body.engine_r.first().copied().unwrap_or(2.0).max(2.5);
+                let vdir = self.dir_to_local(rk.v.normalize_or_zero());
+                let flow = if vdir.length_squared() > 1e-6 { vdir } else { self.dir_to_local(rk.point_dir()) };
+                let bound = height * 1.1 + 45.0; // body + downwind wake
+                (center, bound, flow, vrad)
             }
-            None => (Vec3::Y, Vec3::X, Vec3::ZERO, 20.0),
+            None => (Vec3::ZERO, 60.0, Vec3::Y, 3.0),
         };
         PlasmaUniforms {
             right: [right.x, right.y, right.z, 0.0],
             up: [up.x, up.y, up.z, 0.0],
             fwd: [fwd.x, fwd.y, fwd.z, 0.0],
             eye: [eye.x, eye.y, eye.z, 0.0],
-            center: [center.x, center.y, center.z, scale],
-            axis: [axis.x, axis.y, axis.z, 0.0],
-            side: [side.x, side.y, side.z, 0.0],
+            center: [center.x, center.y, center.z, bound],
+            flow: [flow.x, flow.y, flow.z, vrad],
             params: [tan, aspect, self.anim, self.plasma_heat()],
+            nprims: [np as f32, 0.0, 0.0, 0.0],
+            prims,
         }
     }
 

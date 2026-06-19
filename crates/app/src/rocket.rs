@@ -855,6 +855,29 @@ pub struct RocketBody {
     /// Radial-booster ring per stage: (count, ring radius). Drives the extra
     /// exhaust plumes at the strap-on nozzles while that stage burns.
     pub booster_rings: Vec<(u32, f32)>,
+    /// Per-part SDF primitives (round cones) in the model frame, tagged by the
+    /// stage they belong to (so they drop with it). Their union, plus
+    /// `sdf_payload`, is the vehicle SDF the re-entry plasma raymarches.
+    pub sdf_stage: Vec<(usize, SdfPrim)>,
+    /// Payload/nose SDF primitives (always attached).
+    pub sdf_payload: Vec<SdfPrim>,
+}
+
+/// A round-cone SDF primitive: end caps of radius `r1`/`r2` at `a`/`b` with a
+/// conical hull (covers cylinders, cones, capsules and spheres). Packed so each
+/// primitive is two vec4s (a.xyz+r1, b.xyz+r2) for the plasma shader.
+#[derive(Clone, Copy)]
+pub struct SdfPrim {
+    pub a: [f32; 3],
+    pub r1: f32,
+    pub b: [f32; 3],
+    pub r2: f32,
+}
+
+impl SdfPrim {
+    fn round_cone(a: Vec3, b: Vec3, r1: f32, r2: f32) -> Self {
+        SdfPrim { a: a.into(), r1, b: b.into(), r2 }
+    }
 }
 
 pub const PAD_TOP: f32 = 1.2;
@@ -1054,6 +1077,8 @@ pub fn rocket_body(
     let mut nozzle_y = Vec::new();
     let mut engine_r = Vec::new();
     let mut booster_rings: Vec<(u32, f32)> = Vec::new();
+    let mut sdf_stage: Vec<(usize, SdfPrim)> = Vec::new();
+    let mut sdf_payload: Vec<SdfPrim> = Vec::new();
     let mut y = 0.0f32;
     for (i, stage) in veh.stages.iter().enumerate() {
         let start = m.verts.len();
@@ -1062,6 +1087,8 @@ pub fn rocket_body(
         let vol = stage.prop as f32 / PROP_DENSITY;
         let h = (vol / (std::f32::consts::PI * r * r)).max(2.5);
         nozzle_y.push(y);
+        // stage body as an SDF round cone (cylinder), tagged to this stage.
+        sdf_stage.push((i, SdfPrim::round_cone(Vec3::new(0.0, y, 0.0), Vec3::new(0.0, y + h, 0.0), r, r)));
 
         // body + a couple of dark bands for scale
         m.frustum(0.0, 0.0, y, y + h, r, r, 24, col, false, false);
@@ -1109,6 +1136,9 @@ pub fn rocket_body(
                 for k in 0..nb {
                     let a = k as f32 / nb as f32 * std::f32::consts::TAU;
                     let (cx, cz) = (a.cos() * rr, a.sin() * rr);
+                    // strap-on body + ogive nose as SDF round cones (this stage).
+                    sdf_stage.push((i, SdfPrim::round_cone(Vec3::new(cx, y, cz), Vec3::new(cx, y + bh, cz), br, br)));
+                    sdf_stage.push((i, SdfPrim::round_cone(Vec3::new(cx, y + bh, cz), Vec3::new(cx, y + bh + br * 2.2, cz), br, 0.05)));
                     // motor body
                     m.frustum(cx, cz, y, y + bh, br, br, 12, bcol, false, false);
                     // a dark band for scale
@@ -1142,6 +1172,9 @@ pub fn rocket_body(
     let nose_h = 4.0;
     let fy1 = fy0 + cyl_h; // shoulder
     let ny = fy1 + nose_h; // nose tip
+    // payload fairing: cylinder up to the shoulder, then an ogive to the tip.
+    sdf_payload.push(SdfPrim::round_cone(Vec3::new(0.0, fy0, 0.0), Vec3::new(0.0, fy1, 0.0), pr, pr));
+    sdf_payload.push(SdfPrim::round_cone(Vec3::new(0.0, fy1, 0.0), Vec3::new(0.0, ny, 0.0), pr, 0.05));
 
     // 1) the payload itself, sitting on the upper-stage forward dome
     let mstart = m.verts.len();
@@ -1206,6 +1239,8 @@ pub fn rocket_body(
         fairing_l,
         fairing_r,
         booster_rings,
+        sdf_stage,
+        sdf_payload,
     }
 }
 
