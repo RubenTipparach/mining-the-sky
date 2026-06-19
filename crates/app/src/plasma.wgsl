@@ -135,7 +135,7 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let head = u.head.xyz;              // windward leading point (bow-shock head)
     let lv = max(u.head.w, vrad * 2.0); // vehicle length along the airflow
     let dwind = -vhat;                  // tail direction (downwind)
-    let shell = vrad * 1.1;
+    let shell = vrad * 0.85;            // how far the glow stands off the surface
 
     var tt = max(iv.x, 0.0);
     let tmax = iv.y;
@@ -146,47 +146,40 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
             break;
         }
         let pos = ro + rd * tt;
-        // comet frame anchored at the windward head: s downwind, perp off-axis.
+        let along = dot(pos - center, vhat);    // + = windward (leading) side
+
+        // White-hot bow shock: a shell hugging the vehicle SDF on the windward
+        // side, so the bright plasma wraps the actual rocket shape (not a blob).
+        var shock = 0.0;
+        if (along > -0.4 * lv) {
+            let dv = vehicle_sdf(pos);
+            let band = smoothstep(shell, 0.0, dv) * smoothstep(-shell * 0.45, 0.1, dv);
+            let windward = smoothstep(-0.20 * lv, 0.30 * lv, along);
+            shock = band * windward;
+        }
+
+        // Cooling tail: a turbulent wake streaming downwind off the head, fading.
         let hd = pos - head;
         let s = dot(hd, dwind);                 // 0 at head, + down the tail
         let perp = length(hd - dwind * s);
-        let frac = s / lv;
+        let tailR = vrad * (1.1 + 1.3 * smoothstep(0.0, lv, s));
+        let tail = smoothstep(0.0, 0.12 * lv, s)
+            * exp(-max(s, 0.0) / (lv * 1.0))
+            * smoothstep(tailR, tailR * 0.2, perp);
 
-        // enveloping teardrop: a fat rounded bright head bulb, a bulge wrapping
-        // the whole body, then a long tail tapering + fading as it cools.
-        let bulb = exp(-pow((s - lv * 0.18) / (lv * 0.42), 2.0)); // big rounded head
-        let envR = vrad * (2.0 + 1.4 * smoothstep(-0.1, 0.7, frac) + 1.6 * bulb);
-        let radial = smoothstep(envR, envR * 0.12, perp);
-        let frontCap = smoothstep(-0.9 * vrad, 0.25 * vrad, s);
-        let axialFade = exp(-max(s - lv * 1.0, 0.0) / (lv * 1.3));
-        let envelope = radial * frontCap * axialFade;
-        // a brilliant compact core right at the bow-shock head
-        let headCore = exp(-pow(s / (vrad * 1.6), 2.0)) * smoothstep(envR * 0.9, 0.0, perp);
-
-        // SDF bow shock: a brilliant thin compression layer on the windward
-        // surfaces, strongest near the head (only sampled over the body).
-        var shock = 0.0;
-        if (s < lv * 1.2) {
-            let dv = vehicle_sdf(pos);
-            let band = smoothstep(shell, 0.0, dv) * smoothstep(-shell * 0.4, 0.1, dv);
-            shock = band * smoothstep(lv * 0.85, -0.1 * lv, s);
-        }
-
-        let f = max(envelope, shock);
+        let f = max(shock, tail * 0.7);
         if (f > 0.002) {
-            // boiling turbulence streaming down the tail
             let q = pos / vrad * 0.7 + dwind * (t * 3.5);
             let tb = tnoise(q, 0.1, t);
-            let dens = clamp(f * (0.25 + 1.5 * tb), 0.0, 1.0);
+            let dens = clamp(f * (0.3 + 1.4 * tb), 0.0, 1.0);
 
-            // temperature: hottest at the head + the bow shock, cooling downwind.
-            let cool = clamp(s / (lv * 1.9), 0.0, 1.0);
-            let temp = clamp((1.0 - cool) + shock * 0.6 + headCore, 0.0, 1.0);
-            var c = mix(vec3<f32>(0.5, 0.07, 0.02), vec3<f32>(1.0, 0.42, 0.10), smoothstep(0.0, 0.45, temp));
+            // white-hot on the shock (shape), cooling orange -> red down the tail.
+            let cool = clamp(s / (lv * 1.6), 0.0, 1.0);
+            let temp = clamp(shock * 1.4 + (1.0 - cool) * tail * 0.7, 0.0, 1.0);
+            var c = mix(vec3<f32>(0.5, 0.08, 0.03), vec3<f32>(1.0, 0.42, 0.10), smoothstep(0.0, 0.45, temp));
             c = mix(c, vec3<f32>(1.0, 0.85, 0.5), smoothstep(0.45, 0.78, temp));
-            c = mix(c, vec3<f32>(1.3, 1.25, 1.18), smoothstep(0.8, 1.0, temp)); // white-hot head/shock
-            // alpha: dense + opaque at the hot head, translucent down the tail.
-            let a = clamp(dens * dens * (0.7 + 1.6 * temp) + headCore * 0.7, 0.0, 1.0);
+            c = mix(c, vec3<f32>(1.3, 1.25, 1.18), smoothstep(0.82, 1.0, temp));
+            let a = dens * dens * (0.55 + 1.3 * temp);
             var col = vec4<f32>(c, a);
             col = vec4<f32>(col.rgb * col.a, col.a);
             rz = rz + col * (1.0 - rz.a);
@@ -194,6 +187,6 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         tt = tt + step;
     }
     rz = rz * heat;
-    rz.a = min(rz.a, 0.92);
+    rz.a = min(rz.a, 0.5);              // ~50% transparent overall
     return clamp(rz, vec4<f32>(0.0), vec4<f32>(1.0));
 }
