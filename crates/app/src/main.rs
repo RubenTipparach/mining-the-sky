@@ -148,7 +148,13 @@ const TERRAIN_CAP: u64 = 500_000;
 /// The min is ~1 km so slow, low movement never thrashes the mesh; the max
 /// keeps rebuilds rare from orbit.
 const TERRAIN_GRID_MIN_M: f64 = 1_024.0;
-const TERRAIN_GRID_MAX_M: f64 = 262_144.0;
+const TERRAIN_GRID_MAX_M: f64 = 1_048_576.0;
+
+/// Altitude (m) above which the planet terrain transitions to the stable coarse
+/// cube-sphere LOD regime: rebuild cells widen super-linearly so the high
+/// altitude globe stops re-meshing on every kilometre of travel. ~50 km, where
+/// the surface no longer shows resolvable fine relief.
+const HIGH_ALT_STABLE_M: f64 = 50_000.0;
 
 /// Render-space length unit for the system view: 1000 km.
 const MM: f32 = 1.0e6;
@@ -459,6 +465,9 @@ struct World {
     terrain_dirty: bool,
     terrain_verts: Vec<rocket::MeshVertex>,
     terrain_count: u32,
+    /// LOD-debug overlay: colour the terrain by quadtree depth (toggle with `L`
+    /// in the rocket view) so the split rings are visible and tunable.
+    lod_debug: bool,
     /// Background planet-terrain mesher (double-buffered). See [`terrain_job`].
     terrain_svc: terrain_job::TerrainService,
 
@@ -572,6 +581,7 @@ impl World {
             launch_north,
             ref_local: DVec3::ZERO,
             terrain_dirty: true,
+            lod_debug: false,
             terrain_verts: Vec::new(),
             terrain_count: 0,
             terrain_svc: terrain_job::TerrainService::new(),
@@ -724,6 +734,31 @@ impl World {
             View::Map => View::Rocket,
             View::Rocket => View::Map,
         };
+    }
+
+    /// Toggle the LOD-debug terrain colouring and force an immediate rebuild so
+    /// the new colours appear without waiting for the next floating-origin snap.
+    fn toggle_lod_debug(&mut self) {
+        self.lod_debug = !self.lod_debug;
+        if self.view == View::Rocket {
+            self.rebuild_terrain();
+            self.terrain_dirty = true;
+        }
+    }
+
+    /// Live LOD-debug stats for the HUD: the active planet LOD (patch counts per
+    /// depth) selected from the current camera, plus the camera altitude (m) and
+    /// the current rebuild-grid cell size (m). Planet rocket view only.
+    pub fn lod_debug_stats(&self) -> (terrain::Lod, f64, f64) {
+        let cam_world = self.cam_world(self.ref_local);
+        let lod = rocket::planet_lod(cam_world, 19);
+        let p = self.cam_target_local();
+        let alt = (self.cam_world(p).length() - self.body.radius).max(0.0);
+        // mirror terrain_anchor_local's cell computation for display
+        let base = 0.5 * alt.max(1.0) / rocket::PLANET_SPLIT_FACTOR;
+        let raw = if alt > HIGH_ALT_STABLE_M { base * (alt / HIGH_ALT_STABLE_M) } else { base };
+        let cell = raw.clamp(TERRAIN_GRID_MIN_M, TERRAIN_GRID_MAX_M).log2().floor().exp2();
+        (lod, alt, cell)
     }
 
     /// Rocket-view camera, floating-origin: eye + look target are returned
@@ -1048,10 +1083,19 @@ impl World {
         // split_factor` across, so that is the finest patch edge near the
         // rocket. Make the rebuild threshold (the grid cell) ~half of it: lower
         // LODs (higher up) therefore get proportionally larger thresholds, and
-        // we never rebuild for sub-patch motion. `SPLIT_FACTOR` must match the
-        // value `planet_terrain` passes to `select()`.
-        const SPLIT_FACTOR: f64 = 1.5;
-        let raw = (0.5 * alt / SPLIT_FACTOR).clamp(TERRAIN_GRID_MIN_M, TERRAIN_GRID_MAX_M);
+        // we never rebuild for sub-patch motion.
+        let base = 0.5 * alt / rocket::PLANET_SPLIT_FACTOR;
+        // Above ~50 km the ground reads as a smooth globe (no fine relief is
+        // resolvable), so we transition to a stable coarse cube-sphere LOD
+        // planet: widen the rebuild cell super-linearly with altitude so the
+        // upper terrain re-meshes only at large steps instead of churning every
+        // kilometre of downrange travel. This is the "annoying rebuild" fix.
+        let raw = if alt > HIGH_ALT_STABLE_M {
+            base * (alt / HIGH_ALT_STABLE_M)
+        } else {
+            base
+        };
+        let raw = raw.clamp(TERRAIN_GRID_MIN_M, TERRAIN_GRID_MAX_M);
         // Snap the cell size itself to a power of two so it only steps at
         // altitude octaves instead of drifting continuously with altitude.
         let grid = (raw.log2().floor()).exp2();
@@ -1083,6 +1127,7 @@ impl World {
                 north: self.launch_north,
                 depth: 19,
                 lunar: self.lunar,
+                lod_debug: self.lod_debug,
             });
         }
 
@@ -1557,7 +1602,7 @@ impl World {
         // local origin, refining as the camera (camera_eye_local) approaches.
         if let Some(elev) = self.ast_elev.as_ref() {
             let cam = self.camera_eye_local();
-            let m = rocket::asteroid_terrain(cam, self.ast_radius, elev, 15);
+            let m = rocket::asteroid_terrain(cam, self.ast_radius, elev, 15, self.lod_debug);
             self.terrain_count = (m.verts.len() as u64).min(TERRAIN_CAP) as u32;
             self.terrain_verts = m.verts;
             return;
@@ -1581,6 +1626,7 @@ impl World {
             self.launch_north,
             19,
             self.lunar,
+            self.lod_debug,
         );
         self.terrain_count = (m.verts.len() as u64).min(TERRAIN_CAP) as u32;
         self.terrain_verts = m.verts;
@@ -1992,7 +2038,11 @@ impl World {
         polyline(&self.mission.pad_ring, [0.9, 0.6, 0.2], &mut out);
 
         if let Some(rk) = self.launch.as_ref() {
-            // the player launch's predicted conic (empty while still suborbital)
+            // The flown ascent path (cyan) so the live trajectory shows on the
+            // map during the sub-orbital climb, the forward conic prediction
+            // (amber) ahead of it, and the parking-orbit conic once bound.
+            polyline(&rk.trail_points(&self.body), [0.45, 0.9, 1.0], &mut out);
+            polyline(&rk.forward_arc(&self.body), [1.0, 0.62, 0.20], &mut out);
             let pred = rk.predicted_orbit(&self.body);
             polyline(&pred, [1.0, 0.7, 0.25], &mut out);
         } else if let Some(craft) = self.flight.as_ref() {
@@ -3435,6 +3485,34 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             fly(&mut world, 22.0); // pitched into the gravity turn, smoke trailing
             0.0
         }
+        "loddebug" => {
+            // On the pad with LOD-debug colouring on and the camera pulled back
+            // and up, so the cube-sphere quadtree split rings spread out from the
+            // launch site, one flat colour per depth. The floating origin is
+            // stable here (no in-flight rebuild), so the rings centre cleanly on
+            // the camera the way they do interactively.
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.rocket_az = 4.97;
+            world.rocket_el = 0.42;
+            world.rocket_dist = 4200.0;
+            world.lod_debug = true;
+            world.rebuild_terrain();
+            0.0
+        }
+        "loddebugmap" => {
+            // a launch shown on the orbital map, zoomed to the launch site: the
+            // cyan flown trail and the amber forward conic make the trajectory
+            // readable mid-ascent (before a parking orbit exists).
+            world.ignite_launch();
+            fly(&mut world, 150.0);
+            frame_map(&mut world);
+            world.sys_dist = 11.0;
+            world.sys_az = 4.7;
+            world.sys_el = 0.18;
+            6.0
+        }
         "staging" => {
             world.view = View::Rocket;
             world.rocket_az = 3.6;
@@ -4421,6 +4499,7 @@ impl ApplicationHandler<UserEvent> for App {
                         KeyCode::KeyR if state.world.view == View::Rocket => {
                             state.world.back_to_vab()
                         }
+                        KeyCode::KeyL => state.world.toggle_lod_debug(),
                         KeyCode::BracketRight => {
                             state.world.warp = (state.world.warp * 2.0).min(10000.0);
                         }
@@ -4576,6 +4655,10 @@ fn main() {
                 "rollout"
             } else if args.iter().any(|a| a == "pad") {
                 "pad"
+            } else if args.iter().any(|a| a == "loddebugmap") {
+                "loddebugmap"
+            } else if args.iter().any(|a| a == "loddebug") {
+                "loddebug"
             } else if args.iter().any(|a| a == "liftoff2") {
                 "liftoff2"
             } else if args.iter().any(|a| a == "liftoff") {
@@ -4634,6 +4717,8 @@ fn main() {
                 "pad" => "out/pad.png",
                 "liftoff" => "out/liftoff.png",
                 "liftoff2" => "out/liftoff2.png",
+                "loddebug" => "out/loddebug.png",
+                "loddebugmap" => "out/loddebugmap.png",
                 "staging" => "out/staging.png",
                 "launchmap" => "out/launchmap.png",
                 "ascent" => "out/ascent.png",

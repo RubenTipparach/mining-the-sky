@@ -31,6 +31,9 @@ pub fn build(ctx: &egui::Context, world: &mut World) {
             } else {
                 pad_panel(ctx, world); // rolled out, ready to launch
             }
+            if world.lod_debug && !world.space && world.ast_elev.is_none() {
+                lod_debug_panel(ctx, world);
+            }
         }
         View::Map => {
             body_browser(ctx, world);
@@ -496,6 +499,51 @@ fn launch_panel(ctx: &egui::Context, world: &mut World) {
     }
 }
 
+/// LOD-debug overlay (rocket view, planet only, toggled with `L`): the terrain
+/// is recoloured by quadtree depth and this panel reports the live LOD stats and
+/// a colour legend so the split rings can be read and tuned.
+fn lod_debug_panel(ctx: &egui::Context, world: &World) {
+    let (lod, alt, cell) = world.lod_debug_stats();
+    let tris = lod.triangle_count(9);
+    egui::Window::new("LOD DEBUG")
+        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 12.0))
+        .default_width(220.0)
+        .resizable(false)
+        .show(ctx, |ui| {
+            egui::Grid::new("loddbg").num_columns(2).show(ui, |ui| {
+                kv(ui, "Altitude", &fmt_dist(alt));
+                kv(ui, "Rebuild cell", &fmt_dist(cell));
+                kv(ui, "Patches", &format!("{}", lod.patches.len()));
+                kv(ui, "Max depth", &format!("{}", lod.max_depth_reached));
+                kv(ui, "Triangles", &format!("{}", tris));
+            });
+            if alt > 50_000.0 {
+                ui.label(egui::RichText::new("STABLE GLOBE (>50 km)").color(GOOD));
+            }
+            ui.separator();
+            ui.label(egui::RichText::new("Depth -> colour").color(DIM));
+            // one swatch row per depth that currently has patches
+            for (d, &count) in lod.per_depth.iter().enumerate() {
+                if count == 0 {
+                    continue;
+                }
+                let c = crate::rocket::lod_color(d as u32);
+                let col = egui::Color32::from_rgb(
+                    (c[0] * 255.0) as u8,
+                    (c[1] * 255.0) as u8,
+                    (c[2] * 255.0) as u8,
+                );
+                ui.horizontal(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                    ui.painter().rect_filled(rect, 2.0, col);
+                    ui.label(egui::RichText::new(format!("depth {d}  ({count})")).color(DIM));
+                });
+            }
+            ui.separator();
+            ui.label(egui::RichText::new("L toggles  -  colours track LOD").color(DIM));
+        });
+}
+
 /// The maneuver-node planner (map view, with a craft in flight): place a burn
 /// node on the orbit, dial prograde/normal/radial delta-v, preview the resulting
 /// orbit (drawn cyan on the map), and execute.
@@ -576,6 +624,15 @@ fn fmt_alt(km: f32) -> String {
         format!("{km:.0} km")
     } else {
         "--".to_string()
+    }
+}
+
+/// Metres rendered as km above 1 km, else metres. For the LOD-debug readouts.
+fn fmt_dist(m: f64) -> String {
+    if m >= 1000.0 {
+        format!("{:.1} km", m / 1000.0)
+    } else {
+        format!("{m:.0} m")
     }
 }
 

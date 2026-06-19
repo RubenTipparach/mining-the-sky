@@ -1172,12 +1172,24 @@ pub fn rocket_body(veh: &Vehicle, payload_col: [f32; 3], module_id: i32) -> Rock
 // ---------------------------------------------------------------------------
 
 use glam::DVec3;
-use terrain::{build_mesh, select, Elevation, Planet};
+use terrain::{build_mesh, select, Elevation, Lod, Planet};
 
 /// Spaceport (matches sim / worldgen seed 47).
 const SPACEPORT_LAT_DEG: f64 = -1.7;
 const SPACEPORT_LON_DEG: f64 = -102.9;
 pub const PLANET_RADIUS: f64 = 6.2e6;
+
+/// Quadtree split factor used for the planet terrain LOD: split a patch while
+/// the camera is within `edge * factor` of it. Shared by the mesh build and the
+/// LOD-debug stats so the HUD and the geometry always agree.
+pub const PLANET_SPLIT_FACTOR: f64 = 1.5;
+
+/// Run only the planet LOD selection (no meshing) for the debug HUD: returns the
+/// active patch set + per-depth counts for `cam_world`.
+pub fn planet_lod(cam_world: DVec3, max_depth: u32) -> Lod {
+    let planet = Planet { radius: PLANET_RADIUS };
+    select(&planet, cam_world, PLANET_SPLIT_FACTOR, max_depth)
+}
 
 /// The launch-site direction (unit), honouring the MTS_TERRAIN_LATLON override.
 fn spaceport_dir() -> DVec3 {
@@ -1245,6 +1257,26 @@ fn hashf(p: Vec3) -> f32 {
     h
 }
 
+/// LOD-debug palette: a saturated colour per quadtree depth, cycling so that
+/// adjacent LOD levels always contrast. Drawn over the terrain when LOD debug is
+/// on so the split rings (where one depth meets the next) are obvious. The same
+/// table backs the HUD legend, so the colours match.
+pub fn lod_color(depth: u32) -> [f32; 3] {
+    const PALETTE: [[f32; 3]; 10] = [
+        [0.85, 0.15, 0.15], // 0 red (coarsest visible)
+        [0.95, 0.55, 0.10], // 1 orange
+        [0.95, 0.90, 0.15], // 2 yellow
+        [0.30, 0.85, 0.25], // 3 green
+        [0.15, 0.85, 0.70], // 4 teal
+        [0.20, 0.65, 0.95], // 5 blue
+        [0.40, 0.40, 0.95], // 6 indigo
+        [0.75, 0.35, 0.95], // 7 violet
+        [0.95, 0.35, 0.75], // 8 magenta
+        [0.92, 0.92, 0.95], // 9 white (finest)
+    ];
+    PALETTE[(depth as usize) % PALETTE.len()]
+}
+
 fn terrain_color(signed_h: f64, slope: f32, jitter: f32, abs_lat: f64, lunar: bool) -> [f32; 3] {
     if lunar {
         // dark grey regolith (low albedo, so the relief from lighting reads
@@ -1301,6 +1333,7 @@ pub fn planet_terrain(
     north: DVec3,
     max_depth: u32,
     lunar: bool,
+    lod_debug: bool,
 ) -> Mesh {
     let planet = Planet { radius: PLANET_RADIUS };
     let elev = if lunar { lunar_elevation() } else { launch_elevation() };
@@ -1312,7 +1345,7 @@ pub fn planet_terrain(
         Vec3::new(d.dot(east) as f32, d.dot(up) as f32, d.dot(north) as f32)
     };
 
-    let lod = select(&planet, cam_world, 1.5, max_depth);
+    let lod = select(&planet, cam_world, PLANET_SPLIT_FACTOR, max_depth);
     let mut m = Mesh::default();
     let n = 9;
     let grid = n * n; // first `grid` positions are the surface; the rest are skirts
@@ -1362,8 +1395,12 @@ pub fn planet_terrain(
 
         // Per-vertex colour (height/slope/lat), with a small position-hashed
         // jitter that now interpolates smoothly instead of per-triangle.
+        let dbg = lod_debug.then(|| lod_color(patch.depth));
         let col: Vec<[f32; 3]> = (0..nv)
             .map(|i| {
+                if let Some(c) = dbg {
+                    return c; // flat per-depth colour; the surface normal still shades it
+                }
                 let cdir = pm.positions[i].normalize();
                 let slope = (1.0 - nrm[i].dot(radial[i])).clamp(0.0, 1.0);
                 let abs_lat = cdir.y.clamp(-1.0, 1.0).asin().abs();
@@ -1388,7 +1425,13 @@ pub fn planet_terrain(
 /// position in the asteroid frame; `radius` is the base sphere radius and the
 /// `elev` asteroid field adds the lobes/craters on top. Returns local-space
 /// vertices (the body sits at the origin, so no floating-origin offset).
-pub fn asteroid_terrain(cam_local: DVec3, radius: f64, elev: &Elevation, max_depth: u32) -> Mesh {
+pub fn asteroid_terrain(
+    cam_local: DVec3,
+    radius: f64,
+    elev: &Elevation,
+    max_depth: u32,
+    lod_debug: bool,
+) -> Mesh {
     let planet = Planet { radius };
     let amp = (radius * 0.34) as f32; // colour scale (matches the field amplitude)
     let lod = select(&planet, cam_local, 1.6, max_depth);
@@ -1425,8 +1468,12 @@ pub fn asteroid_terrain(cam_local: DVec3, radius: f64, elev: &Elevation, max_dep
         let local: Vec<Vec3> = pm.positions.iter().map(|&w| w.as_vec3()).collect();
         let radial: Vec<Vec3> = pm.positions.iter().map(|&w| w.normalize_or_zero().as_vec3()).collect();
         let nrm: Vec<Vec3> = pm.positions.iter().map(|&w| normal_at(w.normalize(), eps)).collect();
+        let dbg = lod_debug.then(|| lod_color(patch.depth));
         let col: Vec<[f32; 3]> = (0..nv)
             .map(|i| {
+                if let Some(c) = dbg {
+                    return c;
+                }
                 let h_frac = ((local[i].length() - radius as f32) / amp).clamp(0.0, 1.0);
                 let base = mix3([0.17, 0.14, 0.12], [0.40, 0.36, 0.31], h_frac);
                 let slope = (1.0 - nrm[i].dot(radial[i])).clamp(0.0, 1.0);

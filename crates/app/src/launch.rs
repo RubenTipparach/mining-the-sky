@@ -64,6 +64,10 @@ pub struct Rocket {
     /// Index of the active stage within the original stack (0 = first booster).
     pub stage_base: usize,
     pub stage_total: usize,
+    /// Flown ascent path (home-centred world metres), sampled as the rocket
+    /// climbs. Drawn on the orbital map so the trajectory is visible during the
+    /// sub-orbital ascent, before a predicted conic exists.
+    pub trail: Vec<DVec3>,
 }
 
 impl Rocket {
@@ -100,6 +104,7 @@ impl Rocket {
             just_staged: None,
             stage_base: 0,
             stage_total: veh.stages.len(),
+            trail: vec![r],
         }
     }
 
@@ -227,6 +232,16 @@ impl Rocket {
                 self.orbit_reached = true;
             }
         }
+
+        // Record the flown path for the map, sampling only when the rocket has
+        // moved a visible fraction of a body radius so the trail stays cheap.
+        let step = body.radius * 0.0015; // ~9 km on the home world
+        if self.trail.last().map(|&p| (p - self.r).length() > step).unwrap_or(true) {
+            self.trail.push(self.r);
+            if self.trail.len() > 2048 {
+                self.trail.remove(0);
+            }
+        }
     }
 
     pub fn altitude(&self, body: &CentralBody) -> f64 {
@@ -301,6 +316,52 @@ impl Rocket {
                 Vec3::new(pos.x as f32, pos.y as f32, pos.z as f32)
             })
             .collect()
+    }
+
+    /// The flown ascent path as home-centred unit-sphere points (magnitude
+    /// encodes altitude), ending at the current position. Used to draw the
+    /// rocket's trajectory on the orbital map during the sub-orbital climb.
+    pub fn trail_points(&self, body: &CentralBody) -> Vec<Vec3> {
+        self.trail
+            .iter()
+            .chain(std::iter::once(&self.r))
+            .map(|&p| (p / body.radius).as_vec3())
+            .collect()
+    }
+
+    /// Forward conic arc from the current state as unit-sphere points: continues
+    /// the bound trajectory ahead of the rocket, stopping where a sub-orbital arc
+    /// would re-enter the surface. Gives a visible predicted path on the map even
+    /// before a parking orbit is reached. Empty for hyperbolic/degenerate states.
+    pub fn forward_arc(&self, body: &CentralBody) -> Vec<Vec3> {
+        let orb = orbit_from_state(self.r, self.v, body.mu);
+        if orb.e >= 1.0 || orb.a <= 0.0 {
+            return Vec::new();
+        }
+        let w = orb.h_vec.normalize_or_zero();
+        let p_hat = if orb.e > 1e-4 {
+            orb.e_vec.normalize_or_zero()
+        } else {
+            let a = if w.x.abs() < 0.9 { DVec3::X } else { DVec3::Y };
+            w.cross(a).normalize_or_zero()
+        };
+        let q_hat = w.cross(p_hat).normalize_or_zero();
+        let p = orb.a * (1.0 - orb.e * orb.e);
+        // current true anomaly (angle in the orbit plane from periapsis)
+        let nu0 = self.r.dot(q_hat).atan2(self.r.dot(p_hat));
+        let mut out = Vec::new();
+        let steps = 220;
+        for i in 0..=steps {
+            let nu = nu0 + (i as f64 / steps as f64) * std::f64::consts::TAU;
+            let rad = p / (1.0 + orb.e * nu.cos());
+            // sub-orbital arcs dip below the surface: stop the prediction there.
+            if rad <= body.radius && i > 0 {
+                break;
+            }
+            let pos = (rad * (nu.cos() * p_hat + nu.sin() * q_hat)) / body.radius;
+            out.push(pos.as_vec3());
+        }
+        out
     }
 }
 
