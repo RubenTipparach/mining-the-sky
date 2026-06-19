@@ -46,6 +46,14 @@ pub struct Elevation {
     /// A constant height offset (metres) applied last (used to align the lunar
     /// landing site with the rocket-view origin).
     offset_m: f64,
+    /// Asteroid mode: a small irregular body - low-frequency lobes plus analytic
+    /// impact craters, as a positive radial height field of amplitude `ast_amp`.
+    asteroid: bool,
+    ast_amp: f64,
+    /// Impact craters for asteroid mode: (centre dir, angular radius, depth frac).
+    ast_craters: Vec<DVec3>,
+    ast_crater_cr: Vec<f64>,
+    ast_crater_d: Vec<f64>,
 }
 
 fn smoothstep(e0: f64, e1: f64, x: f64) -> f64 {
@@ -143,6 +151,11 @@ impl Elevation {
             crater_val,
             crater_cfg,
             offset_m: 0.0,
+            asteroid: false,
+            ast_amp: 0.0,
+            ast_craters: Vec::new(),
+            ast_crater_cr: Vec::new(),
+            ast_crater_d: Vec::new(),
         }
     }
 
@@ -152,6 +165,54 @@ impl Elevation {
         let mut e = Elevation::new(seed);
         e.lunar = true;
         e
+    }
+
+    /// A small irregular asteroid: low-frequency lobes + `craters` analytic
+    /// impact basins, as a positive radial height field of amplitude `amp_m`
+    /// (metres). Used with a small `Planet` radius and the LOD quadtree.
+    pub fn asteroid(seed: u32, amp_m: f64, craters: usize) -> Self {
+        let mut e = Elevation::new(seed);
+        e.asteroid = true;
+        e.ast_amp = amp_m;
+        // scatter craters (power-law size mix) over the unit sphere
+        for k in 0..craters {
+            let dir = fib_dir(k, craters.max(1));
+            // jitter the golden-spiral point a little by a hash of the seed
+            let h = ((seed as f64 * 0.013 + k as f64 * 1.7).sin() * 43758.5).fract();
+            let h2 = ((seed as f64 * 0.029 + k as f64 * 3.1).sin() * 24634.6).fract();
+            let cr = 0.06 + 0.5 * h.abs().powf(2.5);
+            let depth = (0.16 + 0.12 * h2.abs()) * (0.5 + cr);
+            e.ast_craters.push(dir);
+            e.ast_crater_cr.push(cr);
+            e.ast_crater_d.push(depth);
+        }
+        e
+    }
+
+    /// Asteroid radial height (metres), in [~0, amp]. Lobes + craters.
+    fn asteroid_height(&self, dir: DVec3) -> f64 {
+        let d = dir.normalize();
+        let lobe = self.continents.get([d.x * 1.5, d.y * 1.5, d.z * 1.5]); // big lobes
+        let med = self.hills.get([d.x * 4.0, d.y * 4.0, d.z * 4.0]);
+        let fine = self.fine.get([d.x * 13.0, d.y * 13.0, d.z * 13.0]);
+        // Mostly big lobes for the silhouette; keep the medium/fine geometry
+        // relief gentle so the ground is smooth up close (crater texture is added
+        // by the surface-detail shader, not the mesh).
+        let mut h = 0.5 + 0.32 * lobe + 0.06 * med + 0.02 * fine; // ~0..1
+        for i in 0..self.ast_craters.len() {
+            let c = self.ast_craters[i];
+            let cr = self.ast_crater_cr[i];
+            let depth = self.ast_crater_d[i];
+            let ang = (1.0 - dir.dot(c).clamp(-1.0, 1.0)).max(0.0);
+            let s = ang / cr;
+            if s < 1.5 {
+                if s < 1.0 {
+                    h -= depth * (1.0 - s * s);
+                }
+                h += 0.45 * depth * (-(((s - 1.0) / 0.18).powi(2))).exp();
+            }
+        }
+        h.clamp(0.04, 1.05) * self.ast_amp
     }
 
     /// Shift the whole field vertically (metres). Used to seat the lunar landing
@@ -229,6 +290,9 @@ impl Elevation {
     /// Natural elevation (metres, signed) before any flatten zones.
     fn base_height(&self, dir: DVec3) -> f64 {
         let d = dir.normalize();
+        if self.asteroid {
+            return self.asteroid_height(d);
+        }
         if self.lunar {
             return self.crater_height(d);
         }

@@ -133,8 +133,9 @@ const OVERLAY_CAP: u64 = 8192;
 const HUD_CAP: u64 = 40000;
 /// Thruster-FX billboards (flame + smoke particles).
 const FX_CAP: u64 = 60000;
-/// Dynamic rocket-view geometry (pad + rocket + spent booster).
-const DYN_MESH_CAP: u64 = 40000;
+/// Dynamic rocket-view geometry (pad + rocket + spent booster, or a surface
+/// mesh: moon base / cargo module / a full procedural asteroid ~66k verts).
+const DYN_MESH_CAP: u64 = 200_000;
 /// Full-planet LOD terrain (rebuilt as the camera moves).
 const TERRAIN_CAP: u64 = 500_000;
 
@@ -185,6 +186,9 @@ struct MeshUniforms {
     lights: [[f32; 4]; 8],
     /// rgb = colour * intensity for each light.
     light_col: [[f32; 4]; 8],
+    /// Procedural surface detail (asteroid/airless bodies): xyz = body centre in
+    /// camera-relative space, w = body radius (m). w = 0 disables.
+    detail: [f32; 4],
 }
 
 const MAX_LIGHTS: usize = 8;
@@ -398,6 +402,11 @@ struct World {
     space: bool,
     /// Name shown for the body being inspected in a deep-space scene.
     space_label: &'static str,
+    /// When set, the asteroid is rendered through the LOD quadtree (detail
+    /// refines as the camera approaches), centred at the local origin, using
+    /// this elevation field and base radius.
+    ast_elev: Option<terrain::Elevation>,
+    ast_radius: f64,
     /// Render the surface as the moon: grey regolith + black airless sky.
     lunar: bool,
     /// Height (m) the lander floats above the surface (0 = landed).
@@ -514,6 +523,8 @@ impl World {
             base_panel: false,
             space: false,
             space_label: "",
+            ast_elev: None,
+            ast_radius: 0.0,
             lunar: false,
             lander_alt: 0.0,
             lander_firing: false,
@@ -703,6 +714,15 @@ impl World {
         } else {
             SUN_LOCAL
         };
+        // Procedural surface detail for the asteroid (fragment-level normal
+        // mapping + micro self-shadow). Body centre in camera-relative space is
+        // rel(origin); w carries the radius (0 = off for other scenes).
+        let detail = if self.ast_elev.is_some() {
+            let c = self.rel(DVec3::ZERO);
+            [c.x, c.y, c.z, self.ast_radius as f32]
+        } else {
+            [0.0, 0.0, 0.0, 0.0]
+        };
         MeshUniforms {
             viewproj: vp.to_cols_array_2d(),
             sun: [sun_l.x, sun_l.y, sun_l.z, lunar],
@@ -712,6 +732,7 @@ impl World {
             fog,
             lights,
             light_col,
+            detail,
         }
     }
 
@@ -1349,7 +1370,16 @@ impl World {
     /// Rebuild the full-planet LOD terrain, camera-relative to the current
     /// `ref_local`, refined toward the camera. Called when the reference moves.
     fn rebuild_terrain(&mut self) {
-        // Deep-space (asteroid) scenes have no planet underfoot.
+        // Asteroid: render the body through the LOD quadtree, centred at the
+        // local origin, refining as the camera (camera_eye_local) approaches.
+        if let Some(elev) = self.ast_elev.as_ref() {
+            let cam = self.camera_eye_local();
+            let m = rocket::asteroid_terrain(cam, self.ast_radius, elev, 15);
+            self.terrain_count = (m.verts.len() as u64).min(TERRAIN_CAP) as u32;
+            self.terrain_verts = m.verts;
+            return;
+        }
+        // Deep-space (asteroid mesh / empty) scenes have no planet underfoot.
         if self.space {
             self.terrain_verts.clear();
             self.terrain_count = 0;
@@ -1392,6 +1422,19 @@ impl World {
     fn build_dynamic_mesh(&self) -> Vec<rocket::MeshVertex> {
         let rb = &self.rocket_body;
         let mut out: Vec<rocket::MeshVertex> = Vec::new();
+
+        // Asteroid LOD body: the body itself is the terrain buffer; only draw the
+        // lander (at the +Y pole, where radial-up = +Y) if one is present.
+        if self.ast_elev.is_some() {
+            if self.show_lander {
+                let base = DVec3::new(0.0, self.lander_alt as f64, 0.0);
+                for v in &self.lander_mesh.verts {
+                    let local = base + Vec3::from(v.pos).as_dvec3();
+                    out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: v.normal, color: v.color });
+                }
+            }
+            return out;
+        }
 
         // static structures (camera-relative): pad + mount, the assembly hangar,
         // and the parts rack beside it.
@@ -3439,6 +3482,22 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.rocket_focus_y = 0.0;
             0.0
         }
+        "ast_craters" => {
+            // a closer look down over the heavily-cratered surface so the
+            // rimmed impact craters of many sizes read clearly.
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.lunar = true;
+            world.space = true;
+            world.base_mesh = Some(rocket::asteroid_preset(1)); // most cratered
+            world.space_label = rocket::ASTEROID_NAMES[1];
+            world.rocket_az = 0.45;
+            world.rocket_el = 0.32;
+            world.rocket_dist = 1080.0;
+            world.rocket_focus_y = 0.0;
+            0.0
+        }
         "ast_surf" => {
             // down near the surface of a large asteroid: rubble horizon + space.
             world.view = View::Rocket;
@@ -3466,6 +3525,61 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.rocket_el = 0.08;
             world.rocket_dist = 430.0;
             world.rocket_focus_y = 170.0;
+            0.0
+        }
+        // ---- Asteroid landing sequence on an LOD body (detail refines as you
+        // approach): distance -> orbit -> descent -> touchdown. ----
+        "ld_far" | "ld_orbit" | "ld_descent" | "ld_land" => {
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.lunar = true; // airless lighting
+            world.space = true; // starfield sky, no planet
+            world.ref_local = DVec3::ZERO; // body at the local origin
+            let r = 380.0f64;
+            let elev = terrain::Elevation::asteroid(8, r * 0.34, 26);
+            let pole = (r + elev.land_height_m(DVec3::Y)) as f32; // surface at +Y
+            world.ast_elev = Some(elev);
+            world.ast_radius = r;
+            world.space_label = rocket::ASTEROID_NAMES[1];
+            match scenario {
+                "ld_far" => {
+                    // a distant speck: the whole body in frame, coarse LOD.
+                    world.rocket_az = 0.5;
+                    world.rocket_el = 0.26;
+                    world.rocket_dist = 3800.0;
+                    world.rocket_focus_y = 0.0;
+                }
+                "ld_orbit" => {
+                    // close orbit: the body fills the view, mid LOD refining.
+                    world.rocket_az = 0.5;
+                    world.rocket_el = 0.30;
+                    world.rocket_dist = 1150.0;
+                    world.rocket_focus_y = 0.0;
+                }
+                "ld_descent" => {
+                    // powered descent toward the +Y pole, looking down; fine LOD
+                    // resolves craters under the hovering lander.
+                    world.show_lander = true;
+                    world.lander_alt = pole + 75.0;
+                    world.lander_firing = true;
+                    world.lander_rcs = 0.8;
+                    world.rocket_az = 0.6;
+                    world.rocket_el = 0.85; // looking down over the pole
+                    world.rocket_dist = 120.0;
+                    world.rocket_focus_y = pole + 60.0;
+                }
+                _ => {
+                    // touchdown: lander on the regolith, finest LOD, craters close.
+                    world.show_lander = true;
+                    world.lander_alt = pole + 1.5;
+                    world.lander_firing = false;
+                    world.rocket_az = 0.6;
+                    world.rocket_el = 0.6;
+                    world.rocket_dist = 34.0;
+                    world.rocket_focus_y = pole + 3.0;
+                }
+            }
             0.0
         }
         "moonbase" => {
@@ -4037,6 +4151,16 @@ fn main() {
                 "ast_orbit3"
             } else if args.iter().any(|a| a == "ast_orbit") {
                 "ast_orbit"
+            } else if args.iter().any(|a| a == "ld_far") {
+                "ld_far"
+            } else if args.iter().any(|a| a == "ld_orbit") {
+                "ld_orbit"
+            } else if args.iter().any(|a| a == "ld_descent") {
+                "ld_descent"
+            } else if args.iter().any(|a| a == "ld_land") {
+                "ld_land"
+            } else if args.iter().any(|a| a == "ast_craters") {
+                "ast_craters"
             } else if args.iter().any(|a| a == "ast_surf2") {
                 "ast_surf2"
             } else if args.iter().any(|a| a == "ast_surf") {
@@ -4115,6 +4239,11 @@ fn main() {
                 "ast_orbit3" => "out/ast_orbit3.png",
                 "ast_surf" => "out/ast_surf.png",
                 "ast_surf2" => "out/ast_surf2.png",
+                "ast_craters" => "out/ast_craters.png",
+                "ld_far" => "out/ld_far.png",
+                "ld_orbit" => "out/ld_orbit.png",
+                "ld_descent" => "out/ld_descent.png",
+                "ld_land" => "out/ld_land.png",
                 "cargo" => "out/cargo.png",
                 "cargoparts" => "out/cargoparts.png",
                 "delivery" => "out/delivery.png",

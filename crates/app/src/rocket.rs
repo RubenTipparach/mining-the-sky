@@ -707,34 +707,45 @@ fn asteroid_color(dir: Vec3, disp: f32, n: Vec3) -> [f32; 3] {
 /// scale) and roughened by `seed`. `craters` impact basins are gouged in.
 pub fn asteroid(seed: f32, radius: f32, elong: Vec3, craters: usize) -> Mesh {
     let off = Vec3::splat(seed * 13.7 + 4.0);
+    // Craters with a power-law size mix (many small, a few large basins).
     let crat: Vec<(Vec3, f32, f32)> = (0..craters)
         .map(|k| {
             let dir = sphere_rand(seed + 7.0, k);
             let a = hash31(Vec3::new(seed, k as f32, 3.0));
             let b = hash31(Vec3::new(seed, k as f32, 5.0));
-            (dir, 0.20 + 0.55 * a, 0.10 + 0.16 * b)
+            let cr = 0.05 + 0.5 * a.powf(2.5); // angular radius, biased small
+            let depth = (0.16 + 0.12 * b) * (0.5 + cr); // bigger craters dig deeper
+            (dir, cr, depth)
         })
         .collect();
 
     let displace = |dir: Vec3| -> f32 {
+        // Keep the base body fairly round (modest lumps) so the craters read as
+        // the dominant relief rather than getting lost in noise.
         let lump = fbm3(dir * 2.0 + off, 5);
-        let fine = fbm3(dir * 6.5 + off, 3);
-        let mut h = 1.0 + 0.30 * lump + 0.08 * fine;
+        let fine = fbm3(dir * 7.0 + off, 4);
+        let mut h = 1.0 + 0.13 * lump + 0.035 * fine;
         for &(c, cr, depth) in &crat {
             let ang = (1.0 - dir.dot(c).clamp(-1.0, 1.0)).max(0.0); // 0 at centre
-            let t = (ang / cr).min(1.0);
-            let bowl = 1.0 - t;
-            let bowl = bowl * bowl * (3.0 - 2.0 * bowl); // smooth bowl
-            h -= depth * bowl;
+            let s = ang / cr; // 0 centre, 1 rim
+            if s < 1.5 {
+                // depressed parabolic floor that rises to the rim ...
+                if s < 1.0 {
+                    h -= depth * (1.0 - s * s);
+                }
+                // ... plus a sharp raised rim ring + a little ejecta outside it
+                let rim = 0.45 * depth * (-(((s - 1.0) / 0.18).powi(2))).exp();
+                h += rim;
+            }
         }
-        h.max(0.45)
+        h.max(0.42)
     };
     let surf = |dir: Vec3| -> Vec3 {
         let d = displace(dir);
         Vec3::new(dir.x * elong.x, dir.y * elong.y, dir.z * elong.z) * (radius * d)
     };
 
-    let n = 44usize;
+    let n = 60usize; // resolves the small craters (~125k verts, under DYN cap)
     let mut m = Mesh::default();
     for face in 0..6 {
         let mut pos = vec![Vec3::ZERO; n * n];
@@ -759,17 +770,22 @@ pub fn asteroid(seed: f32, radius: f32, elong: Vec3, craters: usize) -> Mesh {
                 let du = pos[j * n + ip] - pos[j * n + im];
                 let dv = pos[jp * n + i] - pos[jm * n + i];
                 let mut nn = du.cross(dv).normalize_or_zero();
-                if nn.dot(dir[j * n + i]) < 0.0 {
+                // Orient outward using the position vector from the origin. The
+                // body is star-convex (radius always > 0), so the outward normal
+                // always has a positive dot with `pos`; the sphere direction is
+                // an unreliable proxy on elongated bodies and flipped whole faces.
+                if nn.dot(pos[j * n + i]) < 0.0 {
                     nn = -nn;
                 }
                 if nn.length_squared() < 1e-6 {
-                    nn = dir[j * n + i];
+                    nn = pos[j * n + i].normalize_or_zero();
                 }
                 nrm[j * n + i] = nn;
             }
         }
-        let col: Vec<[f32; 3]> =
-            (0..n * n).map(|k| asteroid_color(dir[k], displace(dir[k]), nrm[k])).collect();
+        let col: Vec<[f32; 3]> = (0..n * n)
+            .map(|k| asteroid_color(pos[k].normalize_or_zero(), displace(dir[k]), nrm[k]))
+            .collect();
         for j in 0..n - 1 {
             for i in 0..n - 1 {
                 let a = j * n + i;
@@ -787,10 +803,10 @@ pub fn asteroid(seed: f32, radius: f32, elong: Vec3, craters: usize) -> Mesh {
 /// A few named large asteroids with distinct silhouettes.
 pub fn asteroid_preset(idx: usize) -> Mesh {
     match idx {
-        0 => asteroid(2.0, 520.0, Vec3::new(1.04, 0.96, 1.0), 6), // near-spherical
-        1 => asteroid(8.0, 470.0, Vec3::new(1.12, 0.84, 1.05), 9), // squat, cratered
-        2 => asteroid(15.0, 360.0, Vec3::new(1.7, 0.78, 0.86), 5), // elongated peanut
-        _ => asteroid(23.0, 430.0, Vec3::new(1.55, 0.82, 0.95), 7), // long shard
+        0 => asteroid(2.0, 520.0, Vec3::new(1.04, 0.96, 1.0), 20), // near-spherical
+        1 => asteroid(8.0, 470.0, Vec3::new(1.12, 0.84, 1.05), 30), // squat, cratered
+        2 => asteroid(15.0, 360.0, Vec3::new(1.7, 0.78, 0.86), 16), // elongated peanut
+        _ => asteroid(23.0, 430.0, Vec3::new(1.55, 0.82, 0.95), 22), // long shard
     }
 }
 
@@ -1295,6 +1311,70 @@ pub fn planet_terrain(
             })
             .collect();
 
+        for tri in pm.indices.chunks(3) {
+            let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+            m.tri3(
+                [local[i0], local[i1], local[i2]],
+                [nrm[i0], nrm[i1], nrm[i2]],
+                [col[i0], col[i1], col[i2]],
+            );
+        }
+    }
+    m
+}
+
+/// An asteroid rendered through the LOD quadtree (so detail refines as the
+/// camera approaches), centred at the local origin. `cam_local` is the camera
+/// position in the asteroid frame; `radius` is the base sphere radius and the
+/// `elev` asteroid field adds the lobes/craters on top. Returns local-space
+/// vertices (the body sits at the origin, so no floating-origin offset).
+pub fn asteroid_terrain(cam_local: DVec3, radius: f64, elev: &Elevation, max_depth: u32) -> Mesh {
+    let planet = Planet { radius };
+    let amp = (radius * 0.34) as f32; // colour scale (matches the field amplitude)
+    let lod = select(&planet, cam_local, 1.6, max_depth);
+    let mut m = Mesh::default();
+    let n = 9;
+    // The true surface point at a direction (same field build_mesh displaced by).
+    let surf = |d: DVec3| -> DVec3 { d * (radius + elev.land_height_m(d)) };
+    // Analytic normal from the height-field gradient, sampled at a step `eps`
+    // (radians) that matches the local mesh spacing. Tying the step to the patch
+    // size keeps the normal at the resolution actually being drawn: coarse far
+    // patches read big features (no sub-triangle speckle), near patches resolve
+    // fine relief. It is a pure function of direction, so patches that share an
+    // edge get identical normals - seamless blending across patches and LODs.
+    let normal_at = |d: DVec3, eps: f64| -> Vec3 {
+        let (t, b) = terrain::cubesphere::tangent_basis(d);
+        let p0 = surf(d);
+        let pt = surf((d + t * eps).normalize());
+        let pb = surf((d + b * eps).normalize());
+        let mut nn = (pt - p0).cross(pb - p0).normalize_or_zero();
+        if nn.dot(d) < 0.0 {
+            nn = -nn;
+        }
+        if nn.length_squared() < 1e-9 {
+            nn = d;
+        }
+        nn.as_vec3()
+    };
+    for patch in &lod.patches {
+        let skirt = (patch.edge * 0.35).clamp(2.0, 5_000.0);
+        let pm = build_mesh(&planet, patch, n, elev, skirt);
+        // one vertex spacing of this patch, as an angular step on the unit sphere
+        let eps = ((patch.edge / (n as f64 - 1.0)) / radius).clamp(2.0e-4, 0.2);
+        let nv = pm.positions.len();
+        let local: Vec<Vec3> = pm.positions.iter().map(|&w| w.as_vec3()).collect();
+        let radial: Vec<Vec3> = pm.positions.iter().map(|&w| w.normalize_or_zero().as_vec3()).collect();
+        let nrm: Vec<Vec3> = pm.positions.iter().map(|&w| normal_at(w.normalize(), eps)).collect();
+        let col: Vec<[f32; 3]> = (0..nv)
+            .map(|i| {
+                let h_frac = ((local[i].length() - radius as f32) / amp).clamp(0.0, 1.0);
+                let base = mix3([0.17, 0.14, 0.12], [0.40, 0.36, 0.31], h_frac);
+                let slope = (1.0 - nrm[i].dot(radial[i])).clamp(0.0, 1.0);
+                let c = mix3(base, [0.30, 0.30, 0.31], slope * 0.5);
+                let j = 0.84 + 0.32 * hashf(local[i] * 0.5);
+                [c[0] * j, c[1] * j, c[2] * j]
+            })
+            .collect();
         for tri in pm.indices.chunks(3) {
             let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
             m.tri3(
