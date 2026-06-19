@@ -26,6 +26,8 @@ pub fn build(ctx: &egui::Context, world: &mut World) {
                 lander_panel(ctx, world); // on the lunar surface
             } else if world.launch.is_some() {
                 launch_panel(ctx, world);
+            } else if world.rolling_out {
+                rollout_panel(ctx, world); // crawling out to the pad
             } else if world.vab_mode {
                 vehicle_panel(ctx, world); // assembling in the building
             } else {
@@ -312,6 +314,44 @@ fn pad_panel(ctx: &egui::Context, world: &mut World) {
     }
     if back {
         world.back_to_vab();
+    }
+}
+
+/// Shown while the crawler is hauling the stack out of the assembly building to
+/// the pad: roll-out progress plus a speed control so the player can fast-forward
+/// the slow transport instead of watching it creep.
+fn rollout_panel(ctx: &egui::Context, world: &mut World) {
+    let rollout = world.rollout;
+    let speed = world.rollout_speed;
+    // Some(true) = crank crawler faster, Some(false) = slower (handled below).
+    let mut bump: Option<bool> = None;
+
+    egui::Window::new("ROLL OUT")
+        .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 12.0))
+        .default_width(240.0)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.label(egui::RichText::new("ROLLING OUT TO PAD").heading().color(AMBER));
+            let pct = (rollout * 100.0).round() as i32;
+            ui.label(egui::RichText::new(format!("{pct}%  -  crawler on the way")).color(DIM));
+            ui.add(egui::ProgressBar::new(rollout).fill(AMBER).desired_height(10.0));
+            ui.separator();
+            // Speed stepper, mirroring the radial-booster control in the VAB.
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Crawler speed").color(DIM));
+                if ui.small_button("-").clicked() {
+                    bump = Some(false);
+                }
+                ui.label(egui::RichText::new(format!("{speed:.0}x")).color(GOOD).monospace());
+                if ui.small_button("+").clicked() {
+                    bump = Some(true);
+                }
+            });
+            ui.label(egui::RichText::new("Keys , and . also adjust  ([ ] = time warp)").color(DIM).small());
+        });
+
+    if let Some(faster) = bump {
+        world.bump_rollout_speed(faster);
     }
 }
 

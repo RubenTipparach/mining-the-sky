@@ -458,6 +458,9 @@ struct World {
     /// Roll-out progress: 0 = in the hangar, 1 = on the pad. Animates.
     rollout: f32,
     rolling_out: bool,
+    /// Crawler speed multiplier while rolling out (1x .. 64x): lets the player
+    /// fast-forward the slow transport instead of watching it creep.
+    rollout_speed: f32,
     rocket_body: rocket::RocketBody,
     pad_mesh: rocket::Mesh,
     hangar_mesh: rocket::Mesh,
@@ -618,6 +621,7 @@ impl World {
             vab_mode: true,
             rollout: 0.0,
             rolling_out: false,
+            rollout_speed: 1.0,
             launch: None,
             rocket_body,
             pad_mesh: rocket::pad_and_mount(),
@@ -1019,8 +1023,19 @@ impl World {
                 let height = self.rocket_body.height.max(8.0);
                 let center = self.rel(base + (quat * Vec3::new(0.0, height * 0.45, 0.0)).as_dvec3());
                 let vrad = self.rocket_body.engine_r.first().copied().unwrap_or(2.0).max(2.5);
+                // Airflow direction. Snap it to the vehicle's own long axis (the
+                // nose direction the mesh is drawn along) instead of the raw
+                // velocity, so the bow shock + wake stay glued to the real
+                // geometry and the tail streams straight out the back rather than
+                // skewing off at the flight-path angle (angle of attack). The
+                // velocity only picks which end meets the airstream (windward).
+                let axis = self.dir_to_local(rk.point_dir());
                 let vdir = self.dir_to_local(rk.v.normalize_or_zero());
-                let flow = if vdir.length_squared() > 1e-6 { vdir } else { self.dir_to_local(rk.point_dir()) };
+                let flow = if vdir.length_squared() > 1e-6 && vdir.dot(axis) < 0.0 {
+                    -axis
+                } else {
+                    axis
+                };
                 // Extent of the attached geometry along the airflow: the leading
                 // tip (windward) is the bow-shock head; the length sizes the
                 // enveloping fireball + tail.
@@ -1182,9 +1197,10 @@ impl World {
         }
 
         // roll the assembled rocket out of the hangar across the flats to the
-        // pad. ~64 s end to end: a slow crawler-transporter pace.
+        // pad. ~64 s end to end at 1x: a slow crawler-transporter pace, but the
+        // player can crank `rollout_speed` to fast-forward it.
         if self.rolling_out {
-            self.rollout = (self.rollout + frame_dt / 64.0).min(1.0);
+            self.rollout = (self.rollout + frame_dt / 64.0 * self.rollout_speed).min(1.0);
             if self.rollout >= 1.0 {
                 self.rolling_out = false;
                 self.vab_mode = false; // now on the pad, ready to launch
@@ -1493,6 +1509,17 @@ impl World {
             self.rebuild_vehicle();
             self.rolling_out = true;
         }
+    }
+
+    /// Speed up (or slow down) the crawler while it rolls out to the pad.
+    /// Doubles/halves the rate, clamped to 1x..64x (64x turns the ~64 s creep
+    /// into about a second). The chosen pace persists to the next roll-out.
+    fn bump_rollout_speed(&mut self, faster: bool) {
+        self.rollout_speed = if faster {
+            (self.rollout_speed * 2.0).min(64.0)
+        } else {
+            (self.rollout_speed * 0.5).max(1.0)
+        };
     }
 
     /// Send the rocket back into the assembly building (between missions).
@@ -3950,10 +3977,13 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             0.0
         }
         "rollout" => {
-            // mid roll-out: the rocket part-way between hangar and pad
+            // mid roll-out: the rocket part-way between hangar and pad, with the
+            // assembly panel showing roll-out progress + the crawler-speed control
             world.view = View::Rocket;
-            world.vab_mode = false;
+            world.vab_mode = true;
+            world.rolling_out = true;
             world.rollout = 0.84; // just clear of the building, nearing the pad
+            world.rollout_speed = 8.0; // fast-forwarded by the player
             world.rocket_az = 5.2;
             world.rocket_el = 0.16;
             world.rocket_dist = 120.0;
@@ -4080,6 +4110,32 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             }
             world.rocket_az = 4.2;
             world.rocket_el = -0.05;
+            world.rocket_dist = 95.0;
+            0.0
+        }
+        "reentry_tilt" => {
+            // Same fireball but with a steeply pitched-over airframe and a big
+            // angle of attack (velocity well off the body axis): verifies the
+            // wake hugs the rocket's own axis instead of skewing off downwind.
+            world.view = View::Rocket;
+            world.ignite_launch();
+            let radius = world.body.radius;
+            let up = world.launch_up;
+            let east = world.launch_east;
+            if let Some(rk) = world.launch.as_mut() {
+                rk.r = up * (radius + 58_000.0);
+                // airframe pitched ~46 deg from vertical toward the east
+                rk.pitch = 0.8;
+                rk.pitch_act = 0.8;
+                // velocity mostly horizontal + falling: a large angle of attack
+                rk.v = east * 5_400.0 - up * 3_200.0;
+                rk.throttle = 0.0;
+            }
+            for _ in 0..12 {
+                world.advance(0.1); // ~1.2 s for the plasma to bloom
+            }
+            world.rocket_az = 4.2;
+            world.rocket_el = 0.05;
             world.rocket_dist = 95.0;
             0.0
         }
@@ -5087,11 +5143,20 @@ impl ApplicationHandler<UserEvent> for App {
                             state.world.back_to_vab()
                         }
                         KeyCode::KeyL => state.world.toggle_lod_debug(),
+                        // [ ] are always time compression (sim time scale).
                         KeyCode::BracketRight => {
                             state.world.warp = (state.world.warp * 2.0).min(10000.0);
                         }
                         KeyCode::BracketLeft => {
                             state.world.warp = (state.world.warp * 0.5).max(1.0);
+                        }
+                        // , . are the separate crawler-speed control, only while
+                        // rolling out to the pad (they do not touch sim time).
+                        KeyCode::Period if state.world.rolling_out => {
+                            state.world.bump_rollout_speed(true);
+                        }
+                        KeyCode::Comma if state.world.rolling_out => {
+                            state.world.bump_rollout_speed(false);
                         }
                         KeyCode::Digit1
                         | KeyCode::Digit2
@@ -5258,6 +5323,8 @@ fn main() {
                 "boosters"
             } else if args.iter().any(|a| a == "crash") {
                 "crash"
+            } else if args.iter().any(|a| a == "reentry_tilt") {
+                "reentry_tilt"
             } else if args.iter().any(|a| a == "reentry") {
                 "reentry"
             } else if args.iter().any(|a| a == "sepfloat") {
@@ -5322,6 +5389,7 @@ fn main() {
                 "staging" => "out/staging.png",
                 "sepfloat" => "out/sepfloat.png",
                 "reentry" => "out/reentry.png",
+                "reentry_tilt" => "out/reentry_tilt.png",
                 "crash" => "out/crash.png",
                 "boosters" => "out/boosters.png",
                 "boosterlaunch" => "out/boosterlaunch.png",
@@ -5336,7 +5404,17 @@ fn main() {
                 .find(|a| a.ends_with(".png"))
                 .cloned()
                 .unwrap_or_else(|| default.to_string());
-            screenshot(&path, 1280, 800, scenario);
+            // Optional `WIDTHxHEIGHT` token (e.g. `1280x1200`) to size the shot;
+            // handy for verifying tall panels that overflow the default frame.
+            let (w, h) = args
+                .iter()
+                .skip(1)
+                .find_map(|a| {
+                    let (ws, hs) = a.split_once('x')?;
+                    Some((ws.parse::<u32>().ok()?, hs.parse::<u32>().ok()?))
+                })
+                .unwrap_or((1280, 800));
+            screenshot(&path, w, h, scenario);
             return;
         }
     }

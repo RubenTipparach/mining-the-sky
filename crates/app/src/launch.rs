@@ -28,8 +28,8 @@ const MAX_PITCH_ACC: f64 = 0.5; // rad/s^2
 // climbs past `HEAT_DAMAGE_Q` (well above anything a normal ascent reaches, so
 // only a fast reentry burns). Tuned for the home world's atmosphere.
 const HEAT_REF: f64 = 2.0e9; // flux at which the plasma shock reads full white-hot
-const HEAT_DAMAGE_Q: f64 = 4.0e9; // flux above which the structure starts to char
-const HEAT_DAMAGE_K: f64 = 9.0; // health lost per second per unit of over-flux
+const HEAT_DAMAGE_Q: f64 = 3.0e9; // flux above which the structure starts to char
+const HEAT_DAMAGE_K: f64 = 2.0; // health lost per second per unit of over-flux
 
 /// One live stage: its current propellant plus its fixed engine numbers.
 #[derive(Clone, Copy)]

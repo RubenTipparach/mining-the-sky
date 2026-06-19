@@ -5,3 +5,4 @@ Cargo.lock.orig
 # wasm build output
 /dist
 /crates/app/dist
+.history/
