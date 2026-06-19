@@ -47,6 +47,30 @@ pub const TANKS: &[Tank] = &[
     Tank { name: "X-Large", prop: 380_000.0, dry: 24_000.0 },
 ];
 
+/// A radial strap-on booster: a self-contained motor + propellant clustered
+/// around a stage. Solid motors (SRBs) run at fixed thrust until burnout;
+/// liquid strap-ons trade a little thrust for higher Isp. They burn together
+/// with the core stage they ring (jettisoned with it), augmenting its thrust,
+/// propellant and mass.
+#[derive(Clone, Copy)]
+pub struct Booster {
+    pub name: &'static str,
+    pub thrust: f64, // N each
+    pub prop: f64,   // kg propellant each
+    pub dry: f64,    // kg structure each
+    pub isp: f64,    // s
+    pub solid: bool,
+}
+
+pub const BOOSTERS: &[Booster] = &[
+    Booster { name: "SRB-Lite", thrust: 3.6e6, prop: 70_000.0, dry: 6_000.0, isp: 250.0, solid: true },
+    Booster { name: "SRB-Heavy", thrust: 8.5e6, prop: 200_000.0, dry: 16_000.0, isp: 262.0, solid: true },
+    Booster { name: "LqStrap", thrust: 4.2e6, prop: 120_000.0, dry: 7_000.0, isp: 295.0, solid: false },
+];
+
+/// Max radial boosters per stage (kept even-ish around the core).
+pub const MAX_BOOSTERS: u32 = 8;
+
 pub const PAYLOADS: &[Payload] = &[
     Payload { name: "CubeSat", mass: 200.0, color: [0.7, 0.8, 0.9], module: -1 },
     Payload { name: "ComSat", mass: 1_400.0, color: [0.9, 0.8, 0.3], module: -1 },
@@ -67,6 +91,16 @@ pub const PAYLOADS: &[Payload] = &[
 pub struct StageCfg {
     pub engine: usize,
     pub tank: usize,
+    /// Number of radial strap-on boosters ringing this stage (0 = none).
+    pub boosters: u32,
+    /// Which booster type (index into `BOOSTERS`).
+    pub booster: usize,
+}
+
+impl StageCfg {
+    pub fn new(engine: usize, tank: usize) -> Self {
+        StageCfg { engine, tank, boosters: 0, booster: 0 }
+    }
 }
 
 /// The player's current vehicle design (stages bottom-first, like `Vehicle`).
@@ -81,8 +115,8 @@ impl Vab {
     pub fn default_build() -> Vab {
         Vab {
             stages: vec![
-                StageCfg { engine: 2, tank: 2 }, // Titan-9 + Large booster
-                StageCfg { engine: 3, tank: 1 }, // Vac-1 + Medium upper
+                StageCfg::new(2, 2), // Titan-9 + Large booster
+                StageCfg::new(3, 1), // Vac-1 + Medium upper
             ],
             payload: 1, // ComSat
         }
@@ -97,19 +131,36 @@ impl Vab {
     pub fn payload(&self) -> Payload {
         PAYLOADS[self.payload.min(PAYLOADS.len() - 1)]
     }
+    /// The booster type fitted to stage `i`, and how many.
+    pub fn booster(&self, i: usize) -> (Booster, u32) {
+        let s = self.stages[i];
+        (BOOSTERS[s.booster.min(BOOSTERS.len() - 1)], s.boosters.min(MAX_BOOSTERS))
+    }
 
-    /// Compile to a `sim` vehicle (stage dry = engine + tank structure).
+    /// Compile to a `sim` vehicle. Each stage's radial boosters burn together
+    /// with it, so they add their thrust + propellant + mass to the stage and
+    /// blend their Isp in (thrust-weighted).
     pub fn to_vehicle(&self) -> Vehicle {
         let stages = (0..self.stages.len())
             .map(|i| {
                 let e = self.engine(i);
                 let t = self.tank(i);
+                let (b, nb) = self.booster(i);
+                let nb = nb as f64;
+                let b_thrust = nb * b.thrust;
+                let thrust = e.thrust + b_thrust;
+                // thrust-weighted Isp so strap-ons shift the effective Isp.
+                let isp = if thrust > 0.0 {
+                    (e.thrust * e.isp + b_thrust * b.isp) / thrust
+                } else {
+                    e.isp
+                };
                 Stage {
                     name: e.name,
-                    dry: e.mass + t.dry,
-                    prop: t.prop,
-                    thrust: e.thrust,
-                    isp: e.isp,
+                    dry: e.mass + t.dry + nb * b.dry,
+                    prop: t.prop + nb * b.prop,
+                    thrust,
+                    isp,
                 }
             })
             .collect();

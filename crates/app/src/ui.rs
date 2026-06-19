@@ -144,6 +144,31 @@ fn vehicle_panel(ctx: &egui::Context, world: &mut World) {
                         act = Some(Act::Remove(i));
                     }
                 });
+                // radial-booster controls for this stage: count stepper + type.
+                ui.horizontal(|ui| {
+                    let bn = vab.stages[i].boosters;
+                    let bt = vab.stages[i].booster;
+                    ui.label(egui::RichText::new("   radial").color(DIM).monospace().small());
+                    if ui.small_button("-").clicked() && bn > 0 {
+                        vab.stages[i].boosters = bn - 1;
+                        changed = true;
+                    }
+                    ui.label(egui::RichText::new(format!("{bn}x")).color(if bn > 0 { GOOD } else { DIM }).monospace());
+                    if ui.small_button("+").clicked() && bn < build::MAX_BOOSTERS {
+                        vab.stages[i].boosters = bn + 1;
+                        changed = true;
+                    }
+                    let b = build::BOOSTERS[bt];
+                    let tag = if b.solid { "SRB" } else { "Liq" };
+                    if ui
+                        .button(egui::RichText::new(format!("{} [{}]", b.name, tag)).small())
+                        .on_hover_text("click to cycle booster type")
+                        .clicked()
+                    {
+                        vab.stages[i].booster = (bt + 1) % build::BOOSTERS.len();
+                        changed = true;
+                    }
+                });
             }
             // payload slot
             ui.horizontal(|ui| {
@@ -225,7 +250,7 @@ fn vehicle_panel(ctx: &egui::Context, world: &mut World) {
             }
         }
         Some(Act::Add) => {
-            vab.stages.push(build::StageCfg { engine: 3, tank: 0 });
+            vab.stages.push(build::StageCfg::new(3, 0));
             changed = true;
         }
         None => {}

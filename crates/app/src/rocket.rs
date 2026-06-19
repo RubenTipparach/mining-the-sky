@@ -852,6 +852,9 @@ pub struct RocketBody {
     /// The two clamshell fairing halves (each swings out along local +/-X).
     pub fairing_l: std::ops::Range<usize>,
     pub fairing_r: std::ops::Range<usize>,
+    /// Radial-booster ring per stage: (count, ring radius). Drives the extra
+    /// exhaust plumes at the strap-on nozzles while that stage burns.
+    pub booster_rings: Vec<(u32, f32)>,
 }
 
 pub const PAD_TOP: f32 = 1.2;
@@ -1024,10 +1027,24 @@ pub fn append_part(m: &mut Mesh, kind: PartKind, c: Vec3, col: [f32; 3]) {
     }
 }
 
+/// Per-stage radial-booster description for the body builder (the sim vehicle
+/// folds boosters into the stage, so their visual count/size is passed here).
+#[derive(Clone, Copy, Default)]
+pub struct BoosterViz {
+    pub count: u32,
+    pub prop: f32, // per-booster propellant, sizes the strap-on
+    pub solid: bool,
+}
+
 /// Build the rocket body for `veh` about its base at y=0, proportional to each
 /// stage's tank (radius/height) and engine (cluster). `payload_col` tints the
-/// payload section.
-pub fn rocket_body(veh: &Vehicle, payload_col: [f32; 3], module_id: i32) -> RocketBody {
+/// payload section. `boosters[i]` rings stage `i` with radial strap-ons.
+pub fn rocket_body(
+    veh: &Vehicle,
+    payload_col: [f32; 3],
+    module_id: i32,
+    boosters: &[BoosterViz],
+) -> RocketBody {
     let mut m = Mesh::default();
     let n = veh.stages.len().max(1);
     let radii: Vec<f32> = veh.stages.iter().map(|s| stage_radius(s.prop)).collect();
@@ -1036,6 +1053,7 @@ pub fn rocket_body(veh: &Vehicle, payload_col: [f32; 3], module_id: i32) -> Rock
     let mut stage_ranges = Vec::new();
     let mut nozzle_y = Vec::new();
     let mut engine_r = Vec::new();
+    let mut booster_rings: Vec<(u32, f32)> = Vec::new();
     let mut y = 0.0f32;
     for (i, stage) in veh.stages.iter().enumerate() {
         let start = m.verts.len();
@@ -1074,6 +1092,35 @@ pub fn rocket_body(veh: &Vehicle, payload_col: [f32; 3], module_id: i32) -> Rock
                 m.bx(Vec3::new(cx, fy, cz), Vec3::new(hx, 1.8, hz), [0.55, 0.10, 0.10]);
             }
         }
+
+        // radial strap-on boosters ringing this stage (drawn into the stage's own
+        // vertex range so they jettison / break up with it).
+        let mut ring = (0u32, 0.0f32);
+        if let Some(bv) = boosters.get(i) {
+            if bv.count > 0 {
+                let nb = bv.count as usize;
+                let bvol = bv.prop / PROP_DENSITY;
+                let br = ((bv.prop / 100_000.0).cbrt() * 1.05).clamp(0.45, 1.7);
+                // height from propellant volume, but capped to the core stage.
+                let bh = (bvol / (std::f32::consts::PI * br * br)).clamp(h * 0.4, h * 0.92);
+                let rr = r + br + 0.15; // ring radius: just outside the core
+                ring = (bv.count, rr);
+                let bcol = if bv.solid { [0.86, 0.85, 0.82] } else { [0.80, 0.83, 0.88] };
+                for k in 0..nb {
+                    let a = k as f32 / nb as f32 * std::f32::consts::TAU;
+                    let (cx, cz) = (a.cos() * rr, a.sin() * rr);
+                    // motor body
+                    m.frustum(cx, cz, y, y + bh, br, br, 12, bcol, false, false);
+                    // a dark band for scale
+                    m.frustum(cx, cz, y + bh * 0.4, y + bh * 0.4 + 0.2, br * 1.02, br * 1.02, 12, [0.16, 0.16, 0.18], false, false);
+                    // ogive nose cap
+                    m.frustum(cx, cz, y + bh, y + bh + br * 2.2, br, 0.0, 12, [0.55, 0.12, 0.10], false, false);
+                    // nozzle below
+                    m.frustum(cx, cz, y - 1.3, y, br * 0.45, br * 0.7, 10, [0.13, 0.13, 0.15], false, true);
+                }
+            }
+        }
+        booster_rings.push(ring);
 
         y += h;
         // interstage tapering to the next stage's radius (or toward the payload)
@@ -1158,6 +1205,7 @@ pub fn rocket_body(veh: &Vehicle, payload_col: [f32; 3], module_id: i32) -> Rock
         module_range,
         fairing_l,
         fairing_r,
+        booster_rings,
     }
 }
 

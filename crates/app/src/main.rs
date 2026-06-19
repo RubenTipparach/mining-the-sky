@@ -547,7 +547,18 @@ impl World {
         let mission = Mission::pioneer_from_spaceport();
         let body = CentralBody::home();
         let vab = build::Vab::default_build();
-        let rocket_body = rocket::rocket_body(&vab.to_vehicle(), vab.payload().color, vab.payload().module);
+        let init_boosters: Vec<rocket::BoosterViz> = (0..vab.stages.len())
+            .map(|i| {
+                let (b, n) = vab.booster(i);
+                rocket::BoosterViz { count: n, prop: b.prop as f32, solid: b.solid }
+            })
+            .collect();
+        let rocket_body = rocket::rocket_body(
+            &vab.to_vehicle(),
+            vab.payload().color,
+            vab.payload().module,
+            &init_boosters,
+        );
         let rocket_frame = (rocket_body.focus_y, rocket_body.cam_dist);
         let (rack_mesh_init, rack_slots) = build_rack();
         let (launch_origin, launch_up, launch_east, launch_north) = rocket::launch_frame();
@@ -1493,7 +1504,18 @@ impl World {
     /// Rebuild the rocket-view geometry from the current VAB design (call after
     /// the player edits the build).
     fn rebuild_vehicle(&mut self) {
-        self.rocket_body = rocket::rocket_body(&self.vab.to_vehicle(), self.vab.payload().color, self.vab.payload().module);
+        let boosters: Vec<rocket::BoosterViz> = (0..self.vab.stages.len())
+            .map(|i| {
+                let (b, n) = self.vab.booster(i);
+                rocket::BoosterViz { count: n, prop: b.prop as f32, solid: b.solid }
+            })
+            .collect();
+        self.rocket_body = rocket::rocket_body(
+            &self.vab.to_vehicle(),
+            self.vab.payload().color,
+            self.vab.payload().module,
+            &boosters,
+        );
         self.rocket_focus_y = self.rocket_body.focus_y;
     }
 
@@ -1966,6 +1988,51 @@ impl World {
                 };
                 card(len, er * 1.9, 0.10, tf); // wide orange body
                 card(len * 0.5, er * 1.0, 0.63, tf * 1.3); // white-hot core
+            }
+        }
+
+        // ---- radial-booster exhaust plumes (one per strap-on nozzle) ----
+        if let Some(rk) = self.launch.as_ref() {
+            let tf = if rk.live_thrust() > 0.0 { rk.throttle as f32 } else { 0.0 };
+            let ring = self.rocket_body.booster_rings.get(rk.stage_base).copied();
+            if tf > 0.0 {
+                if let Some((bn, rr)) = ring {
+                    if bn > 0 {
+                        let pd = self.dir_to_local(rk.point_dir());
+                        let down = -pd;
+                        let q = Quat::from_rotation_arc(Vec3::Y, pd);
+                        let ny = self.rocket_body.nozzle_y.get(rk.stage_base).copied().unwrap_or(0.0);
+                        let base = self.to_local_d(rk.r);
+                        let blen = 12.0 * (0.5 + 0.45 * tf);
+                        for k in 0..bn {
+                            let a = k as f32 / bn as f32 * std::f32::consts::TAU;
+                            let off = Vec3::new(a.cos() * rr, ny - 1.0, a.sin() * rr);
+                            let nozzle = self.rel(base + (q * off).as_dvec3());
+                            let view = (nozzle - eye).normalize_or_zero();
+                            let mut w_axis = down.cross(view).normalize_or_zero();
+                            if w_axis.length_squared() < 1e-4 {
+                                w_axis = right;
+                            }
+                            let mut card = |length: f32, half_w: f32, seed: f32, inten: f32| {
+                                let tip = nozzle + down * length;
+                                let wn = w_axis * half_w;
+                                let wt = w_axis * (half_w * 0.22);
+                                let col = [seed, inten, 0.0, 0.0];
+                                let v = [
+                                    (nozzle - wn, [0.0f32, 0.0]),
+                                    (nozzle + wn, [1.0, 0.0]),
+                                    (tip + wt, [1.0, 1.0]),
+                                    (tip - wt, [0.0, 1.0]),
+                                ];
+                                for &i in &[0usize, 1, 2, 0, 2, 3] {
+                                    out.push(FxVertex { pos: v[i].0.into(), uv: v[i].1, color: col, kind: 0.0 });
+                                }
+                            };
+                            card(blen, 1.5, 0.10, tf);
+                            card(blen * 0.5, 0.8, 0.63, tf * 1.25);
+                        }
+                    }
+                }
             }
         }
 
@@ -3802,6 +3869,32 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             fly_to_staging(&mut world); // spent booster tumbling away
             0.0
         }
+        "boosters" => {
+            // a core stage ringed with radial solid rocket boosters, on the pad.
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.vab.stages[0].boosters = 6;
+            world.vab.stages[0].booster = 1; // SRB-Heavy
+            world.rebuild_vehicle();
+            world.rocket_az = 4.6;
+            world.rocket_el = 0.14;
+            world.rocket_dist = 95.0;
+            0.0
+        }
+        "boosterlaunch" => {
+            // a boostered stack lifting off: core + 6 SRBs all firing.
+            world.view = View::Rocket;
+            world.vab.stages[0].boosters = 6;
+            world.vab.stages[0].booster = 1;
+            world.rebuild_vehicle();
+            world.rocket_az = 4.6;
+            world.rocket_el = 0.12;
+            world.rocket_dist = 120.0;
+            world.ignite_launch();
+            fly(&mut world, 4.0);
+            0.0
+        }
         "crash" => {
             // a structural failure mid-air: the vehicle bursts into tumbling
             // debris + a fireball (same path a ground crash or burn-through takes).
@@ -5001,6 +5094,10 @@ fn main() {
                 "liftoff2"
             } else if args.iter().any(|a| a == "liftoff") {
                 "liftoff"
+            } else if args.iter().any(|a| a == "boosterlaunch") {
+                "boosterlaunch"
+            } else if args.iter().any(|a| a == "boosters") {
+                "boosters"
             } else if args.iter().any(|a| a == "crash") {
                 "crash"
             } else if args.iter().any(|a| a == "reentry") {
@@ -5067,6 +5164,8 @@ fn main() {
                 "sepfloat" => "out/sepfloat.png",
                 "reentry" => "out/reentry.png",
                 "crash" => "out/crash.png",
+                "boosters" => "out/boosters.png",
+                "boosterlaunch" => "out/boosterlaunch.png",
                 "launchmap" => "out/launchmap.png",
                 "ascent" => "out/ascent.png",
                 "flight" => "out/flight.png",
