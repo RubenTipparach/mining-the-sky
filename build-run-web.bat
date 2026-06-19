@@ -5,6 +5,12 @@ REM browser, e.g. recent Chrome or Edge.
 setlocal
 cd /d "%~dp0"
 
+REM Keep the Rust toolchain current; some crates (egui) need a recent rustc.
+where rustup >nul 2>nul && (
+    echo Updating the Rust toolchain...
+    rustup update --no-self-update stable
+)
+
 REM Trunk drives the wasm build; install once if missing.
 where trunk >nul 2>nul
 if errorlevel 1 (

@@ -878,6 +878,66 @@ pub fn pad_and_mount() -> Mesh {
     m
 }
 
+/// The crawlerway: a wide paved strip running along local X (at z=0) from the
+/// hangar out to the pad, so the rollout corridor reads as a real road. Tiled
+/// into segments because a single km-long quad mis-rasterises against the fine
+/// terrain at these coordinates (same reason the hangar apron is tiled).
+pub fn crawlerway(x_from: f32, x_to: f32, half_w: f32) -> Mesh {
+    let mut m = Mesh::default();
+    let road = [0.30, 0.30, 0.33];
+    let curb = [0.24, 0.24, 0.27];
+    let segs = 64usize;
+    let dx = (x_to - x_from) / segs as f32;
+    let hx = dx.abs() * 0.5;
+    for i in 0..segs {
+        let cx = x_from + dx * (i as f32 + 0.5);
+        // road surface: a thin slab just proud of the ground
+        m.bx(Vec3::new(cx, 0.12, 0.0), Vec3::new(hx, 0.12, half_w), road);
+        // low curbs along both edges
+        for sz in [-1.0f32, 1.0] {
+            m.bx(Vec3::new(cx, 0.30, sz * (half_w - 0.4)), Vec3::new(hx, 0.30, 0.5), curb);
+        }
+    }
+    m
+}
+
+/// The mobile launch platform (the "crawler"): a wide flat deck the rocket rides
+/// from the hangar out to the pad, on four crawler-track units. Built in local
+/// space with the ground at y=0 and the deck top at `base_y` (PAD_TOP+MOUNT_H),
+/// so the rocket's base rests on the deck. Positioned at the rocket's resting
+/// base each frame, it travels with the stack during rollout.
+pub fn crawler_platform() -> Mesh {
+    let mut m = Mesh::default();
+    let deck_top = PAD_TOP + MOUNT_H;
+    let hx = 11.0f32; // deck half-extents (large enough to read as a platform)
+    let hz = 11.0f32;
+    let deck_th = 0.9f32;
+    let deck = [0.36, 0.37, 0.41];
+    let under = [0.16, 0.16, 0.19];
+    let tread = [0.11, 0.11, 0.12];
+    let pad_col = [0.28, 0.29, 0.32];
+
+    // main deck
+    m.bx(Vec3::new(0.0, deck_top - deck_th * 0.5, 0.0), Vec3::new(hx, deck_th * 0.5, hz), deck);
+    // boxy under-structure between the deck and the tracks
+    let uh = (deck_top - deck_th) * 0.5;
+    m.bx(Vec3::new(0.0, uh, 0.0), Vec3::new(hx * 0.84, uh, hz * 0.84), under);
+    // four crawler-track units at the corners, sitting on the ground
+    let tr_h = 1.1f32;
+    for (sx, sz) in [(1.0f32, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)] {
+        m.bx(
+            Vec3::new(sx * hx * 0.72, tr_h * 0.5, sz * hz * 0.72),
+            Vec3::new(hx * 0.24, tr_h * 0.5, hz * 0.34),
+            tread,
+        );
+    }
+    // small support pads on the deck where the rocket sits
+    for (sx, sz) in [(1.0f32, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)] {
+        m.bx(Vec3::new(sx * 2.3, deck_top + 0.15, sz * 2.3), Vec3::new(0.5, 0.15, 0.5), pad_col);
+    }
+    m
+}
+
 /// The Vehicle Assembly Building: a large enclosed hangar (floor, back + side
 /// walls, roof, an open front facing the pad, and internal gantry towers) the
 /// rocket is assembled inside. Centred at `c` (local metres), big enough that

@@ -801,11 +801,13 @@ fn body_browser(ctx: &egui::Context, world: &mut World) {
         .collect();
     let focus = world.focus;
     let focus_name = world.focus_label().to_string();
+    let on_vehicle = world.focus_rocket;
     let cam_dist = world.sys_dist;
     let days = world.sys_time / 86_400.0;
     let warp = world.warp;
 
     let mut to_focus: Option<usize> = None;
+    let mut focus_vehicle = false;
     let mut warp_mul = 1.0f32;
 
     {
@@ -815,6 +817,12 @@ fn body_browser(ctx: &egui::Context, world: &mut World) {
             .default_width(220.0)
             .resizable(true)
             .show(ctx, |ui| {
+                // The active vehicle is always at the top of the list (it is not
+                // a universe body, so it cannot appear in the groups below).
+                if ui.selectable_label(on_vehicle, egui::RichText::new("ACTIVE VEHICLE").color(AMBER)).clicked() {
+                    focus_vehicle = true;
+                }
+                ui.separator();
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Find").color(DIM));
                     ui.text_edit_singleline(search);
@@ -862,7 +870,9 @@ fn body_browser(ctx: &egui::Context, world: &mut World) {
     }
 
     world.warp = (world.warp * warp_mul).clamp(1.0, 10000.0);
-    if let Some(i) = to_focus {
+    if focus_vehicle {
+        world.set_focus_rocket();
+    } else if let Some(i) = to_focus {
         world.set_focus(i);
     }
 }
