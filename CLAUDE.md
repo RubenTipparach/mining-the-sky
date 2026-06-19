@@ -14,6 +14,20 @@ Guidance for Claude Code when working in this repository.
 Mining the Sky is a realistic, to-scale, multiplayer hard-sci-fi space sim in
 Rust (WebGPU / wgpu). See docs/DESIGN.md for the full design.
 
+## Platform priority
+
+The native desktop build is the priority target from now on, and it is the
+multi-threaded one. Use real threads freely for performance: heavy work (terrain
+meshing, worldgen, future physics) should run off the render thread on native
+(see `crates/app/src/terrain_job.rs` for the pattern - a background worker with
+double-buffering so a rebuild never stalls a frame).
+
+Web/wasm is a secondary target and must not gate desktop performance work. The
+web build runs single-threaded (real threads on the web need cross-origin
+isolation we do not rely on), so threaded systems should fall back to an inline
+path on `wasm32` rather than being held back to match it. Keep the wasm build
+compiling and runnable, but optimize for native first.
+
 ## UI
 
 Prefer a proper GUI toolkit over the bitmap-font / ASCII-terminal HUD that the
