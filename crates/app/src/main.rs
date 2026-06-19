@@ -228,6 +228,25 @@ struct SkyUniforms {
     params: [f32; 4],
 }
 
+/// Uniforms for the volumetric re-entry plasma pass (camera-relative scene
+/// space): the camera basis + a local frame anchored at the rocket.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct PlasmaUniforms {
+    right: [f32; 4],
+    up: [f32; 4],
+    fwd: [f32; 4],
+    eye: [f32; 4],
+    /// xyz = plasma centre (camera-relative), w = metres per plasma unit.
+    center: [f32; 4],
+    /// +Y plasma axis (downwind/airflow direction).
+    axis: [f32; 4],
+    /// +X plasma axis (perpendicular).
+    side: [f32; 4],
+    /// x = tan(fov/2), y = aspect, z = time, w = heat (0..~1.3).
+    params: [f32; 4],
+}
+
 /// Far plane for the rocket-view log-depth buffer (m): beyond planet diameter.
 const LOG_DEPTH_FAR: f32 = 2.0e7;
 
@@ -941,6 +960,49 @@ impl World {
                 if self.space { 2.0 } else if self.lunar { 1.0 } else { 0.0 },
             ],
             params: [tan, aspect, self.body.radius as f32, r_atm as f32],
+        }
+    }
+
+    /// Current re-entry heating glow (0 when not launched / cool). Drives whether
+    /// the volumetric plasma pass runs and how bright it is.
+    fn plasma_heat(&self) -> f32 {
+        self.launch
+            .as_ref()
+            .filter(|rk| !rk.destroyed)
+            .map(|rk| rk.heat as f32)
+            .unwrap_or(0.0)
+    }
+
+    /// Uniforms for the volumetric plasma pass: a local frame anchored at the
+    /// rocket with +Y downwind (so the fireball wraps the windward face and
+    /// streams behind), sized to the vehicle.
+    fn plasma_uniforms(&self, res: [f32; 2]) -> PlasmaUniforms {
+        let aspect = res[0] / res[1].max(1.0);
+        let (eye, _t, right, up, fwd, tan) = self.rocket_camera(aspect);
+        let (axis, side, center, scale) = match self.launch.as_ref() {
+            Some(rk) => {
+                let vdir = self.dir_to_local(rk.v.normalize_or_zero());
+                let body_axis = self.dir_to_local(rk.point_dir());
+                let downwind = if vdir.length_squared() > 1e-6 { -vdir } else { -body_axis };
+                let pick = if downwind.y.abs() < 0.9 { Vec3::Y } else { Vec3::X };
+                let x = downwind.cross(pick).normalize_or_zero();
+                let height = self.rocket_body.height.max(8.0);
+                // centre on the vehicle's mid-body; the density's windward bias
+                // puts the bright shock on the leading face on its own.
+                let com = self.to_local_d(rk.r) + body_axis.as_dvec3() * (height as f64 * 0.22);
+                (downwind, x, self.rel(com), height * 0.30)
+            }
+            None => (Vec3::Y, Vec3::X, Vec3::ZERO, 20.0),
+        };
+        PlasmaUniforms {
+            right: [right.x, right.y, right.z, 0.0],
+            up: [up.x, up.y, up.z, 0.0],
+            fwd: [fwd.x, fwd.y, fwd.z, 0.0],
+            eye: [eye.x, eye.y, eye.z, 0.0],
+            center: [center.x, center.y, center.z, scale],
+            axis: [axis.x, axis.y, axis.z, 0.0],
+            side: [side.x, side.y, side.z, 0.0],
+            params: [tan, aspect, self.anim, self.plasma_heat()],
         }
     }
 
@@ -1867,88 +1929,12 @@ impl World {
         out
     }
 
-    /// Reentry plasma: a glowing bow-shock cap wrapping the windward side of the
-    /// rocket (the face hitting the air) plus plasma streaks licking downwind, as
-    /// camera-facing additive cards (FX kind 3). Intensity tracks `rk.heat`.
-    fn push_plasma(&self, out: &mut Vec<FxVertex>, rk: &launch::Rocket, heat: f32, eye: Vec3) {
-        let vlen = rk.v.length();
-        if vlen < 1.0 {
-            return;
-        }
-        let vdir = self.dir_to_local(rk.v.normalize_or_zero()); // wind blows from +vdir
-        let axis = self.dir_to_local(rk.point_dir()); // rocket long axis
-        let base = self.to_local_d(rk.r);
-        let height = self.rocket_body.height.max(8.0);
-        let center = base + axis.as_dvec3() * (height as f64 * 0.45);
-        let rwidth = self.rocket_body.engine_r.first().copied().unwrap_or(2.0).max(2.0);
-        // a bit ahead of the rocket's furthest point into the wind
-        let lead = center + vdir.as_dvec3() * (height as f64 * 0.45 + rwidth as f64);
-        let back = -vdir; // plasma streams downwind, opposite the velocity
-
-        // axis-billboard card: length runs along `dir`, width faces the camera.
-        let mut card = |anchor: DVec3, dir: Vec3, length: f32, half_w: f32, taper: f32, seed: f32, role: f32| {
-            let a = self.rel(anchor);
-            let tip = a + dir * length;
-            let view = (a - eye).normalize_or_zero();
-            let mut w_axis = dir.cross(view).normalize_or_zero();
-            if w_axis.length_squared() < 1e-4 {
-                w_axis = Vec3::Y.cross(dir).normalize_or_zero();
-            }
-            let wn = w_axis * half_w;
-            let wt = w_axis * (half_w * taper);
-            let col = [seed, heat, role, 0.0];
-            let q = [
-                (a - wn, [0.0f32, 0.0]),
-                (a + wn, [1.0, 0.0]),
-                (tip + wt, [1.0, 1.0]),
-                (tip - wt, [0.0, 1.0]),
-            ];
-            for &i in &[0usize, 1, 2, 0, 2, 3] {
-                out.push(FxVertex { pos: q[i].0.into(), uv: q[i].1, color: col, kind: 3.0 });
-            }
-        };
-
-        // 1) broad bow-shock cap wrapping the windward apex: a faint outer halo,
-        // the main cap, then a brighter hot core stacked at the stagnation line.
-        let cap_len = height * (0.55 + 0.5 * heat);
-        let cap_w = rwidth * (2.6 + 2.0 * heat);
-        card(lead, back, cap_len * 1.25, cap_w * 1.5, 0.7, 0.42, 0.0); // soft halo
-        card(lead, back, cap_len, cap_w, 0.55, 0.12, 0.0); // main cap
-        card(lead, back, cap_len * 0.6, cap_w * 0.62, 0.5, 0.61, 0.0); // hot core
-
-        // 2) plasma streaks off the flanks, streaming downwind and fanning out
-        // a little so the wake reads as a full sheet of ionised gas.
-        let pick = if vdir.y.abs() < 0.9 { Vec3::Y } else { Vec3::X };
-        let t1 = vdir.cross(pick).normalize_or_zero();
-        let t2 = vdir.cross(t1).normalize_or_zero();
-        let streaks = 7;
-        for k in 0..streaks {
-            let ang = k as f32 / streaks as f32 * std::f32::consts::TAU;
-            let off_dir = t1 * ang.cos() + t2 * ang.sin();
-            let anchor = center
-                + vdir.as_dvec3() * (height as f64 * 0.2)
-                + (off_dir * (rwidth * 0.85)).as_dvec3();
-            // fan the streak slightly outward from straight-downwind
-            let dir = (back + off_dir * 0.18).normalize_or_zero();
-            let wobble = 0.7 + 0.3 * (k as f32 * 1.3).sin().abs();
-            let len = height * (0.8 + 1.7 * heat) * wobble;
-            card(anchor, dir, len, rwidth * 0.5, 0.12, 0.2 + 0.13 * k as f32, 1.0);
-        }
-    }
-
     /// Thruster FX billboards for the rocket view: an emissive flame at the
     /// active nozzle (axis-aligned cards facing the camera) and the smoke-
     /// particle trail (camera-facing puffs). `right`/`up` are the camera basis.
     fn build_fx(&self, eye: Vec3, right: Vec3, up: Vec3) -> Vec<FxVertex> {
         let mut out: Vec<FxVertex> = Vec::new();
-
-        // ---- reentry plasma shock (windward bow shock + trailing streaks) ----
-        if let Some(rk) = self.launch.as_ref() {
-            let heat = rk.heat as f32;
-            if heat > 0.12 && !rk.destroyed {
-                self.push_plasma(&mut out, rk, heat, eye);
-            }
-        }
+        // (re-entry plasma is now a dedicated volumetric pass; see plasma.wgsl.)
 
         // ---- exhaust flame at the active nozzle ----
         if let Some(rk) = self.launch.as_ref() {
@@ -2552,6 +2538,10 @@ struct Gpu {
     sky_pipeline: wgpu::RenderPipeline,
     sky_uniform_buf: wgpu::Buffer,
     sky_bind_group: wgpu::BindGroup,
+    /// Volumetric re-entry plasma (fullscreen raymarch, over the scene).
+    plasma_pipeline: wgpu::RenderPipeline,
+    plasma_uniform_buf: wgpu::Buffer,
+    plasma_bind_group: wgpu::BindGroup,
 }
 
 impl Gpu {
@@ -2984,6 +2974,85 @@ impl Gpu {
             cache: None,
         });
 
+        // Plasma pipeline: fullscreen volumetric re-entry fireball, composited
+        // premultiplied-over on top of the scene (no depth write/test).
+        let plasma_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("plasma"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("plasma.wgsl").into()),
+        });
+        let plasma_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("plasma-uniforms"),
+            size: std::mem::size_of::<PlasmaUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let plasma_bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("plasma-bind-layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let plasma_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("plasma-bind-group"),
+            layout: &plasma_bind_layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: plasma_uniform_buf.as_entire_binding() }],
+        });
+        let plasma_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("plasma-layout"),
+            bind_group_layouts: &[Some(&plasma_bind_layout)],
+            immediate_size: 0,
+        });
+        let plasma_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("plasma-pipeline"),
+            layout: Some(&plasma_layout),
+            vertex: wgpu::VertexState {
+                module: &plasma_shader,
+                entry_point: Some("vs"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &plasma_shader,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    // premultiplied-over: rgb already carries rgb*alpha.
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         // Full-planet terrain is a dynamic, camera-relative buffer rebuilt as the
         // camera moves (floating origin); the rocket/pad are in dyn_vbuf.
         let terrain_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -3017,6 +3086,9 @@ impl Gpu {
             sky_pipeline,
             sky_uniform_buf,
             sky_bind_group,
+            plasma_pipeline,
+            plasma_uniform_buf,
+            plasma_bind_group,
         }
     }
 
@@ -3029,10 +3101,11 @@ impl Gpu {
         w: u32,
         h: u32,
         time: f32,
-    ) -> (usize, usize, u32, u32) {
+    ) -> (usize, usize, u32, u32, bool) {
         let res = [w as f32, h.max(1) as f32];
         let mut dyn_n = 0u32;
         let mut fx_n = 0u32;
+        let mut plasma_on = false;
         match world.view {
             View::Map => {
                 let su = world.scene_uniforms(res, time);
@@ -3058,6 +3131,13 @@ impl Gpu {
                 queue.write_buffer(&self.mesh_uniform_buf, 0, bytemuck::bytes_of(&mu));
                 let sk = world.sky_uniforms(res);
                 queue.write_buffer(&self.sky_uniform_buf, 0, bytemuck::bytes_of(&sk));
+                // re-entry plasma: only run the volume pass at genuine reentry
+                // heating (a normal ascent stays well below this).
+                if world.plasma_heat() > 0.32 {
+                    let pu = world.plasma_uniforms(res);
+                    queue.write_buffer(&self.plasma_uniform_buf, 0, bytemuck::bytes_of(&pu));
+                    plasma_on = true;
+                }
                 let dyn_verts = world.build_dynamic_mesh();
                 dyn_n = (dyn_verts.len() as u64).min(DYN_MESH_CAP) as u32;
                 if dyn_n > 0 {
@@ -3087,7 +3167,7 @@ impl Gpu {
         if hn > 0 {
             queue.write_buffer(&self.hud_buf, 0, bytemuck::cast_slice(&hud_verts[..hn]));
         }
-        (n, hn, dyn_n, fx_n)
+        (n, hn, dyn_n, fx_n, plasma_on)
     }
 
     /// Draw the thruster FX billboards (flame + smoke), in the mesh pass.
@@ -3144,6 +3224,15 @@ impl Gpu {
         pass.set_pipeline(&self.sky_pipeline);
         pass.set_bind_group(0, &self.sky_bind_group, &[]);
         pass.draw(0..3, 0..1);
+    }
+
+    /// Volumetric re-entry plasma, composited over the scene (mesh pass).
+    fn draw_plasma(&self, pass: &mut wgpu::RenderPass, on: bool) {
+        if on {
+            pass.set_pipeline(&self.plasma_pipeline);
+            pass.set_bind_group(0, &self.plasma_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
     }
 }
 
@@ -3520,7 +3609,7 @@ impl State {
             self.fps_since = t;
         }
 
-        let (n, hn, dyn_n, fx_n) = self
+        let (n, hn, dyn_n, fx_n, plasma_on) = self
             .gpu
             .prepare(&self.queue, &mut self.world, self.config.width, self.config.height, t);
         let terrain_n = self.world.terrain_count;
@@ -3598,6 +3687,7 @@ impl State {
                 let mut pass = mesh_pass(&mut encoder, &view, &self.depth_view);
                 self.gpu.draw_sky(&mut pass);
                 self.gpu.draw_meshes(&mut pass, terrain_n, dyn_n);
+                self.gpu.draw_plasma(&mut pass, plasma_on);
                 self.gpu.draw_fx(&mut pass, fx_n);
             }
             {
@@ -4571,7 +4661,7 @@ fn render_shot(
     });
     let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
-    let (n, hn, dyn_n, fx_n) = gpu.prepare(queue, &mut world, width, height, time);
+    let (n, hn, dyn_n, fx_n, plasma_on) = gpu.prepare(queue, &mut world, width, height, time);
     let terrain_n = world.terrain_count;
 
     // 256-byte aligned row pitch for the readback copy.
@@ -4593,6 +4683,7 @@ fn render_shot(
             let mut pass = mesh_pass(&mut encoder, &target_view, &depth);
             gpu.draw_sky(&mut pass);
             gpu.draw_meshes(&mut pass, terrain_n, dyn_n);
+            gpu.draw_plasma(&mut pass, plasma_on);
             gpu.draw_fx(&mut pass, fx_n);
         }
         {
