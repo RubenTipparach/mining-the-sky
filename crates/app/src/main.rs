@@ -137,8 +137,10 @@ const FX_CAP: u64 = 60000;
 /// Dynamic rocket-view geometry (pad + rocket + spent booster, or a surface
 /// mesh: moon base / cargo module / a full procedural asteroid ~66k verts).
 const DYN_MESH_CAP: u64 = 200_000;
-/// Full-planet LOD terrain (rebuilt as the rocket moves across the grid).
-const TERRAIN_CAP: u64 = 500_000;
+/// Full-planet LOD terrain (rebuilt as the rocket moves across the grid). Sized
+/// for the high-detail budget (~1-2M triangles = 3-6M non-indexed vertices); the
+/// GPU buffer is this many vertices, so it bounds the densest terrain frame.
+const TERRAIN_CAP: u64 = 4_500_000;
 
 /// Floating-origin grid for the planet terrain. The reference is snapped to a
 /// lattice so the same rocket position always yields byte-identical geometry

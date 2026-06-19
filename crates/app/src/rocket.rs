@@ -1229,8 +1229,13 @@ pub const PLANET_RADIUS: f64 = 6.2e6;
 
 /// Quadtree split factor used for the planet terrain LOD: split a patch while
 /// the camera is within `edge * factor` of it. Shared by the mesh build and the
-/// LOD-debug stats so the HUD and the geometry always agree.
-pub const PLANET_SPLIT_FACTOR: f64 = 1.5;
+/// LOD-debug stats so the HUD and the geometry always agree. Larger = the fine
+/// LOD zone reaches much further out (more, bigger detail rings).
+pub const PLANET_SPLIT_FACTOR: f64 = 3.2;
+
+/// Vertices per side of each leaf-patch mesh. Higher = denser terrain (more
+/// triangles per patch). Native can comfortably push 1-2M terrain triangles.
+pub const PLANET_PATCH_N: usize = 17;
 
 /// Run only the planet LOD selection (no meshing) for the debug HUD: returns the
 /// active patch set + per-depth counts for `cam_world`.
@@ -1395,7 +1400,7 @@ pub fn planet_terrain(
 
     let lod = select(&planet, cam_world, PLANET_SPLIT_FACTOR, max_depth);
     let mut m = Mesh::default();
-    let n = 9;
+    let n = PLANET_PATCH_N;
     let grid = n * n; // first `grid` positions are the surface; the rest are skirts
     for patch in &lod.patches {
         // Skirt depth scales with the patch so coarse far patches still seal.

@@ -560,7 +560,7 @@ fn launch_panel(ctx: &egui::Context, world: &mut World) {
 /// a colour legend so the split rings can be read and tuned.
 fn lod_debug_panel(ctx: &egui::Context, world: &World) {
     let (lod, alt, cell) = world.lod_debug_stats();
-    let tris = lod.triangle_count(9);
+    let tris = lod.triangle_count(crate::rocket::PLANET_PATCH_N);
     egui::Window::new("LOD DEBUG")
         .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 12.0))
         .default_width(220.0)
