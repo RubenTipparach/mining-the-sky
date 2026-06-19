@@ -278,6 +278,10 @@ struct SepBooster {
     vel: Vec3,
     rot: Quat,
     spin: Vec3,
+    /// Local-frame gravitational acceleration at the separation point (m/s^2),
+    /// so the spent stage falls away under the *actual* gravity at altitude
+    /// (gentle high up, in the correct down-direction) instead of a fixed 1 g.
+    grav: Vec3,
     age: f32,
     /// Vertex range (in the rocket body mesh) of the jettisoned stage.
     range: std::ops::Range<usize>,
@@ -1499,13 +1503,24 @@ impl World {
         let pd_local = self.dir_to_local(pd);
         let rot = Quat::from_rotation_arc(Vec3::Y, pd_local);
         let vel_local = self.dir_to_local_vec(v);
+        // True gravity at the separation point, in the local frame: magnitude
+        // mu/r^2 (so it is weak at altitude) pointing toward the planet centre.
+        let rmag = r.length().max(1.0);
+        let g_mag = (self.body.mu / (rmag * rmag)) as f32;
+        let grav = -self.dir_to_local_vec(r.normalize_or_zero()) * g_mag;
+        // A small, lateral nudge so the spent stage clears the climbing upper
+        // stage's nozzle instead of overlapping it.
+        let side = pd_local.cross(Vec3::Y).normalize_or_zero();
         self.launch.as_mut().unwrap().jettison();
         self.sep = Some(SepBooster {
             pos: base_local,
-            // a gentle retro push so it falls back below the climbing upper stage
-            vel: vel_local - pd_local * 12.0,
+            // Springs/retro-rockets give just a few m/s of separation: a soft
+            // retro push plus a touch of sideways drift so it floats clear and
+            // the upper stage thrusts away on its own.
+            vel: vel_local - pd_local * 3.0 + side * 1.2,
             rot,
-            spin: Vec3::new(0.7, 0.15, 1.1),
+            spin: Vec3::new(0.18, 0.05, 0.28), // slow, majestic tumble
+            grav,
             age: 0.0,
             range,
         });
@@ -1925,10 +1940,12 @@ impl World {
     fn advance_sep(&mut self, dt: f32) {
         if let Some(s) = self.sep.as_mut() {
             s.age += dt;
-            s.vel.y -= 9.2 * dt;
+            // fall away under the real (altitude-appropriate) gravity, so high up
+            // it drifts slowly and low down it arcs back below the upper stage.
+            s.vel += s.grav * dt;
             s.pos += s.vel * dt;
             s.rot = (Quat::from_scaled_axis(s.spin * dt) * s.rot).normalize();
-            if s.age > 9.0 {
+            if s.age > 14.0 {
                 self.sep = None;
             }
         }
@@ -3522,6 +3539,22 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             fly_to_staging(&mut world); // spent booster tumbling away
             0.0
         }
+        "sepfloat" => {
+            // a couple of seconds after staging, zoomed in, so the spent booster
+            // is visibly floating clear just below the climbing upper stage as the
+            // gap opens (soft push + slow tumble).
+            world.view = View::Rocket;
+            world.rocket_az = 3.4;
+            world.rocket_el = 0.16;
+            world.rocket_dist = 70.0;
+            world.rocket_focus_y = -14.0; // look down toward the drifting booster
+            world.ignite_launch();
+            fly_to_staging(&mut world);
+            for _ in 0..25 {
+                world.advance(0.1); // ~2.5 s of drift after separation
+            }
+            0.0
+        }
         "upperflame" => {
             // close-up of the upper stage firing, to check the flame sits at its
             // own nozzle (not the dropped booster's).
@@ -4663,6 +4696,8 @@ fn main() {
                 "liftoff2"
             } else if args.iter().any(|a| a == "liftoff") {
                 "liftoff"
+            } else if args.iter().any(|a| a == "sepfloat") {
+                "sepfloat"
             } else if args.iter().any(|a| a == "staging") {
                 "staging"
             } else if args.iter().any(|a| a == "launchmap") {
@@ -4720,6 +4755,7 @@ fn main() {
                 "loddebug" => "out/loddebug.png",
                 "loddebugmap" => "out/loddebugmap.png",
                 "staging" => "out/staging.png",
+                "sepfloat" => "out/sepfloat.png",
                 "launchmap" => "out/launchmap.png",
                 "ascent" => "out/ascent.png",
                 "flight" => "out/flight.png",

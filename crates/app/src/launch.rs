@@ -13,6 +13,15 @@ use sim::vehicle::{Vehicle, G0};
 const CDA: f64 = 6.0; // Cd * frontal area (m^2), matches the ascent model
 const CRASH_SPEED: f64 = 18.0; // m/s surface-relative impact tolerance
 
+// Attitude (pitch) response: the airframe steers toward the commanded pitch
+// like a thruster-controlled rigid body instead of snapping. `STEER_GAIN` turns
+// the angle error into a target rate (so it eases in near the command);
+// `MAX_PITCH_RATE` caps how fast it can rotate; `MAX_PITCH_ACC` caps how fast
+// that rate can change, which is what gives the rotation its inertia/momentum.
+const STEER_GAIN: f64 = 2.5; // 1/s
+const MAX_PITCH_RATE: f64 = 0.35; // rad/s (~20 deg/s)
+const MAX_PITCH_ACC: f64 = 0.5; // rad/s^2
+
 /// One live stage: its current propellant plus its fixed engine numbers.
 #[derive(Clone, Copy)]
 pub struct LiveStage {
@@ -49,8 +58,17 @@ pub struct Rocket {
     pub stages: Vec<LiveStage>,
     pub payload: f64,
     pub throttle: f64, // 0..1
-    /// Steering angle from local-up toward downrange (rad). 0 = straight up.
+    /// Commanded steering angle from local-up toward downrange (rad). 0 = up.
+    /// This is the target the player / autopilot dials; the rocket's actual
+    /// attitude (`pitch_act`) slews toward it at a limited rate so steering
+    /// reads as a rigid body pitching over, not an instant snap.
     pub pitch: f64,
+    /// Actual attitude angle the airframe currently holds (rad). Thrust and the
+    /// drawn rocket both follow this, so it lags the command realistically.
+    pub pitch_act: f64,
+    /// Current pitch angular rate (rad/s); integrated under a limited angular
+    /// acceleration so the airframe has rotational inertia.
+    pub pitch_rate: f64,
     /// Launch-site radial at ignition (defines the launch plane with `plane_n`).
     pub up0: DVec3,
     /// Orbital-plane normal (up0 x launch-heading); the turn stays in this plane.
@@ -96,6 +114,8 @@ impl Rocket {
             payload: veh.payload,
             throttle: 0.0,
             pitch: 0.0,
+            pitch_act: 0.0,
+            pitch_rate: 0.0,
             up0,
             plane_n,
             met: 0.0,
@@ -142,11 +162,25 @@ impl Rocket {
         h.normalize_or_zero()
     }
 
-    /// Unit thrust / pointing direction for the current pitch.
+    /// Unit thrust / pointing direction for the airframe's *actual* attitude
+    /// (which lags the command, so the rocket rotates instead of snapping).
     pub fn point_dir(&self) -> DVec3 {
         let up = self.r.normalize_or_zero();
         let horiz = self.horizontal(up);
-        (up * self.pitch.cos() + horiz * self.pitch.sin()).normalize_or_zero()
+        (up * self.pitch_act.cos() + horiz * self.pitch_act.sin()).normalize_or_zero()
+    }
+
+    /// Slew the actual attitude toward the commanded pitch over `dt` seconds with
+    /// a limited angular rate and acceleration, so the airframe carries
+    /// rotational inertia rather than teleporting to the new angle. A
+    /// proportional law sets the target rate (easing off near the command); the
+    /// rate itself can only change so fast (the inertia / control authority).
+    fn slew_attitude(&mut self, dt: f64) {
+        let err = self.pitch - self.pitch_act;
+        let target_rate = (err * STEER_GAIN).clamp(-MAX_PITCH_RATE, MAX_PITCH_RATE);
+        let dv = (target_rate - self.pitch_rate).clamp(-MAX_PITCH_ACC * dt, MAX_PITCH_ACC * dt);
+        self.pitch_rate += dv;
+        self.pitch_act += self.pitch_rate * dt;
     }
 
     /// Jettison the active stage and ignite the next. No-op on the last stage.
@@ -194,6 +228,9 @@ impl Rocket {
         let steps = ((dt_sim / h).ceil() as i64).clamp(1, 2000);
         for _ in 0..steps {
             self.met += h;
+            // rotate the airframe toward the commanded pitch before reading the
+            // thrust direction, so thrust follows the actual (lagging) attitude.
+            self.slew_attitude(h);
             let mass = self.mass();
             let thrust_n = self.live_thrust();
             let tdir = self.point_dir();
@@ -427,5 +464,37 @@ mod tests {
         assert_eq!(rk.just_staged, Some(0));
         assert!(rk.mass() < m0, "jettison did not drop mass");
         assert_eq!(rk.stage_name(), "Upper");
+    }
+
+    /// A sudden, large pitch command must not snap the airframe: the actual
+    /// attitude should lag (rate-limited) right after the command, then converge.
+    #[test]
+    fn attitude_slews_instead_of_snapping() {
+        let body = CentralBody::home();
+        let mut rk = pad_rocket(&body);
+        rk.throttle = 1.0;
+        rk.pitch = 80f64.to_radians(); // hard-over command
+
+        // one short tick: the airframe has barely begun to rotate, nowhere near
+        // the command (proves it does not teleport to the commanded angle).
+        rk.integrate(&body, 0.1);
+        assert!(
+            rk.pitch_act < 10f64.to_radians(),
+            "attitude snapped to {:.1} deg in 0.1 s",
+            rk.pitch_act.to_degrees()
+        );
+        // and the rotation rate is capped (rigid-body inertia, not a jump).
+        assert!(rk.pitch_rate <= MAX_PITCH_RATE + 1e-6);
+
+        // hold the command: it converges to the target within a few seconds.
+        for _ in 0..200 {
+            rk.integrate(&body, 0.1);
+        }
+        assert!(
+            (rk.pitch_act - rk.pitch).abs() < 2f64.to_radians(),
+            "attitude failed to converge: act={:.1} cmd={:.1}",
+            rk.pitch_act.to_degrees(),
+            rk.pitch.to_degrees()
+        );
     }
 }
