@@ -193,10 +193,14 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 
     var col = atmosphere(cam, ray, sun, rp, ra);
 
-    // Sun disk + glow, only when the line of sight to the sun is not blocked by
-    // the planet body.
     let pl = ray_sphere(cam, ray, rp);
     let sun_vis = select(1.0, 0.0, pl.x > 0.0);
+
+    // Stars in the part of the sky that misses the planet, fading in as the
+    // atmosphere thins toward space (the bright daytime sky washes them out, so
+    // they only appear once `col` is dark - i.e. high up or on the night side).
+    let dark = clamp(1.0 - (col.r + col.g + col.b) * 3.0, 0.0, 1.0);
+    col = col + starfield(ray) * sun_vis * dark;
     let sd = max(dot(ray, sun), 0.0);
     let disk = smoothstep(0.9996, 0.9999, sd) * 14.0;
     let glow = pow(sd, 1500.0) * 6.0;

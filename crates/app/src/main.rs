@@ -28,6 +28,7 @@ mod flight;
 mod launch;
 mod mission;
 mod rocket;
+mod terrain_job;
 mod ui;
 mod universe;
 use flight::{Craft, GravBody, Mode};
@@ -136,8 +137,18 @@ const FX_CAP: u64 = 60000;
 /// Dynamic rocket-view geometry (pad + rocket + spent booster, or a surface
 /// mesh: moon base / cargo module / a full procedural asteroid ~66k verts).
 const DYN_MESH_CAP: u64 = 200_000;
-/// Full-planet LOD terrain (rebuilt as the camera moves).
+/// Full-planet LOD terrain (rebuilt as the rocket moves across the grid).
 const TERRAIN_CAP: u64 = 500_000;
+
+/// Floating-origin grid for the planet terrain. The reference is snapped to a
+/// lattice so the same rocket position always yields byte-identical geometry
+/// (no shimmer) and the mesh only rebuilds when the rocket crosses a cell. The
+/// cell size grows with altitude (finer near the ground), snapped to a power of
+/// two so it changes only at discrete altitude octaves rather than drifting.
+/// The min is ~1 km so slow, low movement never thrashes the mesh; the max
+/// keeps rebuilds rare from orbit.
+const TERRAIN_GRID_MIN_M: f64 = 1_024.0;
+const TERRAIN_GRID_MAX_M: f64 = 262_144.0;
 
 /// Render-space length unit for the system view: 1000 km.
 const MM: f32 = 1.0e6;
@@ -162,7 +173,7 @@ const HANGAR_LIGHTS: [(Vec3, [f32; 3], f32); 6] = [
 /// Depth format for the rocket view's mesh pass.
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum View {
     /// Orbital map: perspective view of the bodies + launch/orbit trajectories.
     Map,
@@ -386,6 +397,10 @@ struct World {
     pad_mesh: rocket::Mesh,
     hangar_mesh: rocket::Mesh,
     rack_mesh: rocket::Mesh,
+    /// The crawlerway road (static) and the mobile launch platform that carries
+    /// the rocket along it (drawn at the rocket's resting base while not flown).
+    road_mesh: rocket::Mesh,
+    platform_mesh: rocket::Mesh,
     lander_mesh: rocket::Mesh,
     /// Show the lunar lander standing on the ground (instead of the rocket).
     show_lander: bool,
@@ -444,6 +459,8 @@ struct World {
     terrain_dirty: bool,
     terrain_verts: Vec<rocket::MeshVertex>,
     terrain_count: u32,
+    /// Background planet-terrain mesher (double-buffered). See [`terrain_job`].
+    terrain_svc: terrain_job::TerrainService,
 
     // orbital map: a perspective camera framing the focused body.
     view: View,
@@ -466,12 +483,18 @@ struct World {
     rocket_el: f32,
     rocket_dist: f32,
     rocket_focus_y: f32,
+    /// Smoothed model-Y the launched camera aims at: it lerps toward the centre
+    /// of the still-attached geometry, so after a stage drops the framing
+    /// re-centres on the remaining stack instead of jumping. 0 = uninitialised.
+    cam_focus_y: f32,
 
     universe: Universe,
     /// Indices into `universe.bodies` of the navigable bodies (stars + planets).
     nav: Vec<usize>,
     /// Index (into `universe.bodies`) of the focused body.
     focus: usize,
+    /// When set, the map camera frames the active vehicle instead of `focus`.
+    focus_rocket: bool,
     /// egui body-browser search text.
     ui_search: String,
 }
@@ -516,6 +539,10 @@ impl World {
             pad_mesh: rocket::pad_and_mount(),
             hangar_mesh: rocket::hangar(HANGAR_POS, &HANGAR_LIGHTS.map(|l| l.0)),
             rack_mesh: rack_mesh_init,
+            // road from the hangar door out past the pad, with the platform that
+            // crawls the rocket along it.
+            road_mesh: rocket::crawlerway(HANGAR_POS.x, 12.0, 14.0),
+            platform_mesh: rocket::crawler_platform(),
             lander_mesh: rocket::lander(),
             show_lander: false,
             base_mesh: None,
@@ -547,6 +574,7 @@ impl World {
             terrain_dirty: true,
             terrain_verts: Vec::new(),
             terrain_count: 0,
+            terrain_svc: terrain_job::TerrainService::new(),
             view: View::Rocket,
             sys_az: 1.4,
             sys_el: 0.30,
@@ -563,9 +591,11 @@ impl World {
             rocket_el: 0.18,
             rocket_dist: 52.0,
             rocket_focus_y: rocket_frame.0,
+            cam_focus_y: 0.0,
             universe: Universe { bodies: Vec::new() },
             nav: Vec::new(),
             focus: 0,
+            focus_rocket: false,
             ui_search: String::new(),
         };
         // Generate the full Kepler-47 system; the landable moon is injected as
@@ -579,8 +609,10 @@ impl World {
             .filter(|(_, b)| matches!(b.kind, Kind::StarA | Kind::StarB | Kind::Planet))
             .map(|(i, _)| i)
             .collect();
-        // default focus: the home world (body index)
+        // default focus: the active vehicle (falls back to the launch site on
+        // the home world before launch).
         w.focus = w.universe.home_index();
+        w.focus_rocket = true;
         w.apply_focus();
         w
     }
@@ -591,7 +623,38 @@ impl World {
     }
 
     fn focus_label(&self) -> &str {
-        self.focus_body().name.as_str()
+        if self.focus_rocket {
+            "ACTIVE VEHICLE"
+        } else {
+            self.focus_body().name.as_str()
+        }
+    }
+
+    /// The active vehicle's position in system (Mm) coords: the home world's
+    /// orbital position plus the rocket/craft offset (or the launch site before
+    /// launch), converting home-centred metres to Mm.
+    fn rocket_focus_pos(&self) -> DVec3 {
+        let home = self.universe.position(self.universe.home_index(), self.sys_time);
+        let r = self
+            .launch
+            .as_ref()
+            .map(|rk| rk.r)
+            .or_else(|| self.flight.as_ref().map(|c| c.r))
+            .unwrap_or(self.launch_origin);
+        home + r / MM as f64
+    }
+
+    /// Frame the active vehicle in the map view.
+    fn set_focus_rocket(&mut self) {
+        self.focus_rocket = true;
+        self.apply_focus();
+    }
+
+    /// True when the map camera is pulled back to system scale (well beyond the
+    /// home world), where clicking bodies to focus them makes sense. Close in -
+    /// framing the vehicle or home world - click-to-focus is disabled.
+    fn in_system_view(&self) -> bool {
+        self.sys_dist > self.home_radius_mm as f64 * 8.0
     }
 
     /// Pick the nearest body to a screen position (any body, incl. moons /
@@ -622,20 +685,29 @@ impl World {
 
     fn set_focus(&mut self, body_idx: usize) {
         if body_idx < self.universe.bodies.len() {
+            self.focus_rocket = false;
             self.focus = body_idx;
             self.apply_focus();
         }
     }
 
-    /// World position of the focused body at the current sim time.
+    /// World position of the current focus target at the current sim time.
     fn focus_pos(&self) -> DVec3 {
-        self.universe.position(self.focus, self.sys_time)
+        if self.focus_rocket {
+            self.rocket_focus_pos()
+        } else {
+            self.universe.position(self.focus, self.sys_time)
+        }
     }
 
     fn apply_focus(&mut self) {
-        let radius = self.focus_body().radius;
         self.sys_focus = self.focus_pos();
-        self.sys_dist = (radius * 4.0).max(2.0);
+        self.sys_dist = if self.focus_rocket {
+            // close enough to frame the home world and the vehicle's near orbit
+            (self.home_radius_mm as f64 * 4.0).max(2.0)
+        } else {
+            (self.focus_body().radius * 4.0).max(2.0)
+        };
     }
 
     fn grav_bodies(&self) -> Vec<GravBody> {
@@ -700,10 +772,17 @@ impl World {
         // shader (sun.w = 1) and kill the fog so the surface reads dark with
         // hard, high-contrast crater shadows.
         let lunar = if self.lunar { 1.0 } else { 0.0 };
+        // Aerial-perspective haze scales with the air the camera sits in (an
+        // exp falloff at the Rayleigh scale height), so distant ground hazes
+        // near the surface but the planet stays crisp when viewed from orbit -
+        // otherwise the raw view distance fogs the whole disk to white.
+        let cam_alt =
+            (self.cam_world(self.camera_eye_local()).length() - self.body.radius).max(0.0) as f32;
+        let fog_scale = (-cam_alt / 8_000.0).exp();
         let fog = if self.lunar {
             [0.0, 0.0, 0.0, 0.0]
         } else {
-            [HORIZON[0], HORIZON[1], HORIZON[2], 1.0 / 160_000.0]
+            [HORIZON[0], HORIZON[1], HORIZON[2], fog_scale / 160_000.0]
         };
         // A low, grazing sun on the moon throws long shadows off the crater rims;
         // a higher sun for deep-space asteroid portraits.
@@ -901,9 +980,10 @@ impl World {
             }
         }
 
-        // roll the assembled rocket out of the hangar across the flats to the pad
+        // roll the assembled rocket out of the hangar across the flats to the
+        // pad. ~64 s end to end: a slow crawler-transporter pace.
         if self.rolling_out {
-            self.rollout = (self.rollout + frame_dt / 16.0).min(1.0);
+            self.rollout = (self.rollout + frame_dt / 64.0).min(1.0);
             if self.rollout >= 1.0 {
                 self.rolling_out = false;
                 self.vab_mode = false; // now on the pad, ready to launch
@@ -922,19 +1002,97 @@ impl World {
         self.advance_sep(frame_dt * self.warp.min(8.0));
         self.advance_smoke(fx_dt);
 
-        // Floating-origin reference: snap near the camera and rebuild the planet
-        // terrain when the camera has moved far from the last reference (also
-        // refreshes the LOD as the rocket climbs). Threshold grows with altitude
-        // so we rebuild often near the ground and rarely high up.
+        // Keep the planet terrain in sync with the floating-origin reference.
         if self.view == View::Rocket {
-            let eye = self.camera_eye_local();
-            let alt = self.cam_world(eye).length() - self.body.radius;
-            let thresh = (alt.abs() * 0.04).clamp(25.0, 50_000.0);
-            if self.terrain_verts.is_empty() || (eye - self.ref_local).length() > thresh {
-                self.ref_local = eye;
-                self.rebuild_terrain();
-                self.terrain_dirty = true; // upload pending
+            if !self.space && self.ast_elev.is_none() {
+                self.update_planet_terrain();
+            } else {
+                // Asteroid / deep-space: cheap and genuinely camera-driven (you
+                // orbit the body to refine it), so keep the original synchronous,
+                // camera-anchored rebuild.
+                let eye = self.camera_eye_local();
+                let alt = self.cam_world(eye).length() - self.body.radius;
+                let thresh = (alt.abs() * 0.04).clamp(25.0, 50_000.0);
+                if self.terrain_verts.is_empty() || (eye - self.ref_local).length() > thresh {
+                    self.ref_local = eye;
+                    self.rebuild_terrain();
+                    self.terrain_dirty = true;
+                }
             }
+
+            // Smoothly track the centre of the still-attached geometry so the
+            // camera re-centres on the remaining stack after a stage drops.
+            let target_center = match self.launch.as_ref() {
+                Some(rk) => self.remaining_center_y(rk.stage_base),
+                None => self.rocket_body.focus_y,
+            };
+            if self.cam_focus_y <= 0.0 {
+                self.cam_focus_y = target_center; // first frame: snap
+            } else {
+                let k = 1.0 - (-frame_dt / 0.6).exp();
+                self.cam_focus_y += (target_center - self.cam_focus_y) * k;
+            }
+        }
+    }
+
+    /// Grid-snapped terrain anchor in local metres. Anchored to the framed
+    /// rocket (NOT the orbiting camera), so looking around never moves it; and
+    /// quantised to a power-of-two lattice (cell ~ 5% of altitude) so the
+    /// floating origin - and therefore the geometry built around it - is
+    /// deterministic: identical rocket position => identical mesh, and it only
+    /// changes at fixed lattice steps as the rocket actually travels.
+    fn terrain_anchor_local(&self) -> DVec3 {
+        let p = self.cam_target_local();
+        let alt = (self.cam_world(p).length() - self.body.radius).max(1.0);
+        // The quadtree stops splitting once a patch is about `altitude /
+        // split_factor` across, so that is the finest patch edge near the
+        // rocket. Make the rebuild threshold (the grid cell) ~half of it: lower
+        // LODs (higher up) therefore get proportionally larger thresholds, and
+        // we never rebuild for sub-patch motion. `SPLIT_FACTOR` must match the
+        // value `planet_terrain` passes to `select()`.
+        const SPLIT_FACTOR: f64 = 1.5;
+        let raw = (0.5 * alt / SPLIT_FACTOR).clamp(TERRAIN_GRID_MIN_M, TERRAIN_GRID_MAX_M);
+        // Snap the cell size itself to a power of two so it only steps at
+        // altitude octaves instead of drifting continuously with altitude.
+        let grid = (raw.log2().floor()).exp2();
+        DVec3::new(
+            (p.x / grid).round() * grid,
+            (p.y / grid).round() * grid,
+            (p.z / grid).round() * grid,
+        )
+    }
+
+    /// Planet terrain update: rebuild only when the rocket crosses into a new
+    /// grid cell. The heavy mesh build runs on the worker thread and is double-
+    /// buffered (the current mesh keeps drawing until the new one is ready), so
+    /// crossing a cell never spikes a frame. The very first build is synchronous
+    /// so there is never a blank frame (and headless shots are unaffected).
+    fn update_planet_terrain(&mut self) {
+        let anchor = self.terrain_anchor_local();
+        if self.terrain_verts.is_empty() {
+            self.ref_local = anchor;
+            self.rebuild_terrain();
+            self.terrain_dirty = true;
+        } else if anchor != self.ref_local && !self.terrain_svc.busy() {
+            self.terrain_svc.request(terrain_job::PlanetJob {
+                cam_world: self.cam_world(anchor),
+                ref_local: anchor,
+                origin: self.launch_origin,
+                up: self.launch_up,
+                east: self.launch_east,
+                north: self.launch_north,
+                depth: 19,
+                lunar: self.lunar,
+            });
+        }
+
+        // Adopt any mesh the worker finished, swapping its reference origin in
+        // atomically with its vertices.
+        if let Some(res) = self.terrain_svc.try_recv() {
+            self.ref_local = res.ref_local;
+            self.terrain_count = (res.verts.len() as u64).min(TERRAIN_CAP) as u32;
+            self.terrain_verts = res.verts;
+            self.terrain_dirty = true; // upload pending
         }
     }
 
@@ -975,16 +1133,41 @@ impl World {
         }
     }
 
+    /// Model-Y centroid of the geometry still attached at `stage_base` (the
+    /// active stage and everything above it, including the payload). Used to
+    /// re-centre the camera on the remaining stack after a stage separates.
+    fn remaining_center_y(&self, stage_base: usize) -> f32 {
+        let rb = &self.rocket_body;
+        let mut sum = 0.0f64;
+        let mut n = 0u32;
+        for r in rb.stage_ranges.iter().skip(stage_base) {
+            for v in &rb.mesh.verts[r.clone()] {
+                sum += v.pos[1] as f64;
+                n += 1;
+            }
+        }
+        for v in &rb.mesh.verts[rb.payload_range.clone()] {
+            sum += v.pos[1] as f64;
+            n += 1;
+        }
+        if n == 0 {
+            rb.focus_y
+        } else {
+            (sum / n as f64) as f32
+        }
+    }
+
     /// The point the rocket-view camera looks at (launch-tangent metres, f64).
     fn camera_look_local(&self) -> DVec3 {
         let target = self.cam_target_local();
         match self.launch.as_ref() {
             Some(rk) => {
-                // Low and slow: look near the base so the pad + smoke stay framed;
-                // ease up the stack as the rocket climbs away.
+                // Aim at the smoothed centre of the remaining geometry (so the
+                // framing re-centres after staging), eased down toward the base
+                // low and slow so the pad + smoke stay framed at liftoff.
                 let axis = self.dir_to_local_d(rk.point_dir());
-                let f = self.rocket_focus_y as f64 * (self.to_local_d(rk.r).y / 120.0).clamp(0.25, 1.0);
-                target + axis * f
+                let ease = (self.to_local_d(rk.r).y / 120.0).clamp(0.25, 1.0);
+                target + axis * (self.cam_focus_y as f64 * ease)
             }
             None => target + DVec3::new(0.0, self.rocket_focus_y as f64, 0.0),
         }
@@ -1385,7 +1568,10 @@ impl World {
             self.terrain_count = 0;
             return;
         }
-        let cam_world = self.cam_world(self.camera_eye_local());
+        // Anchor the LOD to the grid-snapped reference (the rocket), not the
+        // orbiting camera, so the selection - and thus the mesh - is determined
+        // solely by where the rocket is, identical every rebuild at the same ref.
+        let cam_world = self.cam_world(self.ref_local);
         let m = rocket::planet_terrain(
             cam_world,
             self.ref_local,
@@ -1473,9 +1659,22 @@ impl World {
             return out;
         }
 
+        push_static(&mut out, &self.road_mesh);
         push_static(&mut out, &self.pad_mesh);
         push_static(&mut out, &self.hangar_mesh);
         push_static(&mut out, &self.rack_mesh);
+
+        // The mobile launch platform rides under the rocket from the hangar to
+        // the pad. Drawn at the resting base (its X slides with rollout) only
+        // while the rocket has not lifted off; once flying, it has left the deck.
+        if self.launch.is_none() {
+            let rb = self.resting_base_local();
+            let deck = DVec3::new(rb.x, 0.0, rb.z); // platform built with ground at y=0
+            for v in &self.platform_mesh.verts {
+                let local = deck + Vec3::from(v.pos).as_dvec3();
+                out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: v.normal, color: v.color });
+            }
+        }
 
         // current rocket pose: in the hangar / rolling out when not launched
         let (base_local, quat, active) = match self.launch.as_ref() {
@@ -2549,6 +2748,17 @@ impl Gpu {
     }
 }
 
+/// Compact large counts for the profiler readout: 950, 12.3k, 1.20M.
+fn fmt_count(n: u32) -> String {
+    if n >= 1_000_000 {
+        format!("{:.2}M", n as f32 / 1_000_000.0)
+    } else if n >= 10_000 {
+        format!("{:.1}k", n as f32 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
 /// Push a filled diamond (two triangles) at clip point `c` with half-height
 /// `hy`, for the HUD/triangle pipeline. Square in pixels via the aspect ratio.
 fn push_filled_diamond(out: &mut Vec<OverlayVertex>, c: [f32; 2], hy: f32, aspect: f32, color: [f32; 3]) {
@@ -2661,12 +2871,26 @@ struct State {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    /// Depth attachment for the rocket-view mesh pass, recreated only on resize
+    /// (not per frame).
+    depth_view: wgpu::TextureView,
     gpu: Gpu,
     world: World,
     start: instant_now::Instant,
     last_t: f32,
     dragging: bool,
     last_cursor: (f64, f64),
+    /// Rolling FPS readout shown in the window title: frames since `fps_since`.
+    fps_frames: u32,
+    fps_since: f32,
+    /// (timestamp_s, frame_ms) samples for the on-screen graph, trimmed to the
+    /// last 10 s. Uses the true unclamped frame time so spikes show honestly.
+    frame_log: std::collections::VecDeque<(f32, f32)>,
+    /// Last frame's geometry load, shown in the graph overlay. One frame stale
+    /// (egui's primitives are only known after the graph itself is built), which
+    /// is imperceptible.
+    tri_count: u32,
+    draw_calls: u32,
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
@@ -2729,6 +2953,7 @@ impl State {
         surface.configure(&device, &config);
 
         let gpu = Gpu::new(&device, &queue, format);
+        let depth_view = create_depth(&device, width, height);
 
         // egui: context + winit input glue + wgpu renderer
         let egui_ctx = egui::Context::default();
@@ -2749,12 +2974,18 @@ impl State {
             device,
             queue,
             config,
+            depth_view,
             gpu,
             world: World::new(),
             start: instant_now::Instant::now(),
             last_t: 0.0,
             dragging: false,
             last_cursor: (0.0, 0.0),
+            fps_frames: 0,
+            fps_since: 0.0,
+            frame_log: std::collections::VecDeque::new(),
+            tri_count: 0,
+            draw_calls: 0,
             egui_ctx,
             egui_state,
             egui_renderer,
@@ -2766,7 +2997,85 @@ impl State {
             self.config.width = width;
             self.config.height = height;
             self.surface.configure(&self.device, &self.config);
+            self.depth_view = create_depth(&self.device, width, height);
         }
+    }
+
+    /// Draw the rolling frame-time graph (last ~10 s) as a small non-interactive
+    /// overlay in the bottom-left corner. Must run between egui's `begin_pass`
+    /// and `end_pass`. The blue trace is per-frame milliseconds; the green and
+    /// amber reference lines mark the 60 fps (16.7 ms) and 30 fps (33.3 ms)
+    /// budgets, so spikes above them read at a glance.
+    fn draw_frame_graph(&self) {
+        use egui::{Align2, Color32, FontId, Pos2, Sense, Stroke, Vec2};
+        if self.frame_log.len() < 2 {
+            return;
+        }
+        let now = self.last_t;
+        let window_s = 10.0_f32;
+        let peak = self.frame_log.iter().map(|&(_, ms)| ms).fold(0.0_f32, f32::max);
+        // Auto-scale the y axis to the rolling peak, floored so the 60 fps line
+        // is always visible and capped so one huge spike doesn't squash detail.
+        let max_ms = peak.max(33.4).min(200.0);
+        let cur = self.frame_log.back().map(|&(_, ms)| ms).unwrap_or(0.0);
+
+        egui::Area::new(egui::Id::new("frame-graph"))
+            .anchor(Align2::LEFT_BOTTOM, Vec2::new(12.0, -12.0))
+            .interactable(false)
+            .show(&self.egui_ctx, |ui| {
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(300.0, 96.0), Sense::hover());
+                let p = ui.painter();
+                p.rect_filled(rect, egui::CornerRadius::same(4), Color32::from_black_alpha(190));
+                for (ms, col) in [
+                    (1000.0 / 60.0, Color32::from_rgb(70, 150, 95)),
+                    (1000.0 / 30.0, Color32::from_rgb(175, 140, 60)),
+                ] {
+                    let y = rect.bottom() - (ms / max_ms) * rect.height();
+                    p.line_segment(
+                        [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
+                        Stroke::new(1.0, col),
+                    );
+                }
+                let pts: Vec<Pos2> = self
+                    .frame_log
+                    .iter()
+                    .map(|&(ts, ms)| {
+                        let x = rect.right() - ((now - ts) / window_s) * rect.width();
+                        let y = rect.bottom() - (ms.min(max_ms) / max_ms) * rect.height();
+                        Pos2::new(x.max(rect.left()), y)
+                    })
+                    .collect();
+                p.add(egui::Shape::line(pts, Stroke::new(1.0, Color32::from_rgb(120, 200, 255))));
+                p.text(
+                    rect.left_top() + Vec2::new(6.0, 4.0),
+                    Align2::LEFT_TOP,
+                    format!("{:?}  {cur:.1} ms  peak {peak:.1} ms / 10s", self.world.view),
+                    FontId::monospace(11.0),
+                    Color32::from_rgb(210, 228, 245),
+                );
+                p.text(
+                    rect.left_top() + Vec2::new(6.0, 18.0),
+                    Align2::LEFT_TOP,
+                    format!(
+                        "{} tris  {} draws",
+                        fmt_count(self.tri_count),
+                        self.draw_calls
+                    ),
+                    FontId::monospace(11.0),
+                    Color32::from_rgb(160, 190, 215),
+                );
+                // Lights up while the worker thread is meshing terrain - the
+                // rebuild that used to spike the frame now runs here instead.
+                if self.world.terrain_svc.busy() {
+                    p.text(
+                        rect.right_top() + Vec2::new(-6.0, 4.0),
+                        Align2::RIGHT_TOP,
+                        "meshing terrain",
+                        FontId::monospace(11.0),
+                        Color32::from_rgb(120, 230, 140),
+                    );
+                }
+            });
     }
 
     fn render(&mut self) {
@@ -2781,9 +3090,36 @@ impl State {
         }
 
         let t = self.start.elapsed().as_secs_f32();
-        let frame_dt = (t - self.last_t).clamp(0.0, 0.1);
+        let raw_dt = (t - self.last_t).max(0.0);
+        let frame_dt = raw_dt.min(0.1);
         self.last_t = t;
         self.world.advance(frame_dt);
+
+        // Record the true (unclamped) frame time for the on-screen graph and
+        // trim to the last 10 s. Skip absurd gaps (startup, tab-out/resume) so a
+        // single multi-second stall doesn't flatten the whole graph.
+        let frame_ms = raw_dt * 1000.0;
+        if frame_ms < 1000.0 {
+            self.frame_log.push_back((t, frame_ms));
+        }
+        while matches!(self.frame_log.front(), Some(&(ts, _)) if t - ts > 10.0) {
+            self.frame_log.pop_front();
+        }
+
+        // Rolling FPS readout (once per second) so it's clear which view is slow.
+        self.fps_frames += 1;
+        let span = t - self.fps_since;
+        if span >= 1.0 {
+            let fps = self.fps_frames as f32 / span;
+            self.window.set_title(&format!(
+                "Mining the Sky - {:?} view - {:.0} fps ({:.1} ms)",
+                self.world.view,
+                fps,
+                1000.0 / fps.max(1.0),
+            ));
+            self.fps_frames = 0;
+            self.fps_since = t;
+        }
 
         let (n, hn, dyn_n, fx_n) = self
             .gpu
@@ -2809,11 +3145,44 @@ impl State {
         let raw_input = self.egui_state.take_egui_input(&self.window);
         self.egui_ctx.begin_pass(raw_input);
         ui::build(&self.egui_ctx, &mut self.world);
+        self.draw_frame_graph();
         let full = self.egui_ctx.end_pass();
         self.egui_state
             .handle_platform_output(&self.window, full.platform_output);
         let ppp = self.egui_ctx.pixels_per_point();
         let prims = self.egui_ctx.tessellate(full.shapes, ppp);
+
+        // Geometry load for the profiler overlay. egui contributes one draw and
+        // indices/3 triangles per clipped primitive; the scene pipelines are
+        // triangle lists except the line overlay (counted as draws, not tris).
+        let egui_tris: u32 = prims
+            .iter()
+            .map(|p| match &p.primitive {
+                egui::epaint::Primitive::Mesh(m) => (m.indices.len() / 3) as u32,
+                _ => 0,
+            })
+            .sum();
+        let egui_draws = prims.len() as u32;
+        let (scene_tris, scene_draws) = if self.world.view == View::Rocket {
+            let tris = 1 // sky fullscreen triangle
+                + terrain_n / 3
+                + dyn_n / 3
+                + fx_n / 3
+                + hn as u32 / 3;
+            let draws = 1 // sky
+                + (terrain_n > 0) as u32
+                + (dyn_n > 0) as u32
+                + (fx_n > 0) as u32
+                + (n > 0) as u32 // overlay (lines)
+                + (hn > 0) as u32; // hud
+            (tris, draws)
+        } else {
+            // Map: one fullscreen raymarch triangle + hud; overlay is lines.
+            (1 + hn as u32 / 3, 1 + (n > 0) as u32 + (hn > 0) as u32)
+        };
+        self.tri_count = scene_tris + egui_tris;
+        self.draw_calls = scene_draws + egui_draws;
+
         for (id, delta) in &full.textures_delta.set {
             self.egui_renderer
                 .update_texture(&self.device, &self.queue, *id, delta);
@@ -2826,9 +3195,8 @@ impl State {
             .update_buffers(&self.device, &self.queue, &mut encoder, &prims, &screen);
 
         if self.world.view == View::Rocket {
-            let depth = create_depth(&self.device, self.config.width, self.config.height);
             {
-                let mut pass = mesh_pass(&mut encoder, &view, &depth);
+                let mut pass = mesh_pass(&mut encoder, &view, &self.depth_view);
                 self.gpu.draw_sky(&mut pass);
                 self.gpu.draw_meshes(&mut pass, terrain_n, dyn_n);
                 self.gpu.draw_fx(&mut pass, fx_n);
@@ -3889,10 +4257,17 @@ impl ApplicationHandler<UserEvent> for App {
         if egui_resp.consumed
             && matches!(
                 event,
-                WindowEvent::MouseInput { .. }
-                    | WindowEvent::MouseWheel { .. }
-                    | WindowEvent::KeyboardInput { .. }
+                WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. }
             )
+        {
+            return;
+        }
+        // For keys, only let egui win when it actually wants text input (a
+        // focused text field). Otherwise the game keeps its shortcuts - notably
+        // Tab, which egui's focus navigation would otherwise swallow before it
+        // ever reaches `toggle_view()`.
+        if matches!(event, WindowEvent::KeyboardInput { .. })
+            && state.egui_ctx.wants_keyboard_input()
         {
             return;
         }
@@ -3912,8 +4287,10 @@ impl ApplicationHandler<UserEvent> for App {
                     let (cx, cy) = (state.last_cursor.0 as f32, state.last_cursor.1 as f32);
                     let ndc = [cx / w * 2.0 - 1.0, 1.0 - cy / h * 2.0];
                     if pressed {
-                        // map: click a body to focus it
-                        if state.world.view == View::Map {
+                        // map: click a body to focus it, but only when zoomed out
+                        // to system scale - up close (framing the vehicle/home)
+                        // a stray click must not snap focus to a random body.
+                        if state.world.view == View::Map && state.world.in_system_view() {
                             if let Some(b) = state.world.pick_body((w, h), cx, cy) {
                                 state.world.set_focus(b);
                                 return;
