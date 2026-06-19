@@ -325,6 +325,7 @@ fn rollout_panel(ctx: &egui::Context, world: &mut World) {
     let speed = world.rollout_speed;
     // Some(true) = crank crawler faster, Some(false) = slower (handled below).
     let mut bump: Option<bool> = None;
+    let mut skip = false;
 
     egui::Window::new("ROLL OUT")
         .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 12.0))
@@ -348,10 +349,22 @@ fn rollout_panel(ctx: &egui::Context, world: &mut World) {
                 }
             });
             ui.label(egui::RichText::new("Keys , and . also adjust  ([ ] = time warp)").color(DIM).small());
+            ui.separator();
+            let btn = egui::Button::new(
+                egui::RichText::new("SKIP TO PAD").strong().color(egui::Color32::BLACK),
+            )
+            .fill(AMBER)
+            .min_size(egui::vec2(150.0, 24.0));
+            if ui.add(btn).clicked() {
+                skip = true;
+            }
         });
 
     if let Some(faster) = bump {
         world.bump_rollout_speed(faster);
+    }
+    if skip {
+        world.skip_rollout();
     }
 }
 

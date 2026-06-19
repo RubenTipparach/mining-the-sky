@@ -256,6 +256,29 @@ struct PlasmaUniforms {
     prims: [[f32; 4]; MAX_PLASMA_PRIMS * 2],
 }
 
+/// Max engine nozzles for the volumetric plume pass (main + radial boosters).
+const MAX_PLUME_NOZZLES: usize = 12;
+
+/// Uniforms for the volumetric exhaust-plume pass (camera-relative scene space).
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct PlumeUniforms {
+    right: [f32; 4],
+    up: [f32; 4],
+    fwd: [f32; 4],
+    eye: [f32; 4],
+    /// xyz = bounding centre (camera-relative), w = bounding radius.
+    center: [f32; 4],
+    /// xyz = exhaust direction (unit), w = plume length.
+    dir: [f32; 4],
+    /// x = tan(fov/2), y = aspect, z = time, w = intensity (0..1).
+    params: [f32; 4],
+    /// x = nozzle count, y = base radius.
+    nnoz: [f32; 4],
+    /// Per nozzle: xyz position (camera-relative), w = per-nozzle radius scale.
+    noz: [[f32; 4]; MAX_PLUME_NOZZLES],
+}
+
 /// Far plane for the rocket-view log-depth buffer (m): beyond planet diameter.
 const LOG_DEPTH_FAR: f32 = 2.0e7;
 
@@ -1023,16 +1046,22 @@ impl World {
                 let height = self.rocket_body.height.max(8.0);
                 let center = self.rel(base + (quat * Vec3::new(0.0, height * 0.45, 0.0)).as_dvec3());
                 let vrad = self.rocket_body.engine_r.first().copied().unwrap_or(2.0).max(2.5);
-                // Airflow direction. Snap it to the vehicle's own long axis (the
-                // nose direction the mesh is drawn along) instead of the raw
-                // velocity, so the bow shock + wake stay glued to the real
-                // geometry and the tail streams straight out the back rather than
-                // skewing off at the flight-path angle (angle of attack). The
-                // velocity only picks which end meets the airstream (windward).
+                // Airflow direction. In near-axial flight we snap it to the
+                // vehicle's long axis so the bow shock + wake stay glued to the
+                // geometry (no skew); as the angle of attack grows we blend
+                // toward the true velocity so a side-on / tumbling entry lights
+                // up the windward belly and the tail trails straight back along
+                // the airstream rather than the body. The velocity always picks
+                // which axis end is windward.
                 let axis = self.dir_to_local(rk.point_dir());
                 let vdir = self.dir_to_local(rk.v.normalize_or_zero());
-                let flow = if vdir.length_squared() > 1e-6 && vdir.dot(axis) < 0.0 {
-                    -axis
+                let flow = if vdir.length_squared() > 1e-6 {
+                    let axis_signed = if vdir.dot(axis) < 0.0 { -axis } else { axis };
+                    let aoa = vdir.dot(axis_signed).clamp(-1.0, 1.0).acos(); // 0 axial .. pi
+                    // 0 below ~12 deg (clean axial), 1 above ~55 deg (follow wind)
+                    let t = ((aoa - 0.21) / (0.96 - 0.21)).clamp(0.0, 1.0);
+                    let blend = t * t * (3.0 - 2.0 * t);
+                    axis_signed.lerp(vdir, blend).normalize_or_zero()
                 } else {
                     axis
                 };
@@ -1072,6 +1101,70 @@ impl World {
             params: [tan, aspect, self.anim, self.plasma_heat()],
             nprims: [np as f32, 0.0, 0.0, 0.0],
             prims,
+        }
+    }
+
+    /// Exhaust intensity of the active engine (0 when not thrusting / destroyed).
+    fn plume_intensity(&self) -> f32 {
+        self.launch
+            .as_ref()
+            .filter(|rk| !rk.destroyed && rk.live_thrust() > 0.0)
+            .map(|rk| rk.throttle as f32)
+            .unwrap_or(0.0)
+    }
+
+    /// Uniforms for the volumetric exhaust-plume pass: the active engine nozzle
+    /// (plus any radial-booster nozzles), all firing along the exhaust direction.
+    fn plume_uniforms(&self, res: [f32; 2]) -> PlumeUniforms {
+        let aspect = res[0] / res[1].max(1.0);
+        let (eye, _t, right, up, fwd, tan) = self.rocket_camera(aspect);
+        let inten = self.plume_intensity();
+        let mut noz = [[0.0f32; 4]; MAX_PLUME_NOZZLES];
+        let mut nn = 0usize;
+        let (center, bound, dir, length, base_r) = match self.launch.as_ref() {
+            Some(rk) => {
+                let pdir = self.dir_to_local(rk.point_dir());
+                let exhaust = -pdir;
+                let q = Quat::from_rotation_arc(Vec3::Y, pdir);
+                let base = self.to_local_d(rk.r);
+                let sb = rk.stage_base;
+                let er = self.rocket_body.engine_r.get(sb).copied().unwrap_or(0.9).max(0.5);
+                let ny = self.rocket_body.nozzle_y.get(sb).copied().unwrap_or(0.0);
+                let booster_stage = sb == 0;
+                let length = (if booster_stage { 30.0 } else { 18.0 }) * (0.6 + 0.4 * inten);
+                let main = self.rel(base + (q * Vec3::new(0.0, ny - 1.2, 0.0)).as_dvec3());
+                noz[nn] = [main.x, main.y, main.z, 1.0];
+                nn += 1;
+                let mut spread = 0.0f32;
+                if let Some(&(bn, rr)) = self.rocket_body.booster_rings.get(sb) {
+                    spread = rr;
+                    for k in 0..bn {
+                        if nn >= MAX_PLUME_NOZZLES {
+                            break;
+                        }
+                        let a = k as f32 / bn.max(1) as f32 * std::f32::consts::TAU;
+                        let off = Vec3::new(a.cos() * rr, ny - 1.0, a.sin() * rr);
+                        let p = self.rel(base + (q * off).as_dvec3());
+                        noz[nn] = [p.x, p.y, p.z, 0.6];
+                        nn += 1;
+                    }
+                }
+                let center = main + exhaust * (length * 0.5);
+                let bound = length * 0.65 + spread + er * 2.0;
+                (center, bound, exhaust, length, er)
+            }
+            None => (Vec3::ZERO, 10.0, Vec3::NEG_Y, 10.0, 1.0),
+        };
+        PlumeUniforms {
+            right: [right.x, right.y, right.z, 0.0],
+            up: [up.x, up.y, up.z, 0.0],
+            fwd: [fwd.x, fwd.y, fwd.z, 0.0],
+            eye: [eye.x, eye.y, eye.z, 0.0],
+            center: [center.x, center.y, center.z, bound],
+            dir: [dir.x, dir.y, dir.z, length],
+            params: [tan, aspect, self.anim, inten],
+            nnoz: [nn as f32, base_r, 0.0, 0.0],
+            noz,
         }
     }
 
@@ -1509,6 +1602,13 @@ impl World {
             self.rebuild_vehicle();
             self.rolling_out = true;
         }
+    }
+
+    /// Skip the crawler animation and jump straight to the pad, ready to launch.
+    fn skip_rollout(&mut self) {
+        self.rollout = 1.0;
+        self.rolling_out = false;
+        self.vab_mode = false;
     }
 
     /// Speed up (or slow down) the crawler while it rolls out to the pad.
@@ -2015,95 +2115,9 @@ impl World {
     /// particle trail (camera-facing puffs). `right`/`up` are the camera basis.
     fn build_fx(&self, eye: Vec3, right: Vec3, up: Vec3) -> Vec<FxVertex> {
         let mut out: Vec<FxVertex> = Vec::new();
-        // (re-entry plasma is now a dedicated volumetric pass; see plasma.wgsl.)
-
-        // ---- exhaust flame at the active nozzle ----
-        if let Some(rk) = self.launch.as_ref() {
-            let tf = if rk.live_thrust() > 0.0 { rk.throttle as f32 } else { 0.0 };
-            if tf > 0.0 {
-                let booster = rk.stage_base == 0;
-                let down = -self.dir_to_local(rk.point_dir()); // flame opposes thrust
-                let er = self.rocket_body.engine_r.get(rk.stage_base).copied().unwrap_or(0.9)
-                    * 1.6;
-                // Anchor at the ACTIVE stage's engine: its nozzle sits up the mesh
-                // by `nozzle_y`, so after a stage drops the flame stays at the new
-                // active engine instead of the old base.
-                let q = Quat::from_rotation_arc(Vec3::Y, self.dir_to_local(rk.point_dir()));
-                let ny = self.rocket_body.nozzle_y.get(rk.stage_base).copied().unwrap_or(0.0);
-                let mount = self.to_local_d(rk.r) + (q * Vec3::new(0.0, ny - 1.2, 0.0)).as_dvec3();
-                let nozzle = self.rel(mount);
-                let len = (if booster { 17.0 } else { 10.5 }) * (0.55 + 0.45 * tf);
-                // axis billboard: width axis is perpendicular to the flame and to
-                // the view ray, so the card faces the camera.
-                let view = (nozzle - eye).normalize_or_zero();
-                let mut w_axis = down.cross(view).normalize_or_zero();
-                if w_axis.length_squared() < 1e-4 {
-                    w_axis = right;
-                }
-                let mut card = |length: f32, half_w: f32, seed: f32, inten: f32| {
-                    let tip = nozzle + down * length;
-                    let wn = w_axis * half_w;
-                    let wt = w_axis * (half_w * 0.22);
-                    let col = [seed, inten, 0.0, 0.0];
-                    let q = [
-                        (nozzle - wn, [0.0f32, 0.0]),
-                        (nozzle + wn, [1.0, 0.0]),
-                        (tip + wt, [1.0, 1.0]),
-                        (tip - wt, [0.0, 1.0]),
-                    ];
-                    for &i in &[0usize, 1, 2, 0, 2, 3] {
-                        out.push(FxVertex { pos: q[i].0.into(), uv: q[i].1, color: col, kind: 0.0 });
-                    }
-                };
-                card(len, er * 1.9, 0.10, tf); // wide orange body
-                card(len * 0.5, er * 1.0, 0.63, tf * 1.3); // white-hot core
-            }
-        }
-
-        // ---- radial-booster exhaust plumes (one per strap-on nozzle) ----
-        if let Some(rk) = self.launch.as_ref() {
-            let tf = if rk.live_thrust() > 0.0 { rk.throttle as f32 } else { 0.0 };
-            let ring = self.rocket_body.booster_rings.get(rk.stage_base).copied();
-            if tf > 0.0 {
-                if let Some((bn, rr)) = ring {
-                    if bn > 0 {
-                        let pd = self.dir_to_local(rk.point_dir());
-                        let down = -pd;
-                        let q = Quat::from_rotation_arc(Vec3::Y, pd);
-                        let ny = self.rocket_body.nozzle_y.get(rk.stage_base).copied().unwrap_or(0.0);
-                        let base = self.to_local_d(rk.r);
-                        let blen = 12.0 * (0.5 + 0.45 * tf);
-                        for k in 0..bn {
-                            let a = k as f32 / bn as f32 * std::f32::consts::TAU;
-                            let off = Vec3::new(a.cos() * rr, ny - 1.0, a.sin() * rr);
-                            let nozzle = self.rel(base + (q * off).as_dvec3());
-                            let view = (nozzle - eye).normalize_or_zero();
-                            let mut w_axis = down.cross(view).normalize_or_zero();
-                            if w_axis.length_squared() < 1e-4 {
-                                w_axis = right;
-                            }
-                            let mut card = |length: f32, half_w: f32, seed: f32, inten: f32| {
-                                let tip = nozzle + down * length;
-                                let wn = w_axis * half_w;
-                                let wt = w_axis * (half_w * 0.22);
-                                let col = [seed, inten, 0.0, 0.0];
-                                let v = [
-                                    (nozzle - wn, [0.0f32, 0.0]),
-                                    (nozzle + wn, [1.0, 0.0]),
-                                    (tip + wt, [1.0, 1.0]),
-                                    (tip - wt, [0.0, 1.0]),
-                                ];
-                                for &i in &[0usize, 1, 2, 0, 2, 3] {
-                                    out.push(FxVertex { pos: v[i].0.into(), uv: v[i].1, color: col, kind: 0.0 });
-                                }
-                            };
-                            card(blen, 1.5, 0.10, tf);
-                            card(blen * 0.5, 0.8, 0.63, tf * 1.25);
-                        }
-                    }
-                }
-            }
-        }
+        // Re-entry plasma and the engine exhaust plume are now dedicated
+        // volumetric raymarch passes (plasma.wgsl / plume.wgsl). This builder
+        // emits only the smoke trail and the lander/RCS jets.
 
         // ---- lunar descent-engine plume (under the lander's bell) ----
         if self.show_lander && self.lander_firing {
@@ -2623,6 +2637,10 @@ struct Gpu {
     plasma_pipeline: wgpu::RenderPipeline,
     plasma_uniform_buf: wgpu::Buffer,
     plasma_bind_group: wgpu::BindGroup,
+    /// Volumetric exhaust plume (fullscreen raymarch, additive over the scene).
+    plume_pipeline: wgpu::RenderPipeline,
+    plume_uniform_buf: wgpu::Buffer,
+    plume_bind_group: wgpu::BindGroup,
 }
 
 impl Gpu {
@@ -3134,6 +3152,84 @@ impl Gpu {
             cache: None,
         });
 
+        // Plume pipeline: fullscreen volumetric exhaust, composited additively.
+        let plume_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("plume"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("plume.wgsl").into()),
+        });
+        let plume_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("plume-uniforms"),
+            size: std::mem::size_of::<PlumeUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let plume_bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("plume-bind-layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let plume_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("plume-bind-group"),
+            layout: &plume_bind_layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: plume_uniform_buf.as_entire_binding() }],
+        });
+        let plume_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("plume-layout"),
+            bind_group_layouts: &[Some(&plume_bind_layout)],
+            immediate_size: 0,
+        });
+        let plume_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("plume-pipeline"),
+            layout: Some(&plume_layout),
+            vertex: wgpu::VertexState {
+                module: &plume_shader,
+                entry_point: Some("vs"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &plume_shader,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    // additive: the emissive jet adds light to the scene.
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         // Full-planet terrain is a dynamic, camera-relative buffer rebuilt as the
         // camera moves (floating origin); the rocket/pad are in dyn_vbuf.
         let terrain_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -3170,6 +3266,9 @@ impl Gpu {
             plasma_pipeline,
             plasma_uniform_buf,
             plasma_bind_group,
+            plume_pipeline,
+            plume_uniform_buf,
+            plume_bind_group,
         }
     }
 
@@ -3182,11 +3281,12 @@ impl Gpu {
         w: u32,
         h: u32,
         time: f32,
-    ) -> (usize, usize, u32, u32, bool) {
+    ) -> (usize, usize, u32, u32, bool, bool) {
         let res = [w as f32, h.max(1) as f32];
         let mut dyn_n = 0u32;
         let mut fx_n = 0u32;
         let mut plasma_on = false;
+        let mut plume_on = false;
         match world.view {
             View::Map => {
                 let su = world.scene_uniforms(res, time);
@@ -3219,6 +3319,12 @@ impl Gpu {
                     queue.write_buffer(&self.plasma_uniform_buf, 0, bytemuck::bytes_of(&pu));
                     plasma_on = true;
                 }
+                // volumetric exhaust plume while the active engine is firing.
+                if world.plume_intensity() > 0.01 {
+                    let pu = world.plume_uniforms(res);
+                    queue.write_buffer(&self.plume_uniform_buf, 0, bytemuck::bytes_of(&pu));
+                    plume_on = true;
+                }
                 let dyn_verts = world.build_dynamic_mesh();
                 dyn_n = (dyn_verts.len() as u64).min(DYN_MESH_CAP) as u32;
                 if dyn_n > 0 {
@@ -3248,7 +3354,7 @@ impl Gpu {
         if hn > 0 {
             queue.write_buffer(&self.hud_buf, 0, bytemuck::cast_slice(&hud_verts[..hn]));
         }
-        (n, hn, dyn_n, fx_n, plasma_on)
+        (n, hn, dyn_n, fx_n, plasma_on, plume_on)
     }
 
     /// Draw the thruster FX billboards (flame + smoke), in the mesh pass.
@@ -3312,6 +3418,15 @@ impl Gpu {
         if on {
             pass.set_pipeline(&self.plasma_pipeline);
             pass.set_bind_group(0, &self.plasma_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+    }
+
+    /// Volumetric exhaust plume, composited additively over the scene.
+    fn draw_plume(&self, pass: &mut wgpu::RenderPass, on: bool) {
+        if on {
+            pass.set_pipeline(&self.plume_pipeline);
+            pass.set_bind_group(0, &self.plume_bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
     }
@@ -3690,7 +3805,7 @@ impl State {
             self.fps_since = t;
         }
 
-        let (n, hn, dyn_n, fx_n, plasma_on) = self
+        let (n, hn, dyn_n, fx_n, plasma_on, plume_on) = self
             .gpu
             .prepare(&self.queue, &mut self.world, self.config.width, self.config.height, t);
         let terrain_n = self.world.terrain_count;
@@ -3768,6 +3883,7 @@ impl State {
                 let mut pass = mesh_pass(&mut encoder, &view, &self.depth_view);
                 self.gpu.draw_sky(&mut pass);
                 self.gpu.draw_meshes(&mut pass, terrain_n, dyn_n);
+                self.gpu.draw_plume(&mut pass, plume_on);
                 self.gpu.draw_plasma(&mut pass, plasma_on);
                 self.gpu.draw_fx(&mut pass, fx_n);
             }
@@ -4133,6 +4249,30 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             }
             for _ in 0..12 {
                 world.advance(0.1); // ~1.2 s for the plasma to bloom
+            }
+            world.rocket_az = 4.2;
+            world.rocket_el = 0.05;
+            world.rocket_dist = 95.0;
+            0.0
+        }
+        "reentry_side" => {
+            // belly-first: nose vertical, velocity purely horizontal (~90 deg
+            // angle of attack), so the windward side is the flank and the wake
+            // trails straight back along the airstream.
+            world.view = View::Rocket;
+            world.ignite_launch();
+            let radius = world.body.radius;
+            let up = world.launch_up;
+            let east = world.launch_east;
+            if let Some(rk) = world.launch.as_mut() {
+                rk.r = up * (radius + 55_000.0);
+                rk.pitch = 0.0;
+                rk.pitch_act = 0.0;
+                rk.v = east * 6_600.0; // broadside to the airstream
+                rk.throttle = 0.0;
+            }
+            for _ in 0..12 {
+                world.advance(0.1);
             }
             world.rocket_az = 4.2;
             world.rocket_el = 0.05;
@@ -4771,7 +4911,7 @@ fn render_shot(
     });
     let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
-    let (n, hn, dyn_n, fx_n, plasma_on) = gpu.prepare(queue, &mut world, width, height, time);
+    let (n, hn, dyn_n, fx_n, plasma_on, plume_on) = gpu.prepare(queue, &mut world, width, height, time);
     let terrain_n = world.terrain_count;
 
     // 256-byte aligned row pitch for the readback copy.
@@ -4793,6 +4933,7 @@ fn render_shot(
             let mut pass = mesh_pass(&mut encoder, &target_view, &depth);
             gpu.draw_sky(&mut pass);
             gpu.draw_meshes(&mut pass, terrain_n, dyn_n);
+            gpu.draw_plume(&mut pass, plume_on);
             gpu.draw_plasma(&mut pass, plasma_on);
             gpu.draw_fx(&mut pass, fx_n);
         }
@@ -5325,6 +5466,8 @@ fn main() {
                 "crash"
             } else if args.iter().any(|a| a == "reentry_tilt") {
                 "reentry_tilt"
+            } else if args.iter().any(|a| a == "reentry_side") {
+                "reentry_side"
             } else if args.iter().any(|a| a == "reentry") {
                 "reentry"
             } else if args.iter().any(|a| a == "sepfloat") {
