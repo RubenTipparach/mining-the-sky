@@ -103,6 +103,35 @@ fn shade_planet(p: vec3<f32>, center: vec3<f32>, color: vec3<f32>) -> vec3<f32> 
     return color * band * (0.05 + 0.95 * ndl);
 }
 
+// Detailed night-side city lights. The baked emission map (texel.a) gives the
+// regional glow (where cities are, sized by population); on top of it we add
+// procedural structure - discrete lit districts, dense cores fading to
+// scattered suburbs, a few twinkling points, and warm/cool colour variation -
+// so the lights read as a granular sprawl from space rather than a smooth blob.
+fn city_lights(n: vec3<f32>, emission: f32, time: f32) -> vec3<f32> {
+    if (emission < 0.0015) {
+        return vec3<f32>(0.0);
+    }
+    // fine grain: individual neighbourhoods/streets within the glow
+    let fine = vnoise(n * 520.0);
+    let fine2 = vnoise(n * 240.0 + vec3<f32>(7.3, 1.1, 4.2));
+    // sharpen into bright pockets sitting on a connected glow (not pure dots)
+    let cells = pow(max(fine * fine2, 0.0), 2.2);
+    // mid-scale clustering: bright downtown cores out to sparse outskirts
+    let cluster = 0.22 + 0.78 * smoothstep(0.30, 0.82, vnoise(n * 95.0));
+    // a faint road-grid shimmer between the pockets
+    let grid = 0.10 * smoothstep(0.6, 1.0, vnoise(n * 1100.0));
+    // subtle twinkle on the brightest points
+    let tw = 0.85 + 0.15 * sin(time * 2.5 + fine * 130.0);
+    let inten = emission * cluster * (0.38 + 2.3 * cells + grid) * tw;
+    // warm sodium glow, with a few cooler (whiter) modern districts
+    let cool = smoothstep(0.74, 0.92, fine2);
+    let warm = vec3<f32>(1.0, 0.72, 0.38);
+    let white = vec3<f32>(0.85, 0.90, 1.0);
+    let lcol = mix(warm, white, cool * 0.6);
+    return lcol * inten;
+}
+
 fn shade_home(p: vec3<f32>, rd: vec3<f32>) -> vec3<f32> {
     let n = normalize(p - s.home.xyz);
     let sun = normalize(s.sun.xyz - p);
@@ -119,9 +148,9 @@ fn shade_home(p: vec3<f32>, rd: vec3<f32>) -> vec3<f32> {
     let diffuse = day * (0.12 + 0.88 * max(ndl, 0.0));
     var col = albedo * vec3<f32>(1.05, 1.02, 0.95) * diffuse;
 
-    // city lights on the dark side
+    // detailed city lights on the dark side (fade in through the terminator)
     let night = 1.0 - day;
-    col = col + vec3<f32>(1.0, 0.82, 0.5) * emission * night * 1.7;
+    col = col + city_lights(n, emission, s.params.z) * night * 2.6;
 
     // atmospheric limb (rim toward the camera)
     let viewdir = -rd;

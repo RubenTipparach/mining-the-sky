@@ -4026,6 +4026,15 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.sys_dist = 60.0;
             6.0
         }
+        "citylights" => {
+            // the home world's night side, filling the frame, to show the
+            // detailed city lights on the dark hemisphere.
+            frame_map(&mut world);
+            world.sys_dist = 14.0;
+            world.sys_az = 4.3;
+            world.sys_el = 0.12;
+            6.0
+        }
         "moons" => {
             // focus a moon up close so it ray-marches as a real sphere, with its
             // gas giant looming behind.
@@ -5068,6 +5077,8 @@ fn main() {
                 "baseparts"
             } else if args.iter().any(|a| a == "moons") {
                 "moons"
+            } else if args.iter().any(|a| a == "citylights") {
+                "citylights"
             } else if args.iter().any(|a| a == "moon") {
                 "moon"
             } else if args.iter().any(|a| a == "rocket") {
@@ -5155,6 +5166,7 @@ fn main() {
                 "baseparts" => "out/baseparts.png",
                 "moons" => "out/moons.png",
                 "moon" => "out/moon.png",
+                "citylights" => "out/citylights.png",
                 "rocket" => "out/rocket.png",
                 "system" => "out/system.png",
                 "pad" => "out/pad.png",
