@@ -986,11 +986,12 @@ impl World {
                 let downwind = if vdir.length_squared() > 1e-6 { -vdir } else { -body_axis };
                 let pick = if downwind.y.abs() < 0.9 { Vec3::Y } else { Vec3::X };
                 let x = downwind.cross(pick).normalize_or_zero();
+                let _ = body_axis;
                 let height = self.rocket_body.height.max(8.0);
-                // centre on the vehicle's mid-body; the density's windward bias
-                // puts the bright shock on the leading face on its own.
-                let com = self.to_local_d(rk.r) + body_axis.as_dvec3() * (height as f64 * 0.22);
-                (downwind, x, self.rel(com), height * 0.30)
+                // anchor the comet head at the windward leading face (just into
+                // the wind); the tail streams downwind (+Y) past the body.
+                let head = self.to_local_d(rk.r) + vdir.as_dvec3() * (height as f64 * 0.06);
+                (downwind, x, self.rel(head), height * 0.30)
             }
             None => (Vec3::Y, Vec3::X, Vec3::ZERO, 20.0),
         };

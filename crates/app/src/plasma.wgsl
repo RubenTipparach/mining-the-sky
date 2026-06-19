@@ -59,28 +59,23 @@ fn tnoise(pin: vec3<f32>, spd: f32, t: f32) -> f32 {
     return rz;
 }
 
-fn map2(p: vec3<f32>) -> f32 { return length(p) - 1.3; }
-
-fn gradm(p: vec3<f32>) -> f32 {
-    let e = 0.06;
-    var d = map2(vec3<f32>(p.x, p.y - e, p.z)) - map2(vec3<f32>(p.x, p.y + e, p.z));
-    d = d + map2(vec3<f32>(p.x - e, p.y, p.z)) - map2(vec3<f32>(p.x + e, p.y, p.z));
-    d = d + map2(vec3<f32>(p.x, p.y, p.z - e)) - map2(vec3<f32>(p.x, p.y, p.z + e));
-    return d;
-}
-
-// Fireball density at a plasma-space point (after nimitz's mapVol).
+// Comet-style plasma density. The local frame has +Y = downwind (the trail
+// direction), so the bright head sits at the windward leading face (s ~ 0) and
+// a long boiling tail streams up +Y, fading out as it cools. `s` is the
+// distance downwind from the head; the tail widens and thins downstream.
 fn map_vol(pin: vec3<f32>, spd: f32, t: f32) -> f32 {
     var p = pin;
-    // The dense bright shock sits on the windward (low-y, fall-direction) side
-    // and thins out into a faint, transparent wake streaming up (+y) the body.
-    let f = smoothstep(0.0, 1.25, 2.2 - (p.y + dot(p.xz, p.xz) * 0.62));
-    let g = p.y;
-    p.y = p.y * 0.27;
-    p.z = p.z + gradm(p * 0.73) * 3.5;
-    p.y = p.y + t * 6.0;
-    var d = tnoise(p * vec3<f32>(0.3, 0.27, 0.3), spd * 0.7, t) * 1.4 + 0.01;
-    d = d + max(g * 0.12, 0.0); // faint streaming wake (kept thin/transparent)
+    let s = p.y;                 // 0 at the windward head, grows up the tail
+    let rad = length(p.xz);
+    // axial profile: rises sharply at the head, exponential cooling up the tail
+    let axial = smoothstep(-0.9, 0.15, s) * exp(-max(s, 0.0) * 0.42);
+    // the tail spreads a little downstream
+    let width = 0.38 + max(s, 0.0) * 0.16;
+    let radialf = smoothstep(width, 0.0, rad);
+    let f = axial * radialf;
+    var q = p;
+    q.y = q.y * 0.5 + t * 5.0;   // scroll the boil up the tail
+    var d = tnoise(q * vec3<f32>(0.5, 0.32, 0.5), spd * 0.7, t) * 1.6 + 0.02;
     d = d * f;
     return clamp(d, 0.0, 1.0);
 }
@@ -114,7 +109,7 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let op = vec3<f32>(dot(o, xax), dot(o, yax), dot(o, zax)) / scl;
     let dp = vec3<f32>(dot(rd, xax), dot(rd, yax), dot(rd, zax)); // unit (orthonormal basis)
 
-    let RB = 2.8;
+    let RB = 5.5;
     let iv = sphere_iv(op, dp, RB);
     if (iv.y < 0.0) {
         return vec4<f32>(0.0);
@@ -122,27 +117,27 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     var tt = max(iv.x, 0.0);
     let tmax = iv.y;
     var rz = vec4<f32>(0.0);
-    for (var i = 0; i < 48; i = i + 1) {
+    for (var i = 0; i < 64; i = i + 1) {
         if (rz.a > 0.99 || tt > tmax) {
             break;
         }
         let pos = op + dp * tt;
         let r = map_vol(pos, 0.1, t);
-        // windward (-y) density gradient -> the cool blue-white compression
-        // front sits on the leading face the air hits, not the trailing wake.
+        // windward (-y) density gradient -> a cool blue-white compression front
+        // on the leading face the air hits.
         let gr = clamp((r - map_vol(pos - vec3<f32>(0.0, 0.7, 0.0), 0.1, t)) / 0.3, 0.0, 1.0);
-        let lg = vec3<f32>(0.72, 0.28, 0.0) * 1.2 + 1.3 * vec3<f32>(0.55, 0.77, 0.9) * gr;
-        // thinner per-step opacity so the shock layer reads as translucent gas
-        var col = vec4<f32>(lg, r * r * r * 1.1);
-        col.a = col.a * smoothstep(0.4, 1.2, 0.7 - map2(vec3<f32>(pos.x, pos.y * 0.17, pos.z)));
+        // cooling along the tail: white-hot/orange head -> deep red, fading out.
+        let cool = clamp(max(pos.y, 0.0) * 0.22, 0.0, 1.0);
+        var lg = mix(vec3<f32>(1.0, 0.58, 0.18), vec3<f32>(0.58, 0.11, 0.04), cool);
+        lg = lg + 1.5 * vec3<f32>(0.55, 0.77, 0.95) * gr * (1.0 - cool); // blue-white front at the head
+        // translucent gas: thin per-step opacity, a touch denser at the hot head
+        let dens = r * r * r * (1.5 + 1.2 * (1.0 - cool));
+        var col = vec4<f32>(lg, dens);
         col = vec4<f32>(col.rgb * col.a, col.a);
         rz = rz + col * (1.0 - rz.a);
         tt = tt + 0.16;
     }
-    // warm the accumulation as in the reference, then scale by heat and keep it
-    // translucent overall (alpha capped so the scene shows through).
-    rz.g = rz.g * (rz.w * 0.9 + 0.12);
-    rz.r = rz.r * (rz.w * 0.5 + 0.48);
+    // scale by heat and keep it translucent overall (alpha capped).
     rz = rz * heat;
     rz.a = min(rz.a, 0.72);
     return clamp(rz, vec4<f32>(0.0), vec4<f32>(1.0));
