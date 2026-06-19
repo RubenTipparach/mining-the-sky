@@ -82,7 +82,7 @@ fn fs(in: VsOut) -> FsOut {
         let mask = smoothstep(1.0, 0.1, r) * n;
         let a = in.color.a * mask;
         out.color = vec4<f32>(in.color.rgb * a, a);
-    } else {
+    } else if (in.kind < 2.5) {
         // ---- RCS jet (kind 2) ----  a short, cool blue-white attitude puff
         let across = 1.0 - abs(in.uv.x - 0.5) * 2.0;
         let along = in.uv.y;
@@ -94,6 +94,46 @@ fn fs(in: VsOut) -> FsOut {
         // cool white core fading to pale blue at the tip
         let rgb = mix(vec3<f32>(0.85, 0.93, 1.0), vec3<f32>(0.45, 0.6, 1.0), along);
         out.color = vec4<f32>(rgb * a * intensity * 1.6, 0.0); // additive
+    } else {
+        // ---- reentry plasma shock (kind 3) ----
+        // uv.x across the sheet (0..1), uv.y leading shock (0, hottest) ->
+        // streaming wake (1, cooler). color.x = seed, color.y = heat (0..1.3),
+        // color.z = layer role (0 = bow-shock cap, 1 = trailing plasma streak).
+        let across = 1.0 - abs(in.uv.x - 0.5) * 2.0;
+        let along = in.uv.y;
+        let seed = in.color.x;
+        let heat = in.color.y;
+        let role = in.color.z;
+        // fast, fine turbulence so the sheet boils like real plasma
+        let turb = 0.62 + 0.38 * sin(t * 34.0 + along * 16.0 + seed * 6.28)
+                              * sin(t * 21.0 + across * 7.0 + seed * 2.0)
+                              * sin(t * 13.0 - along * 5.0);
+        // shape: a bright leading edge that streams back into a tapering tail
+        var a: f32;
+        var ramp: f32; // 0 at the hot shock front, 1 at the cool wake tip
+        if (role < 0.5) {
+            // bow-shock cap: hottest at the windward apex (along ~ 0), broad
+            a = pow(max(across, 0.0), 1.3) * pow(1.0 - along, 1.4);
+            ramp = along;
+        } else {
+            // trailing plasma streak: a thin tongue licking back off the body
+            a = pow(max(across, 0.0), 2.2) * (1.0 - along) * smoothstep(0.0, 0.15, along);
+            ramp = clamp(along * 1.1, 0.0, 1.0);
+        }
+        a = a * turb * clamp(heat, 0.0, 1.3);
+        // colour ramp: blue-white compression front -> incandescent orange ->
+        // ionised pink/magenta -> violet as the wake cools.
+        let core = vec3<f32>(0.75, 0.90, 1.0);   // blue-white shock front
+        let hot  = vec3<f32>(1.0, 0.85, 0.55);   // incandescent
+        let ion  = vec3<f32>(1.0, 0.40, 0.55);   // ionised pink
+        let tail = vec3<f32>(0.55, 0.22, 0.70);  // cooling violet
+        var rgb = mix(core, hot, smoothstep(0.0, 0.30, ramp));
+        rgb = mix(rgb, ion, smoothstep(0.30, 0.65, ramp));
+        rgb = mix(rgb, tail, smoothstep(0.65, 1.0, ramp));
+        // a white-hot sliver right at the stagnation line
+        let stag = pow(max(across, 0.0), 6.0) * pow(1.0 - along, 2.0);
+        rgb = mix(rgb, vec3<f32>(1.2, 1.2, 1.25), stag * heat);
+        out.color = vec4<f32>(rgb * a * 1.9, 0.0); // additive
     }
     return out;
 }

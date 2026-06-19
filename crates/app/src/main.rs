@@ -287,6 +287,31 @@ struct SepBooster {
     range: std::ops::Range<usize>,
 }
 
+/// One chunk of a destroyed vehicle, tumbling away from the blast in the
+/// rocket-view local frame. Like `SepBooster` but many at once, each a vertex
+/// range of the original rocket mesh.
+struct Debris {
+    pos: Vec3,
+    vel: Vec3,
+    rot: Quat,
+    spin: Vec3,
+    grav: Vec3,
+    age: f32,
+    range: std::ops::Range<usize>,
+}
+
+/// One fireball/smoke particle of an explosion. Drawn through the FX smoke
+/// pipeline, but colour-ramped from white-hot through orange to dark smoke as it
+/// ages, so a burst reads as a fireball collapsing into a smoke cloud.
+struct Boom {
+    pos: Vec3,
+    vel: Vec3,
+    age: f32,
+    life: f32,
+    size0: f32,
+    seed: f32,
+}
+
 /// A planned maneuver (burn node) on the craft's current orbit: where to burn
 /// (true anomaly `nu`) and the prograde / normal / radial delta-v (m/s).
 #[derive(Clone, Copy)]
@@ -450,6 +475,11 @@ struct World {
     /// Drag ghost position (camera-relative) while grabbing.
     grab_ghost: Vec3,
     sep: Option<SepBooster>,
+    /// Chunks of a destroyed vehicle + the fireball particles of its explosion,
+    /// and a latch so the blast spawns exactly once.
+    debris: Vec<Debris>,
+    boom: Vec<Boom>,
+    exploded: bool,
     /// Payloads delivered to orbit by completed missions (they accumulate).
     orbits: Vec<OrbitObject>,
     /// Whether the active launch's payload has been captured to orbit yet.
@@ -574,6 +604,9 @@ impl World {
             grab_target: None,
             grab_ghost: Vec3::ZERO,
             sep: None,
+            debris: Vec::new(),
+            boom: Vec::new(),
+            exploded: false,
             orbits: Vec::new(),
             mission_captured: false,
             smoke: Vec::new(),
@@ -1035,10 +1068,15 @@ impl World {
             let dt = (frame_dt * self.warp).min(2.0);
             rk.integrate(&self.body, dt as f64);
         }
+        // break-up: a destroyed vehicle (burn-through or crash) explodes once.
+        if self.launch.as_ref().map(|rk| rk.destroyed).unwrap_or(false) && !self.exploded {
+            self.spawn_explosion();
+        }
         self.capture_orbit_if_reached();
         let fx_dt = (frame_dt * self.warp).min(0.5);
         self.anim += fx_dt;
         self.advance_sep(frame_dt * self.warp.min(8.0));
+        self.advance_debris(frame_dt * self.warp.min(8.0));
         self.advance_smoke(fx_dt);
 
         // Keep the planet terrain in sync with the floating-origin reference.
@@ -1474,6 +1512,9 @@ impl World {
         rk.throttle = 1.0;
         self.launch = Some(rk);
         self.sep = None;
+        self.debris.clear();
+        self.boom.clear();
+        self.exploded = false;
         self.smoke.clear();
         self.mission_captured = false;
         // you launch from the pad: ensure we're rolled out.
@@ -1538,6 +1579,9 @@ impl World {
     fn reset_launch(&mut self) {
         self.launch = None;
         self.sep = None;
+        self.debris.clear();
+        self.boom.clear();
+        self.exploded = false;
         self.smoke.clear();
         self.mission_captured = false;
     }
@@ -1747,19 +1791,35 @@ impl World {
             None => (self.resting_base_local(), Quat::IDENTITY, 0),
         };
 
-        // draw the payload. When the fairing is closed, the whole payload range
-        // (module + clamshell) draws as one. When opening, draw the module in
-        // place and swing the two fairing halves out along local +/-X.
-        if self.fairing_open > 0.01 {
-            let off = self.fairing_open * 4.0;
-            self.xform_into(&mut out, rb.module_range.clone(), quat, base_local);
-            self.xform_into_off(&mut out, rb.fairing_l.clone(), quat, base_local, Vec3::new(-off, 0.0, 0.0));
-            self.xform_into_off(&mut out, rb.fairing_r.clone(), quat, base_local, Vec3::new(off, 0.0, 0.0));
-        } else {
-            self.xform_into(&mut out, rb.payload_range.clone(), quat, base_local);
+        // A destroyed vehicle is drawn as scattered debris (see below) instead
+        // of the intact stack; while it's flying, draw the intact rocket.
+        let destroyed = self.launch.as_ref().map(|rk| rk.destroyed).unwrap_or(false);
+        if !destroyed {
+            // draw the payload. When the fairing is closed, the whole payload
+            // range draws as one; when opening, swing the two halves out.
+            if self.fairing_open > 0.01 {
+                let off = self.fairing_open * 4.0;
+                self.xform_into(&mut out, rb.module_range.clone(), quat, base_local);
+                self.xform_into_off(&mut out, rb.fairing_l.clone(), quat, base_local, Vec3::new(-off, 0.0, 0.0));
+                self.xform_into_off(&mut out, rb.fairing_r.clone(), quat, base_local, Vec3::new(off, 0.0, 0.0));
+            } else {
+                self.xform_into(&mut out, rb.payload_range.clone(), quat, base_local);
+            }
+            for r in rb.stage_ranges.iter().skip(active) {
+                self.xform_into(&mut out, r.clone(), quat, base_local);
+            }
         }
-        for r in rb.stage_ranges.iter().skip(active) {
-            self.xform_into(&mut out, r.clone(), quat, base_local);
+
+        // explosion debris: each chunk at its own tumbling pose, charred dark.
+        for d in &self.debris {
+            for v in &rb.mesh.verts[d.range.clone()] {
+                let local = d.pos.as_dvec3() + (d.rot * Vec3::from(v.pos)).as_dvec3();
+                let n = d.rot * Vec3::from(v.normal);
+                // scorch the chunk: darken toward black as it ages
+                let s = (1.0 - 0.55 * (d.age / 16.0).clamp(0.0, 1.0)).max(0.2);
+                let c = [v.color[0] * s, v.color[1] * s, v.color[2] * s];
+                out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: n.into(), color: c });
+            }
         }
 
         // tumbling spent stage
@@ -1783,11 +1843,88 @@ impl World {
         out
     }
 
+    /// Reentry plasma: a glowing bow-shock cap wrapping the windward side of the
+    /// rocket (the face hitting the air) plus plasma streaks licking downwind, as
+    /// camera-facing additive cards (FX kind 3). Intensity tracks `rk.heat`.
+    fn push_plasma(&self, out: &mut Vec<FxVertex>, rk: &launch::Rocket, heat: f32, eye: Vec3) {
+        let vlen = rk.v.length();
+        if vlen < 1.0 {
+            return;
+        }
+        let vdir = self.dir_to_local(rk.v.normalize_or_zero()); // wind blows from +vdir
+        let axis = self.dir_to_local(rk.point_dir()); // rocket long axis
+        let base = self.to_local_d(rk.r);
+        let height = self.rocket_body.height.max(8.0);
+        let center = base + axis.as_dvec3() * (height as f64 * 0.45);
+        let rwidth = self.rocket_body.engine_r.first().copied().unwrap_or(2.0).max(2.0);
+        // a bit ahead of the rocket's furthest point into the wind
+        let lead = center + vdir.as_dvec3() * (height as f64 * 0.45 + rwidth as f64);
+        let back = -vdir; // plasma streams downwind, opposite the velocity
+
+        // axis-billboard card: length runs along `dir`, width faces the camera.
+        let mut card = |anchor: DVec3, dir: Vec3, length: f32, half_w: f32, taper: f32, seed: f32, role: f32| {
+            let a = self.rel(anchor);
+            let tip = a + dir * length;
+            let view = (a - eye).normalize_or_zero();
+            let mut w_axis = dir.cross(view).normalize_or_zero();
+            if w_axis.length_squared() < 1e-4 {
+                w_axis = Vec3::Y.cross(dir).normalize_or_zero();
+            }
+            let wn = w_axis * half_w;
+            let wt = w_axis * (half_w * taper);
+            let col = [seed, heat, role, 0.0];
+            let q = [
+                (a - wn, [0.0f32, 0.0]),
+                (a + wn, [1.0, 0.0]),
+                (tip + wt, [1.0, 1.0]),
+                (tip - wt, [0.0, 1.0]),
+            ];
+            for &i in &[0usize, 1, 2, 0, 2, 3] {
+                out.push(FxVertex { pos: q[i].0.into(), uv: q[i].1, color: col, kind: 3.0 });
+            }
+        };
+
+        // 1) broad bow-shock cap wrapping the windward apex: a faint outer halo,
+        // the main cap, then a brighter hot core stacked at the stagnation line.
+        let cap_len = height * (0.55 + 0.5 * heat);
+        let cap_w = rwidth * (2.6 + 2.0 * heat);
+        card(lead, back, cap_len * 1.25, cap_w * 1.5, 0.7, 0.42, 0.0); // soft halo
+        card(lead, back, cap_len, cap_w, 0.55, 0.12, 0.0); // main cap
+        card(lead, back, cap_len * 0.6, cap_w * 0.62, 0.5, 0.61, 0.0); // hot core
+
+        // 2) plasma streaks off the flanks, streaming downwind and fanning out
+        // a little so the wake reads as a full sheet of ionised gas.
+        let pick = if vdir.y.abs() < 0.9 { Vec3::Y } else { Vec3::X };
+        let t1 = vdir.cross(pick).normalize_or_zero();
+        let t2 = vdir.cross(t1).normalize_or_zero();
+        let streaks = 7;
+        for k in 0..streaks {
+            let ang = k as f32 / streaks as f32 * std::f32::consts::TAU;
+            let off_dir = t1 * ang.cos() + t2 * ang.sin();
+            let anchor = center
+                + vdir.as_dvec3() * (height as f64 * 0.2)
+                + (off_dir * (rwidth * 0.85)).as_dvec3();
+            // fan the streak slightly outward from straight-downwind
+            let dir = (back + off_dir * 0.18).normalize_or_zero();
+            let wobble = 0.7 + 0.3 * (k as f32 * 1.3).sin().abs();
+            let len = height * (0.8 + 1.7 * heat) * wobble;
+            card(anchor, dir, len, rwidth * 0.5, 0.12, 0.2 + 0.13 * k as f32, 1.0);
+        }
+    }
+
     /// Thruster FX billboards for the rocket view: an emissive flame at the
     /// active nozzle (axis-aligned cards facing the camera) and the smoke-
     /// particle trail (camera-facing puffs). `right`/`up` are the camera basis.
     fn build_fx(&self, eye: Vec3, right: Vec3, up: Vec3) -> Vec<FxVertex> {
         let mut out: Vec<FxVertex> = Vec::new();
+
+        // ---- reentry plasma shock (windward bow shock + trailing streaks) ----
+        if let Some(rk) = self.launch.as_ref() {
+            let heat = rk.heat as f32;
+            if heat > 0.12 && !rk.destroyed {
+                self.push_plasma(&mut out, rk, heat, eye);
+            }
+        }
 
         // ---- exhaust flame at the active nozzle ----
         if let Some(rk) = self.launch.as_ref() {
@@ -1933,7 +2070,133 @@ impl World {
                 out.push(FxVertex { pos: q[i].0.into(), uv: q[i].1, color: col, kind: 1.0 });
             }
         }
+
+        // ---- explosion fireball particles (hot -> sooty, expanding) ----
+        for b in &self.boom {
+            let t = (b.age / b.life).clamp(0.0, 1.0);
+            // grow as it expands; fade out near end of life
+            let size = b.size0 * (0.6 + 1.9 * t);
+            let alpha = (1.0 - t).powf(0.7) * 0.9;
+            if alpha <= 0.01 {
+                continue;
+            }
+            // colour ramp: white-hot -> yellow -> orange -> dark smoke
+            let col = if t < 0.18 {
+                let k = t / 0.18;
+                [1.0, 0.95 - 0.1 * k, 0.7 - 0.4 * k]
+            } else if t < 0.5 {
+                let k = (t - 0.18) / 0.32;
+                [1.0, 0.6 - 0.35 * k, 0.18 - 0.12 * k]
+            } else {
+                let k = (t - 0.5) / 0.5;
+                let g = 0.32 - 0.24 * k;
+                [g + 0.06, g, g]
+            };
+            let r = right * size;
+            let u = up * size;
+            let c = self.rel(b.pos.as_dvec3());
+            let q = [
+                (c - r - u, [0.0f32, 0.0]),
+                (c + r - u, [1.0, 0.0]),
+                (c + r + u, [1.0, 1.0]),
+                (c - r + u, [0.0, 1.0]),
+            ];
+            // premultiplied-over smoke pipeline expects rgb*alpha in rgb.
+            let cm = [col[0] * alpha, col[1] * alpha, col[2] * alpha, alpha];
+            for &i in &[0usize, 1, 2, 0, 2, 3] {
+                out.push(FxVertex { pos: q[i].0.into(), uv: q[i].1, color: cm, kind: 1.0 });
+            }
+        }
         out
+    }
+
+    /// Break the destroyed vehicle into tumbling debris and spawn a fireball.
+    /// Each still-attached stage (and the payload) becomes a chunk flying out
+    /// from the centre of mass; a burst of hot particles forms the explosion.
+    fn spawn_explosion(&mut self) {
+        let Some(rk) = self.launch.as_ref() else { return };
+        let base = self.to_local(rk.r);
+        let pd_local = self.dir_to_local(rk.point_dir());
+        let rot = Quat::from_rotation_arc(Vec3::Y, pd_local);
+        let vel_local = self.dir_to_local_vec(rk.v);
+        let rmag = rk.r.length().max(1.0);
+        let g_mag = (self.body.mu / (rmag * rmag)) as f32;
+        let grav = -self.dir_to_local_vec(rk.r.normalize_or_zero()) * g_mag;
+        let stage_base = rk.stage_base;
+        // place the fireball where the camera is actually looking (up the stack),
+        // so the blast frames on-screen instead of sitting below centre.
+        let center_y = self.cam_focus_y.max(self.rocket_body.focus_y);
+
+        // deterministic-ish RNG seeded by the impact state
+        let mut seed = (rk.r.x.abs() * 13.0 + rk.met * 997.0).to_bits() ^ 0x9E3779B9;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32
+        };
+
+        // chunks: each remaining stage + the payload, kicked radially outward
+        let mut ranges: Vec<std::ops::Range<usize>> = self
+            .rocket_body
+            .stage_ranges
+            .iter()
+            .skip(stage_base)
+            .cloned()
+            .collect();
+        ranges.push(self.rocket_body.payload_range.clone());
+        self.debris.clear();
+        for range in ranges {
+            let kick = Vec3::new(rnd() - 0.5, rnd() - 0.5, rnd() - 0.5).normalize_or_zero()
+                * (8.0 + rnd() * 22.0);
+            let spin = Vec3::new(rnd() - 0.5, rnd() - 0.5, rnd() - 0.5) * 3.5;
+            self.debris.push(Debris {
+                pos: base,
+                vel: vel_local + kick,
+                rot,
+                spin,
+                grav,
+                age: 0.0,
+                range,
+            });
+        }
+
+        // fireball: a dense burst of hot particles from the centre of mass, with
+        // a few big slow cores for the heart of the blast and many fast embers.
+        let origin = base + pd_local * center_y;
+        self.boom.clear();
+        for k in 0..130 {
+            let dir = Vec3::new(rnd() - 0.5, rnd() - 0.5, rnd() - 0.5).normalize_or_zero();
+            let core = k < 30; // big, slow, central fire
+            let spd = if core { 2.0 + rnd() * 9.0 } else { 14.0 + rnd() * 52.0 };
+            let size0 = if core { 14.0 + rnd() * 14.0 } else { 5.0 + rnd() * 9.0 };
+            let life = if core { 2.6 + rnd() * 2.2 } else { 1.0 + rnd() * 2.0 };
+            self.boom.push(Boom {
+                pos: origin + dir * (rnd() * 6.0),
+                vel: vel_local * 0.35 + dir * spd,
+                age: 0.0,
+                life,
+                size0,
+                seed: rnd(),
+            });
+        }
+        self.exploded = true;
+    }
+
+    /// Integrate explosion debris chunks + fireball particles (local frame).
+    fn advance_debris(&mut self, dt: f32) {
+        for d in self.debris.iter_mut() {
+            d.age += dt;
+            d.vel += d.grav * dt;
+            d.pos += d.vel * dt;
+            d.rot = (Quat::from_scaled_axis(d.spin * dt) * d.rot).normalize();
+        }
+        self.debris.retain(|d| d.age < 16.0);
+        for b in self.boom.iter_mut() {
+            b.age += dt;
+            b.vel *= 1.0 - (1.6 * dt).min(0.9); // air-brake the blast
+            b.vel.y += 3.0 * dt; // hot gas rises
+            b.pos += b.vel * dt;
+        }
+        self.boom.retain(|b| b.age < b.life);
     }
 
     /// Integrate the jettisoned booster (local frame, ~9.2 m/s^2 down).
@@ -3539,6 +3802,48 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             fly_to_staging(&mut world); // spent booster tumbling away
             0.0
         }
+        "crash" => {
+            // a structural failure mid-air: the vehicle bursts into tumbling
+            // debris + a fireball (same path a ground crash or burn-through takes).
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.rocket_az = 4.97;
+            world.rocket_el = 0.05;
+            world.rocket_dist = 30.0;
+            world.ignite_launch();
+            world.advance(0.05); // let the camera focus settle on the stack
+            if let Some(rk) = world.launch.as_mut() {
+                rk.health = 0.0; // force the break-up
+            }
+            for _ in 0..5 {
+                world.advance(0.1); // spawn + bloom the fireball (~0.5 s)
+            }
+            0.0
+        }
+        "reentry" => {
+            // a vehicle screaming back into the upper atmosphere: the reentry
+            // plasma bow shock + streaks at full heat.
+            world.view = View::Rocket;
+            world.ignite_launch();
+            let radius = world.body.radius;
+            let up = world.launch_up;
+            let east = world.launch_east;
+            if let Some(rk) = world.launch.as_mut() {
+                rk.r = up * (radius + 58_000.0);
+                rk.v = -up * 6_000.0 + east * 2_600.0;
+                rk.throttle = 0.0;
+                rk.pitch = 0.0;
+                rk.pitch_act = 0.0;
+            }
+            for _ in 0..12 {
+                world.advance(0.1); // ~1.2 s for the plasma to bloom
+            }
+            world.rocket_az = 4.2;
+            world.rocket_el = -0.05;
+            world.rocket_dist = 95.0;
+            0.0
+        }
         "sepfloat" => {
             // a couple of seconds after staging, zoomed in, so the spent booster
             // is visibly floating clear just below the climbing upper stage as the
@@ -4696,6 +5001,10 @@ fn main() {
                 "liftoff2"
             } else if args.iter().any(|a| a == "liftoff") {
                 "liftoff"
+            } else if args.iter().any(|a| a == "crash") {
+                "crash"
+            } else if args.iter().any(|a| a == "reentry") {
+                "reentry"
             } else if args.iter().any(|a| a == "sepfloat") {
                 "sepfloat"
             } else if args.iter().any(|a| a == "staging") {
@@ -4756,6 +5065,8 @@ fn main() {
                 "loddebugmap" => "out/loddebugmap.png",
                 "staging" => "out/staging.png",
                 "sepfloat" => "out/sepfloat.png",
+                "reentry" => "out/reentry.png",
+                "crash" => "out/crash.png",
                 "launchmap" => "out/launchmap.png",
                 "ascent" => "out/ascent.png",
                 "flight" => "out/flight.png",

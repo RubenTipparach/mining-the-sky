@@ -450,6 +450,37 @@ fn launch_panel(ctx: &egui::Context, world: &mut World) {
                         .fill(egui::Color32::from_rgb(90, 150, 90)),
                 );
             });
+            // structural integrity: drains under aerodynamic heating
+            let hp = (tel.health / 100.0).clamp(0.0, 1.0);
+            let hp_col = if hp > 0.5 {
+                egui::Color32::from_rgb(90, 170, 90)
+            } else if hp > 0.2 {
+                WARN
+            } else {
+                egui::Color32::from_rgb(220, 70, 60)
+            };
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Integrity").color(DIM));
+                ui.add(
+                    egui::ProgressBar::new(hp)
+                        .desired_width(110.0)
+                        .fill(hp_col)
+                        .text(format!("{:.0}%", tel.health)),
+                );
+            });
+            // heating gauge, shown when the air starts to bite
+            if tel.heat > 0.1 {
+                let hcol = egui::Color32::from_rgb(255, (200.0 - 150.0 * tel.heat).clamp(40.0, 200.0) as u8, 40);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Heating").color(DIM));
+                    ui.add(
+                        egui::ProgressBar::new(tel.heat.min(1.0))
+                            .desired_width(110.0)
+                            .fill(hcol)
+                            .text(if tel.heat > 0.85 { "PLASMA" } else { "" }),
+                    );
+                });
+            }
             ui.separator();
             if complete {
                 ui.label(

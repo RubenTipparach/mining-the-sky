@@ -22,6 +22,15 @@ const STEER_GAIN: f64 = 2.5; // 1/s
 const MAX_PITCH_RATE: f64 = 0.35; // rad/s (~20 deg/s)
 const MAX_PITCH_ACC: f64 = 0.5; // rad/s^2
 
+// Aerodynamic heating. The convective heat flux on a blunt body goes roughly as
+// q ~ sqrt(rho) * v^3 (Sutton-Graves form). We normalise that against
+// `HEAT_REF` for the FX glow, and the airframe only takes damage once the flux
+// climbs past `HEAT_DAMAGE_Q` (well above anything a normal ascent reaches, so
+// only a fast reentry burns). Tuned for the home world's atmosphere.
+const HEAT_REF: f64 = 2.0e9; // flux at which the plasma shock reads full white-hot
+const HEAT_DAMAGE_Q: f64 = 4.0e9; // flux above which the structure starts to char
+const HEAT_DAMAGE_K: f64 = 9.0; // health lost per second per unit of over-flux
+
 /// One live stage: its current propellant plus its fixed engine numbers.
 #[derive(Clone, Copy)]
 pub struct LiveStage {
@@ -49,6 +58,9 @@ pub struct Tel {
     pub apo_km: f32,
     pub peri_km: f32,
     pub pitch_deg: f32,
+    /// Structural integrity (0..100) and current heating glow (0..1).
+    pub health: f32,
+    pub heat: f32,
 }
 
 pub struct Rocket {
@@ -76,6 +88,16 @@ pub struct Rocket {
     pub met: f64,
     pub crashed: bool,
     pub orbit_reached: bool,
+    /// Structural integrity, 0..100. Aerodynamic heating past the airframe's
+    /// tolerance burns it down; at 0 the vehicle is destroyed. A hard ground
+    /// impact destroys it outright.
+    pub health: f64,
+    /// Smoothed aerodynamic-heating level, 0..~1.2, driving the reentry plasma
+    /// FX glow (1.0 = white-hot shock). Lags the instantaneous flux a little.
+    pub heat: f64,
+    /// Set once when the vehicle is destroyed (burn-through or crash), so the
+    /// render side can spawn the explosion + debris exactly once.
+    pub destroyed: bool,
     /// Set for one frame when a stage was just jettisoned (drives the visual
     /// separation); carries the jettisoned stage index from the original stack.
     pub just_staged: Option<usize>,
@@ -121,6 +143,9 @@ impl Rocket {
             met: 0.0,
             crashed: false,
             orbit_reached: false,
+            health: 100.0,
+            heat: 0.0,
+            destroyed: false,
             just_staged: None,
             stage_base: 0,
             stage_total: veh.stages.len(),
@@ -257,10 +282,30 @@ impl Rocket {
                 self.r = up * body.radius;
                 if self.met > 1.0 && rel > CRASH_SPEED {
                     self.crashed = true;
+                    self.destroyed = true;
+                    self.health = 0.0;
                     self.v = DVec3::ZERO;
                     return;
                 }
                 self.v = DVec3::ZERO; // pinned to the pad before liftoff
+            }
+
+            // aerodynamic heating: glow tracks the flux; burn-through past the
+            // material limit eats into structural health, and at zero the
+            // vehicle breaks up (the render side spawns the explosion + debris).
+            let q = self.heat_flux(body);
+            let target = (q / HEAT_REF).min(1.3);
+            // ease the glow toward the instantaneous flux (hot fast, cool slow)
+            let k = if target > self.heat { 6.0 } else { 1.5 };
+            self.heat += (target - self.heat) * (k * h).min(1.0);
+            if q > HEAT_DAMAGE_Q {
+                self.health -= (q - HEAT_DAMAGE_Q) / HEAT_DAMAGE_Q * HEAT_DAMAGE_K * h;
+            }
+            if self.health <= 0.0 && !self.crashed {
+                self.health = 0.0;
+                self.crashed = true;
+                self.destroyed = true;
+                return;
             }
 
             // orbit achieved once the periapsis clears the atmosphere
@@ -284,6 +329,17 @@ impl Rocket {
     pub fn altitude(&self, body: &CentralBody) -> f64 {
         self.r.length() - body.radius
     }
+
+    /// Instantaneous convective heat flux proxy (q ~ sqrt(rho) * v^3) at the
+    /// current state. Zero above the atmosphere.
+    pub fn heat_flux(&self, body: &CentralBody) -> f64 {
+        let rho = body.density(self.altitude(body));
+        if rho <= 0.0 {
+            return 0.0;
+        }
+        let v = self.v.length();
+        rho.sqrt() * v * v * v
+    }
     pub fn speed(&self) -> f64 {
         self.v.length()
     }
@@ -303,8 +359,12 @@ impl Rocket {
         };
         let g = body.mu / (self.r.length() * self.r.length());
         let twr = (self.live_thrust() / (self.mass() * g)) as f32;
-        let phase = if self.crashed {
+        let phase = if self.destroyed {
+            "DESTROYED"
+        } else if self.crashed {
             "CRASHED"
+        } else if self.heat > 0.55 {
+            "REENTRY"
         } else if self.orbit_reached {
             "ORBIT"
         } else if self.live_thrust() > 0.0 {
@@ -326,6 +386,8 @@ impl Rocket {
             apo_km,
             peri_km,
             pitch_deg: self.pitch.to_degrees() as f32,
+            health: self.health as f32,
+            heat: self.heat as f32,
         }
     }
 
