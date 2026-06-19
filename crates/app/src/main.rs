@@ -245,6 +245,9 @@ struct PlasmaUniforms {
     center: [f32; 4],
     /// xyz = airflow / velocity direction (unit), w = vehicle radius scale.
     flow: [f32; 4],
+    /// xyz = windward leading point (the bow-shock head), w = vehicle length
+    /// along the airflow.
+    head: [f32; 4],
     /// x = tan(fov/2), y = aspect, z = time, w = heat (0..~1.3).
     params: [f32; 4],
     /// x = primitive count.
@@ -987,7 +990,7 @@ impl World {
         let (eye, _t, right, up, fwd, tan) = self.rocket_camera(aspect);
         let mut prims = [[0.0f32; 4]; MAX_PLASMA_PRIMS * 2];
         let mut np = 0usize;
-        let (center, bound, flow, vrad) = match self.launch.as_ref() {
+        let (center, bound, flow, vrad, head, length) = match self.launch.as_ref() {
             Some(rk) => {
                 // Pose the model-space SDF primitives into camera-relative space
                 // (same transform as the drawn mesh) for the attached geometry.
@@ -1018,10 +1021,30 @@ impl World {
                 let vrad = self.rocket_body.engine_r.first().copied().unwrap_or(2.0).max(2.5);
                 let vdir = self.dir_to_local(rk.v.normalize_or_zero());
                 let flow = if vdir.length_squared() > 1e-6 { vdir } else { self.dir_to_local(rk.point_dir()) };
-                let bound = height * 1.1 + 45.0; // body + downwind wake
-                (center, bound, flow, vrad)
+                // Extent of the attached geometry along the airflow: the leading
+                // tip (windward) is the bow-shock head; the length sizes the
+                // enveloping fireball + tail.
+                let mut lead = f32::MIN;
+                let mut tail = f32::MAX;
+                for i in 0..np {
+                    let a = Vec3::from_array([prims[i * 2][0], prims[i * 2][1], prims[i * 2][2]]);
+                    let b = Vec3::from_array([prims[i * 2 + 1][0], prims[i * 2 + 1][1], prims[i * 2 + 1][2]]);
+                    let (r1, r2) = (prims[i * 2][3], prims[i * 2 + 1][3]);
+                    let da = (a - center).dot(flow);
+                    let db = (b - center).dot(flow);
+                    lead = lead.max(da + r1).max(db + r2);
+                    tail = tail.min(da - r1).min(db - r2);
+                }
+                if np == 0 {
+                    lead = vrad;
+                    tail = -vrad;
+                }
+                let length = (lead - tail).max(vrad * 2.0);
+                let head = center + flow * lead;
+                let bound = length * 1.6 + 30.0;
+                (center, bound, flow, vrad, head, length)
             }
-            None => (Vec3::ZERO, 60.0, Vec3::Y, 3.0),
+            None => (Vec3::ZERO, 60.0, Vec3::Y, 3.0, Vec3::ZERO, 40.0),
         };
         PlasmaUniforms {
             right: [right.x, right.y, right.z, 0.0],
@@ -1030,6 +1053,7 @@ impl World {
             eye: [eye.x, eye.y, eye.z, 0.0],
             center: [center.x, center.y, center.z, bound],
             flow: [flow.x, flow.y, flow.z, vrad],
+            head: [head.x, head.y, head.z, length],
             params: [tan, aspect, self.anim, self.plasma_heat()],
             nprims: [np as f32, 0.0, 0.0, 0.0],
             prims,

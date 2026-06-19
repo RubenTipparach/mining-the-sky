@@ -16,6 +16,7 @@ struct P {
     eye: vec4<f32>,
     center: vec4<f32>,  // xyz vehicle centre, w = bounding radius
     flow: vec4<f32>,    // xyz airflow/velocity dir (unit), w = vehicle radius
+    head: vec4<f32>,    // xyz windward leading point, w = vehicle length
     params: vec4<f32>,  // x = tan(fov/2), y = aspect, z = time, w = heat
     nprims: vec4<f32>,  // x = primitive count
     prims: array<vec4<f32>, 48>, // MAX_PRIMS*2: [a.xyz,r1] then [b.xyz,r2]
@@ -131,52 +132,68 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0);
     }
 
-    let shell = vrad * 0.95;            // shock-layer thickness off the surface
+    let head = u.head.xyz;              // windward leading point (bow-shock head)
+    let lv = max(u.head.w, vrad * 2.0); // vehicle length along the airflow
+    let dwind = -vhat;                  // tail direction (downwind)
+    let shell = vrad * 1.1;
+
     var tt = max(iv.x, 0.0);
     let tmax = iv.y;
     var rz = vec4<f32>(0.0);
-    let step = bound / 40.0;
-    for (var i = 0; i < 80; i = i + 1) {
+    let step = bound / 56.0;
+    for (var i = 0; i < 96; i = i + 1) {
         if (rz.a > 0.99 || tt > tmax) {
             break;
         }
         let pos = ro + rd * tt;
-        let dv = vehicle_sdf(pos);
-        let rel = pos - center;
-        let along = dot(rel, vhat);              // + = windward (leading) side
-        let perp = length(rel - vhat * along);
+        // comet frame anchored at the windward head: s downwind, perp off-axis.
+        let hd = pos - head;
+        let s = dot(hd, dwind);                 // 0 at head, + down the tail
+        let perp = length(hd - dwind * s);
+        let frac = s / lv;
 
-        // shock layer hugging the windward surfaces (a band just outside, killed
-        // inside the body so it doesn't paint over the leeward hull).
-        let band = smoothstep(shell, 0.0, dv) * smoothstep(-shell * 0.4, 0.15, dv);
-        let windward = smoothstep(-0.10 * bound, 0.34 * bound, along);
-        let sheath = band * windward;
+        // enveloping teardrop: a fat rounded bright head bulb, a bulge wrapping
+        // the whole body, then a long tail tapering + fading as it cools.
+        let bulb = exp(-pow((s - lv * 0.18) / (lv * 0.42), 2.0)); // big rounded head
+        let envR = vrad * (2.0 + 1.4 * smoothstep(-0.1, 0.7, frac) + 1.6 * bulb);
+        let radial = smoothstep(envR, envR * 0.12, perp);
+        let frontCap = smoothstep(-0.9 * vrad, 0.25 * vrad, s);
+        let axialFade = exp(-max(s - lv * 1.0, 0.0) / (lv * 1.3));
+        let envelope = radial * frontCap * axialFade;
+        // a brilliant compact core right at the bow-shock head
+        let headCore = exp(-pow(s / (vrad * 1.6), 2.0)) * smoothstep(envR * 0.9, 0.0, perp);
 
-        // downwind wake: a translucent tail streaming behind, fading as it cools.
-        let s = -along;                          // downwind distance from centre
-        let wake = smoothstep(0.0, 0.12 * bound, s)
-            * exp(-max(s, 0.0) / (0.42 * bound))
-            * smoothstep(vrad * 4.0, 0.0, perp);
+        // SDF bow shock: a brilliant thin compression layer on the windward
+        // surfaces, strongest near the head (only sampled over the body).
+        var shock = 0.0;
+        if (s < lv * 1.2) {
+            let dv = vehicle_sdf(pos);
+            let band = smoothstep(shell, 0.0, dv) * smoothstep(-shell * 0.4, 0.1, dv);
+            shock = band * smoothstep(lv * 0.85, -0.1 * lv, s);
+        }
 
-        let f = max(sheath, wake * 0.65);
-        if (f > 0.001) {
-            // boiling turbulence (sampled in vehicle radii)
-            let q = pos / vrad - vhat * (t * 3.0);
-            let tb = tnoise(q * 0.6, 0.1, t);
-            let dens = clamp(f * (0.3 + 1.5 * tb), 0.0, 1.0);
-            // windward density gradient -> cool blue-white compression front
-            let gr = clamp((dv - vehicle_sdf(pos - vhat * shell * 0.6)) / shell, 0.0, 1.0);
-            // cooling along the wake: white-hot/orange head -> deep red, fading
-            let cool = clamp(max(s, 0.0) / (0.5 * bound), 0.0, 1.0);
-            var lg = mix(vec3<f32>(1.0, 0.6, 0.2), vec3<f32>(0.55, 0.1, 0.04), cool);
-            lg = lg + 1.5 * vec3<f32>(0.55, 0.77, 0.95) * gr * (1.0 - cool);
-            var col = vec4<f32>(lg, dens * dens * 1.25);
+        let f = max(envelope, shock);
+        if (f > 0.002) {
+            // boiling turbulence streaming down the tail
+            let q = pos / vrad * 0.7 + dwind * (t * 3.5);
+            let tb = tnoise(q, 0.1, t);
+            let dens = clamp(f * (0.25 + 1.5 * tb), 0.0, 1.0);
+
+            // temperature: hottest at the head + the bow shock, cooling downwind.
+            let cool = clamp(s / (lv * 1.9), 0.0, 1.0);
+            let temp = clamp((1.0 - cool) + shock * 0.6 + headCore, 0.0, 1.0);
+            var c = mix(vec3<f32>(0.5, 0.07, 0.02), vec3<f32>(1.0, 0.42, 0.10), smoothstep(0.0, 0.45, temp));
+            c = mix(c, vec3<f32>(1.0, 0.85, 0.5), smoothstep(0.45, 0.78, temp));
+            c = mix(c, vec3<f32>(1.3, 1.25, 1.18), smoothstep(0.8, 1.0, temp)); // white-hot head/shock
+            // alpha: dense + opaque at the hot head, translucent down the tail.
+            let a = clamp(dens * dens * (0.7 + 1.6 * temp) + headCore * 0.7, 0.0, 1.0);
+            var col = vec4<f32>(c, a);
             col = vec4<f32>(col.rgb * col.a, col.a);
             rz = rz + col * (1.0 - rz.a);
         }
         tt = tt + step;
     }
     rz = rz * heat;
-    rz.a = min(rz.a, 0.72);
+    rz.a = min(rz.a, 0.92);
     return clamp(rz, vec4<f32>(0.0), vec4<f32>(1.0));
 }
