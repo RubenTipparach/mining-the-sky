@@ -1085,7 +1085,8 @@ impl World {
                 }
                 let length = (lead - tail).max(vrad * 2.0);
                 let head = center + flow * lead;
-                let bound = length * 1.6 + 30.0;
+                // cover the downstream smear/wake (~1.4 vehicle sizes) too.
+                let bound = height * 1.5 + length * 0.6 + 30.0;
                 (center, bound, flow, vrad, head, length)
             }
             None => (Vec3::ZERO, 60.0, Vec3::Y, 3.0, Vec3::ZERO, 40.0),
@@ -1099,7 +1100,9 @@ impl World {
             flow: [flow.x, flow.y, flow.z, vrad],
             head: [head.x, head.y, head.z, length],
             params: [tan, aspect, self.anim, self.plasma_heat()],
-            nprims: [np as f32, 0.0, 0.0, 0.0],
+            // y = vehicle size (height), so the wake-smear length is set by the
+            // vehicle, not by its (orientation-dependent) extent along the flow.
+            nprims: [np as f32, self.rocket_body.height.max(8.0), 0.0, 0.0],
             prims,
         }
     }

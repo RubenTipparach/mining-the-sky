@@ -132,53 +132,57 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0);
     }
 
-    let head = u.head.xyz;              // windward leading point (bow-shock head)
-    let lv = max(u.head.w, vrad * 2.0); // vehicle length along the airflow
-    let dwind = -vhat;                  // tail direction (downwind)
-    let shell = vrad * 0.85;            // how far the glow stands off the surface
+    let lv = max(u.head.w, vrad * 2.0); // extent along the airflow (windward gate)
+    let vsize = max(u.nprims.y, vrad * 2.0); // vehicle size (sets the wake length)
+    let shell = vrad * 1.3;             // shock-layer thickness off the surface
+    let smear_len = vsize * 1.4;        // how far the hot gas smears downstream
 
     var tt = max(iv.x, 0.0);
     let tmax = iv.y;
     var rz = vec4<f32>(0.0);
-    let step = bound / 56.0;
+    let step = bound / 60.0;
     for (var i = 0; i < 96; i = i + 1) {
         if (rz.a > 0.99 || tt > tmax) {
             break;
         }
         let pos = ro + rd * tt;
-        let along = dot(pos - center, vhat);    // + = windward (leading) side
 
-        // White-hot bow shock: a shell hugging the vehicle SDF on the windward
-        // side, so the bright plasma wraps the actual rocket shape (not a blob).
-        var shock = 0.0;
-        if (along > -0.4 * lv) {
-            let dv = vehicle_sdf(pos);
+        // SDF smear: walk a few samples UPSTREAM along the airflow. A point lights
+        // up if a *windward* surface sits upstream of it (band hugging the SDF on
+        // the leading side), so the windward shock smears straight downstream into
+        // the wake, fading + cooling with distance. This works at any attitude
+        // (the SDF + flow define it) and auto-rejects the leeward side (its
+        // upstream is the body interior, where the band is killed).
+        var glow = 0.0;
+        var smear = smear_len; // downstream distance of the lit surface (cooling)
+        // dither the sample offsets per pixel so the smear reads as soft streaks
+        // rather than regular bands.
+        let jit = fract(sin(dot(in.uv, vec2<f32>(127.1, 311.7)) + t) * 43758.5);
+        for (var j = 0; j < 16; j = j + 1) {
+            let k = (f32(j) + jit) / 16.0 * smear_len;
+            let q = pos + vhat * k;
+            let dv = vehicle_sdf(q);
             let band = smoothstep(shell, 0.0, dv) * smoothstep(-shell * 0.45, 0.1, dv);
-            let windward = smoothstep(-0.20 * lv, 0.30 * lv, along);
-            shock = band * windward;
+            let windward = smoothstep(-0.18 * lv, 0.22 * lv, dot(q - center, vhat));
+            let fade = exp(-k / (smear_len * 0.5));
+            let g = band * windward * fade;
+            if (g > glow) {
+                glow = g;
+                smear = k;
+            }
         }
 
-        // Cooling tail: a turbulent wake streaming downwind off the head, fading.
-        let hd = pos - head;
-        let s = dot(hd, dwind);                 // 0 at head, + down the tail
-        let perp = length(hd - dwind * s);
-        let tailR = vrad * (1.1 + 1.3 * smoothstep(0.0, lv, s));
-        let tail = smoothstep(0.0, 0.12 * lv, s)
-            * exp(-max(s, 0.0) / (lv * 1.0))
-            * smoothstep(tailR, tailR * 0.2, perp);
-
-        let f = max(shock, tail * 0.7);
-        if (f > 0.002) {
-            let q = pos / vrad * 0.7 + dwind * (t * 3.5);
-            let tb = tnoise(q, 0.1, t);
-            let dens = clamp(f * (0.3 + 1.4 * tb), 0.0, 1.0);
-
-            // white-hot on the shock (shape), cooling orange -> red down the tail.
-            let cool = clamp(s / (lv * 1.6), 0.0, 1.0);
-            let temp = clamp(shock * 1.4 + (1.0 - cool) * tail * 0.7, 0.0, 1.0);
-            var c = mix(vec3<f32>(0.5, 0.08, 0.03), vec3<f32>(1.0, 0.42, 0.10), smoothstep(0.0, 0.45, temp));
-            c = mix(c, vec3<f32>(1.0, 0.85, 0.5), smoothstep(0.45, 0.78, temp));
-            c = mix(c, vec3<f32>(1.3, 1.25, 1.18), smoothstep(0.82, 1.0, temp));
+        if (glow > 0.0025) {
+            // boiling turbulence streaming down the smear
+            let q2 = pos / vrad * 0.7 - vhat * (t * 3.2);
+            let tb = tnoise(q2, 0.1, t);
+            let dens = clamp(glow * (0.3 + 1.4 * tb), 0.0, 1.0);
+            // cooling along the smear: white-hot at the surface -> orange -> red.
+            let cool = clamp(smear / smear_len, 0.0, 1.0);
+            let temp = clamp((1.0 - cool) * 1.15, 0.0, 1.0);
+            var c = mix(vec3<f32>(0.5, 0.08, 0.03), vec3<f32>(1.0, 0.42, 0.10), smoothstep(0.0, 0.42, temp));
+            c = mix(c, vec3<f32>(1.0, 0.85, 0.5), smoothstep(0.42, 0.76, temp));
+            c = mix(c, vec3<f32>(1.3, 1.25, 1.18), smoothstep(0.82, 1.0, temp)); // white-hot windward
             let a = dens * dens * (0.55 + 1.3 * temp);
             var col = vec4<f32>(c, a);
             col = vec4<f32>(col.rgb * col.a, col.a);
@@ -187,6 +191,6 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         tt = tt + step;
     }
     rz = rz * heat;
-    rz.a = min(rz.a, 0.5);              // ~50% transparent overall
+    rz.a = min(rz.a, 0.55);
     return clamp(rz, vec4<f32>(0.0), vec4<f32>(1.0));
 }
