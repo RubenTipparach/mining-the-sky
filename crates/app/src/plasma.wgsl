@@ -100,6 +100,35 @@ fn vehicle_sdf(p: vec3<f32>) -> f32 {
     return d;
 }
 
+// ============================ TUNABLES ============================
+// Edit these to dial the re-entry plasma look, then `cargo run` (the shader is
+// recompiled at build time). All the headline knobs live here.
+
+const SHELL_MULT:    f32 = 1.3;   // shock-layer thickness, x vehicle radius
+const SMEAR_MULT:    f32 = 1.4;   // wake length, x vehicle size
+const SMEAR_FADE:    f32 = 0.5;   // wake fade (x smear length); smaller = shorter glow
+const SMEAR_SAMPLES: i32 = 16;    // upstream SDF samples (more = finer streaks)
+const WINDWARD_LO:   f32 = -0.18; // windward gate start (x along-flow extent)
+const WINDWARD_HI:   f32 = 0.22;  // windward gate end
+
+// Steep cooling gradient: fractions of the smear distance where each colour ends
+// (0 = right at the windward surface). Smaller WHITE_END = tighter white band.
+const WHITE_END:  f32 = 0.10;
+const YELLOW_END: f32 = 0.22;
+const ORANGE_END: f32 = 0.45;
+const COL_RED:    vec3<f32> = vec3<f32>(0.40, 0.05, 0.02); // cool tail
+const COL_ORANGE: vec3<f32> = vec3<f32>(1.00, 0.36, 0.07);
+const COL_YELLOW: vec3<f32> = vec3<f32>(1.00, 0.78, 0.40);
+const COL_WHITE:  vec3<f32> = vec3<f32>(1.40, 1.32, 1.22); // white-hot windward
+const COL_IONISE: vec3<f32> = vec3<f32>(0.32, 0.05, 0.20); // pink/violet fringe
+const COL_SHEEN:  vec3<f32> = vec3<f32>(0.30, 0.45, 0.70); // blue-white on filaments
+
+const TURB_COARSE: f32 = 0.7;   // coarse turbulence frequency (x 1/radius)
+const TURB_FINE:   f32 = 2.3;   // fine wisp frequency
+const TURB_SCROLL: f32 = 3.2;   // how fast the boil streams downwind
+const ALPHA_CAP:   f32 = 0.42;  // overall opacity (0..1); lower = more transparent
+// ==================================================================
+
 // Ray/sphere interval (near, far) around a centre; far < 0 means a miss.
 fn sphere_iv(ro: vec3<f32>, rd: vec3<f32>, c: vec3<f32>, r: f32) -> vec2<f32> {
     let oc = ro - c;
@@ -134,8 +163,8 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 
     let lv = max(u.head.w, vrad * 2.0); // extent along the airflow (windward gate)
     let vsize = max(u.nprims.y, vrad * 2.0); // vehicle size (sets the wake length)
-    let shell = vrad * 1.3;             // shock-layer thickness off the surface
-    let smear_len = vsize * 1.4;        // how far the hot gas smears downstream
+    let shell = vrad * SHELL_MULT;      // shock-layer thickness off the surface
+    let smear_len = vsize * SMEAR_MULT; // how far the hot gas smears downstream
 
     var tt = max(iv.x, 0.0);
     let tmax = iv.y;
@@ -158,13 +187,13 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         // dither the sample offsets per pixel so the smear reads as soft streaks
         // rather than regular bands.
         let jit = fract(sin(dot(in.uv, vec2<f32>(127.1, 311.7)) + t) * 43758.5);
-        for (var j = 0; j < 16; j = j + 1) {
-            let k = (f32(j) + jit) / 16.0 * smear_len;
+        for (var j = 0; j < SMEAR_SAMPLES; j = j + 1) {
+            let k = (f32(j) + jit) / f32(SMEAR_SAMPLES) * smear_len;
             let q = pos + vhat * k;
             let dv = vehicle_sdf(q);
             let band = smoothstep(shell, 0.0, dv) * smoothstep(-shell * 0.45, 0.1, dv);
-            let windward = smoothstep(-0.18 * lv, 0.22 * lv, dot(q - center, vhat));
-            let fade = exp(-k / (smear_len * 0.5));
+            let windward = smoothstep(WINDWARD_LO * lv, WINDWARD_HI * lv, dot(q - center, vhat));
+            let fade = exp(-k / (smear_len * SMEAR_FADE));
             let g = band * windward * fade;
             if (g > glow) {
                 glow = g;
@@ -175,9 +204,9 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         if (glow > 0.0025) {
             // multi-octave boiling turbulence streaming down the smear: a coarse
             // roll plus a finer wisp layer for detail.
-            let flow_t = vhat * (t * 3.2);
-            let tb0 = tnoise(pos / vrad * 0.7 - flow_t, 0.1, t);
-            let tb1 = tnoise(pos / vrad * 2.3 - flow_t * 1.7 + vec3<f32>(5.0), 0.15, t);
+            let flow_t = vhat * (t * TURB_SCROLL);
+            let tb0 = tnoise(pos / vrad * TURB_COARSE - flow_t, 0.1, t);
+            let tb1 = tnoise(pos / vrad * TURB_FINE - flow_t * 1.7 + vec3<f32>(5.0), 0.15, t);
             let tb = clamp(tb0 * 0.8 + tb1 * 0.5, 0.0, 1.4);
             // fine filaments running along the streak (sharpened high band)
             let fil = smoothstep(0.55, 0.95, tb1);
@@ -187,17 +216,17 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
             // white-hot glow stays pinned to the windward surface (smear ~ 0) and
             // drops fast to orange, then a long deep-red tail.
             let cool = clamp(smear / smear_len, 0.0, 1.0);
-            let whitef = smoothstep(0.10, 0.0, cool);   // only right at the surface
-            let yellowf = smoothstep(0.22, 0.04, cool);
-            let orangef = smoothstep(0.45, 0.10, cool);
-            var c = vec3<f32>(0.40, 0.05, 0.02);                  // deep-red tail
-            c = mix(c, vec3<f32>(1.0, 0.36, 0.07), orangef);      // orange
-            c = mix(c, vec3<f32>(1.0, 0.78, 0.40), yellowf);      // yellow
-            c = mix(c, vec3<f32>(1.4, 1.32, 1.22), whitef);       // white-hot windward
+            let whitef = smoothstep(WHITE_END, 0.0, cool);   // only right at the surface
+            let yellowf = smoothstep(YELLOW_END, WHITE_END * 0.4, cool);
+            let orangef = smoothstep(ORANGE_END, WHITE_END, cool);
+            var c = COL_RED;                       // deep-red tail
+            c = mix(c, COL_ORANGE, orangef);       // orange
+            c = mix(c, COL_YELLOW, yellowf);       // yellow
+            c = mix(c, COL_WHITE, whitef);         // white-hot windward
             // faint pink/violet ionised fringe in the mid-temperature gas
-            c = c + vec3<f32>(0.32, 0.05, 0.20) * orangef * (1.0 - yellowf) * 0.7;
+            c = c + COL_IONISE * orangef * (1.0 - yellowf) * 0.7;
             // cool blue-white sheen on the hottest filaments (windward only)
-            c = c + vec3<f32>(0.3, 0.45, 0.7) * fil * whitef;
+            c = c + COL_SHEEN * fil * whitef;
 
             // alpha biased to the hot windward glow; the cool tail stays wispy.
             let hot = max(whitef, yellowf * 0.65);
@@ -209,6 +238,6 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         tt = tt + step;
     }
     rz = rz * heat;
-    rz.a = min(rz.a, 0.42);
+    rz.a = min(rz.a, ALPHA_CAP);
     return clamp(rz, vec4<f32>(0.0), vec4<f32>(1.0));
 }
