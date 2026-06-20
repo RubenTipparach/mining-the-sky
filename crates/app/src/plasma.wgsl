@@ -173,17 +173,29 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         }
 
         if (glow > 0.0025) {
-            // boiling turbulence streaming down the smear
-            let q2 = pos / vrad * 0.7 - vhat * (t * 3.2);
-            let tb = tnoise(q2, 0.1, t);
-            let dens = clamp(glow * (0.3 + 1.4 * tb), 0.0, 1.0);
-            // cooling along the smear: white-hot at the surface -> orange -> red.
+            // multi-octave boiling turbulence streaming down the smear: a coarse
+            // roll plus a finer wisp layer for detail.
+            let flow_t = vhat * (t * 3.2);
+            let tb0 = tnoise(pos / vrad * 0.7 - flow_t, 0.1, t);
+            let tb1 = tnoise(pos / vrad * 2.3 - flow_t * 1.7 + vec3<f32>(5.0), 0.15, t);
+            let tb = clamp(tb0 * 0.8 + tb1 * 0.5, 0.0, 1.4);
+            // fine filaments running along the streak (sharpened high band)
+            let fil = smoothstep(0.55, 0.95, tb1);
+            var dens = clamp(glow * (0.22 + 1.3 * tb + 0.5 * fil), 0.0, 1.0);
+
+            // cooling along the smear: white-hot windward -> orange -> deep red.
             let cool = clamp(smear / smear_len, 0.0, 1.0);
             let temp = clamp((1.0 - cool) * 1.15, 0.0, 1.0);
-            var c = mix(vec3<f32>(0.5, 0.08, 0.03), vec3<f32>(1.0, 0.42, 0.10), smoothstep(0.0, 0.42, temp));
-            c = mix(c, vec3<f32>(1.0, 0.85, 0.5), smoothstep(0.42, 0.76, temp));
-            c = mix(c, vec3<f32>(1.3, 1.25, 1.18), smoothstep(0.82, 1.0, temp)); // white-hot windward
-            let a = dens * dens * (0.55 + 1.3 * temp);
+            var c = mix(vec3<f32>(0.45, 0.06, 0.02), vec3<f32>(1.0, 0.40, 0.09), smoothstep(0.0, 0.42, temp));
+            c = mix(c, vec3<f32>(1.0, 0.86, 0.5), smoothstep(0.42, 0.76, temp));
+            c = mix(c, vec3<f32>(1.3, 1.28, 1.22), smoothstep(0.82, 1.0, temp)); // white-hot windward
+            // a faint pink/violet ionised fringe in the mid-temperature gas
+            c = c + vec3<f32>(0.35, 0.06, 0.22) * smoothstep(0.3, 0.6, temp) * (1.0 - smoothstep(0.7, 0.95, temp));
+            // a cool blue-white sheen on the very hottest filaments
+            c = c + vec3<f32>(0.3, 0.45, 0.7) * fil * smoothstep(0.7, 1.0, temp);
+
+            // more translucent overall; bright filaments read through the haze.
+            let a = dens * dens * (0.4 + 1.0 * temp) + fil * temp * 0.15;
             var col = vec4<f32>(c, a);
             col = vec4<f32>(col.rgb * col.a, col.a);
             rz = rz + col * (1.0 - rz.a);
@@ -191,6 +203,6 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         tt = tt + step;
     }
     rz = rz * heat;
-    rz.a = min(rz.a, 0.55);
+    rz.a = min(rz.a, 0.42);
     return clamp(rz, vec4<f32>(0.0), vec4<f32>(1.0));
 }
