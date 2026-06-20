@@ -170,11 +170,27 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let tmax = iv.y;
     var rz = vec4<f32>(0.0);
     let step = bound / 60.0;
-    for (var i = 0; i < 96; i = i + 1) {
+    // A point can only glow if a vehicle surface sits within (shell + smear_len)
+    // of it (the shock shell plus the downstream wake), so that band sets how
+    // close to the geometry the expensive smear loop has to run.
+    let active_band = shell + smear_len;
+    for (var i = 0; i < 128; i = i + 1) {
         if (rz.a > 0.99 || tt > tmax) {
             break;
         }
         let pos = ro + rd * tt;
+
+        // Empty-space skip (sphere trace): one cheap SDF eval tells us how far the
+        // nearest vehicle surface is. If that is further than the active band, no
+        // smear sample on this ray point can light up, so jump straight to the
+        // band edge instead of paying the 16x smear loop here. This collapses the
+        // big empty volume inside the bounding sphere to a few jumps.
+        let d0 = vehicle_sdf(pos);
+        let safe = abs(d0) - active_band;
+        if (safe > step) {
+            tt = tt + safe;
+            continue;
+        }
 
         // SDF smear: walk a few samples UPSTREAM along the airflow. A point lights
         // up if a *windward* surface sits upstream of it (band hugging the SDF on

@@ -180,6 +180,10 @@ const HANGAR_LIGHTS: [(Vec3, [f32; 3], f32); 6] = [
 
 /// Depth format for the rocket view's mesh pass.
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+// The re-entry plasma is raymarched into a half-resolution HDR buffer (linear,
+// filterable) and then upscale-composited over the scene, so the expensive march
+// runs at a quarter of the pixels. Linear-float avoids sRGB round-trip artefacts.
+const PLASMA_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum View {
@@ -2636,10 +2640,14 @@ struct Gpu {
     sky_pipeline: wgpu::RenderPipeline,
     sky_uniform_buf: wgpu::Buffer,
     sky_bind_group: wgpu::BindGroup,
-    /// Volumetric re-entry plasma (fullscreen raymarch, over the scene).
+    /// Volumetric re-entry plasma, raymarched into a half-res HDR buffer.
     plasma_pipeline: wgpu::RenderPipeline,
     plasma_uniform_buf: wgpu::Buffer,
     plasma_bind_group: wgpu::BindGroup,
+    /// Upscale-composite of the half-res plasma buffer over the full-res scene.
+    plasma_comp_pipeline: wgpu::RenderPipeline,
+    plasma_comp_layout: wgpu::BindGroupLayout,
+    plasma_sampler: wgpu::Sampler,
     /// Volumetric exhaust plume (fullscreen raymarch, additive over the scene).
     plume_pipeline: wgpu::RenderPipeline,
     plume_uniform_buf: wgpu::Buffer,
@@ -3123,6 +3131,85 @@ impl Gpu {
             fragment: Some(wgpu::FragmentState {
                 module: &plasma_shader,
                 entry_point: Some("fs"),
+                // Renders into the half-res HDR buffer (cleared transparent), so a
+                // single fullscreen draw just stores its own premultiplied result.
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: PLASMA_FORMAT,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            // No depth: the half-res plasma pass has no depth attachment (the plasma
+            // ignored depth anyway - it composited with compare Always / no write).
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        // Composite pipeline: bilinear-upscale the half-res plasma buffer over the
+        // full-res scene with the same premultiplied-over blend.
+        let plasma_comp_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("plasma-composite"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("plasma_composite.wgsl").into()),
+        });
+        let plasma_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("plasma-sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let plasma_comp_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("plasma-comp-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let plasma_comp_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("plasma-comp-pipeline-layout"),
+            bind_group_layouts: &[Some(&plasma_comp_layout)],
+            immediate_size: 0,
+        });
+        let plasma_comp_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("plasma-comp-pipeline"),
+            layout: Some(&plasma_comp_pl),
+            vertex: wgpu::VertexState {
+                module: &plasma_comp_shader,
+                entry_point: Some("vs"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &plasma_comp_shader,
+                entry_point: Some("fs"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
                     // premultiplied-over: rgb already carries rgb*alpha.
@@ -3143,13 +3230,7 @@ impl Gpu {
                 compilation_options: Default::default(),
             }),
             primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Always),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
+            depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
             cache: None,
@@ -3269,6 +3350,9 @@ impl Gpu {
             plasma_pipeline,
             plasma_uniform_buf,
             plasma_bind_group,
+            plasma_comp_pipeline,
+            plasma_comp_layout,
+            plasma_sampler,
             plume_pipeline,
             plume_uniform_buf,
             plume_bind_group,
@@ -3425,6 +3509,13 @@ impl Gpu {
         }
     }
 
+    /// Composite the half-res plasma buffer over the full-res scene (upscaled).
+    fn draw_plasma_composite(&self, pass: &mut wgpu::RenderPass, bind: &wgpu::BindGroup) {
+        pass.set_pipeline(&self.plasma_comp_pipeline);
+        pass.set_bind_group(0, bind, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
     /// Volumetric exhaust plume, composited additively over the scene.
     fn draw_plume(&self, pass: &mut wgpu::RenderPass, on: bool) {
         if on {
@@ -3459,6 +3550,73 @@ fn push_filled_diamond(out: &mut Vec<OverlayVertex>, c: [f32; 2], hy: f32, aspec
     }
 }
 
+
+/// Half-resolution HDR buffer the re-entry plasma is raymarched into, plus the
+/// composite bind group that upscales it. Rebuilt only when the size changes.
+struct PlasmaTarget {
+    view: wgpu::TextureView,
+    bind: wgpu::BindGroup,
+    size: (u32, u32),
+}
+
+/// Build (or rebuild) the half-res plasma target for a full-res `w`x`h` frame.
+fn make_plasma_target(device: &wgpu::Device, gpu: &Gpu, w: u32, h: u32) -> PlasmaTarget {
+    let hw = (w / 2).max(1);
+    let hh = (h / 2).max(1);
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("plasma-halfres"),
+        size: wgpu::Extent3d { width: hw, height: hh, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: PLASMA_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("plasma-comp-bind"),
+        layout: &gpu.plasma_comp_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&gpu.plasma_sampler) },
+        ],
+    });
+    PlasmaTarget { view, bind, size: (hw, hh) }
+}
+
+/// Raymarch the plasma at half resolution, then composite it (bilinear-upscaled)
+/// over the full-res `full_view`. Cheap no-op aside from two fullscreen draws.
+fn draw_plasma_halfres(
+    encoder: &mut wgpu::CommandEncoder,
+    gpu: &Gpu,
+    full_view: &wgpu::TextureView,
+    target: &PlasmaTarget,
+) {
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("plasma-halfres-pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target.view,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        gpu.draw_plasma(&mut pass, true);
+    }
+    {
+        let mut pass = overlay_pass(encoder, full_view);
+        gpu.draw_plasma_composite(&mut pass, &target.bind);
+    }
+}
 
 fn render_pass<'a>(
     encoder: &'a mut wgpu::CommandEncoder,
@@ -3561,6 +3719,8 @@ struct State {
     /// Depth attachment for the rocket-view mesh pass, recreated only on resize
     /// (not per frame).
     depth_view: wgpu::TextureView,
+    /// Half-res HDR buffer for the re-entry plasma, rebuilt only on resize.
+    plasma_target: PlasmaTarget,
     gpu: Gpu,
     world: World,
     start: instant_now::Instant,
@@ -3641,6 +3801,7 @@ impl State {
 
         let gpu = Gpu::new(&device, &queue, format);
         let depth_view = create_depth(&device, width, height);
+        let plasma_target = make_plasma_target(&device, &gpu, width, height);
 
         // egui: context + winit input glue + wgpu renderer
         let egui_ctx = egui::Context::default();
@@ -3662,6 +3823,7 @@ impl State {
             queue,
             config,
             depth_view,
+            plasma_target,
             gpu,
             world: World::new(),
             start: instant_now::Instant::now(),
@@ -3685,6 +3847,7 @@ impl State {
             self.config.height = height;
             self.surface.configure(&self.device, &self.config);
             self.depth_view = create_depth(&self.device, width, height);
+            self.plasma_target = make_plasma_target(&self.device, &self.gpu, width, height);
         }
     }
 
@@ -3887,8 +4050,12 @@ impl State {
                 self.gpu.draw_sky(&mut pass);
                 self.gpu.draw_meshes(&mut pass, terrain_n, dyn_n);
                 self.gpu.draw_plume(&mut pass, plume_on);
-                self.gpu.draw_plasma(&mut pass, plasma_on);
                 self.gpu.draw_fx(&mut pass, fx_n);
+            }
+            // Re-entry plasma: raymarched at half resolution, then upscaled over the
+            // scene. Only runs during re-entry, so the cost is paid only then.
+            if plasma_on {
+                draw_plasma_halfres(&mut encoder, &self.gpu, &view, &self.plasma_target);
             }
             {
                 let mut pass = overlay_pass(&mut encoder, &view);
@@ -4937,8 +5104,11 @@ fn render_shot(
             gpu.draw_sky(&mut pass);
             gpu.draw_meshes(&mut pass, terrain_n, dyn_n);
             gpu.draw_plume(&mut pass, plume_on);
-            gpu.draw_plasma(&mut pass, plasma_on);
             gpu.draw_fx(&mut pass, fx_n);
+        }
+        if plasma_on {
+            let pt = make_plasma_target(device, gpu, width, height);
+            draw_plasma_halfres(&mut encoder, gpu, &target_view, &pt);
         }
         {
             let mut pass = overlay_pass(&mut encoder, &target_view);
@@ -5070,6 +5240,7 @@ fn render_anim(
         mapped_at_creation: false,
     });
 
+    let plasma_target = make_plasma_target(device, gpu, fw, fh);
     let mut strip = image::RgbaImage::new(fw * frames, fh);
     for f in 0..frames {
         let anim = world.anim;
@@ -5083,8 +5254,10 @@ fn render_anim(
             gpu.draw_sky(&mut pass);
             gpu.draw_meshes(&mut pass, terrain_n, dyn_n);
             gpu.draw_plume(&mut pass, plume_on);
-            gpu.draw_plasma(&mut pass, plasma_on);
             gpu.draw_fx(&mut pass, fx_n);
+        }
+        if plasma_on {
+            draw_plasma_halfres(&mut enc, gpu, &target_view, &plasma_target);
         }
         {
             let mut pass = overlay_pass(&mut enc, &target_view);
