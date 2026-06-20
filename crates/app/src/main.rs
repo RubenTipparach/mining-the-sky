@@ -574,6 +574,9 @@ struct World {
     /// Prototype toggle: render the re-entry plasma as a procedural glow mesh
     /// (depth-tested geometry) instead of the fullscreen volumetric raymarch.
     plasma_mesh_mode: bool,
+    /// Which re-entry test attitude the live `J` key last set (0 axial, 1 tilt,
+    /// 2 side); pressing `J` again cycles to the next one.
+    reentry_test_kind: u8,
     /// Vertex count of the plasma glow mesh built this frame (mesh mode only).
     plasma_mesh_n: u32,
     /// Background planet-terrain mesher (double-buffered). See [`terrain_job`].
@@ -707,6 +710,7 @@ impl World {
             lod_debug: false,
             plasma_mesh_mode: false,
             plasma_mesh_n: 0,
+            reentry_test_kind: 0,
             terrain_verts: Vec::new(),
             terrain_count: 0,
             terrain_svc: terrain_job::TerrainService::new(),
@@ -869,6 +873,64 @@ impl World {
             self.rebuild_terrain();
             self.terrain_dirty = true;
         }
+    }
+
+    /// Toggle the re-entry plasma renderer between the volumetric raymarch
+    /// (default) and the prototype glow mesh. Bound to `M` in the rocket view.
+    fn toggle_plasma_mesh(&mut self) {
+        self.plasma_mesh_mode = !self.plasma_mesh_mode;
+        log::info!(
+            "Re-entry plasma: {}",
+            if self.plasma_mesh_mode { "procedural MESH" } else { "volumetric RAYMARCH" }
+        );
+    }
+
+    /// Drop the live view straight into a re-entry test: a vehicle at full heating
+    /// in the upper atmosphere. Repeated calls cycle the attitude - 0 = axial
+    /// (nose-first), 1 = pitched-over (high angle of attack), 2 = broadside. The
+    /// shot scenarios `reentry`, `reentry_tilt`, `reentry_side` use the same setup.
+    fn setup_reentry(&mut self, kind: u8) {
+        self.view = View::Rocket;
+        self.ignite_launch();
+        let radius = self.body.radius;
+        let up = self.launch_up;
+        let east = self.launch_east;
+        if let Some(rk) = self.launch.as_mut() {
+            rk.throttle = 0.0;
+            match kind {
+                0 => {
+                    rk.r = up * (radius + 58_000.0);
+                    rk.v = -up * 6_000.0 + east * 2_600.0;
+                    rk.pitch = 0.0;
+                    rk.pitch_act = 0.0;
+                }
+                1 => {
+                    rk.r = up * (radius + 58_000.0);
+                    rk.pitch = 0.8;
+                    rk.pitch_act = 0.8;
+                    rk.v = east * 5_400.0 - up * 3_200.0;
+                }
+                _ => {
+                    rk.r = up * (radius + 55_000.0);
+                    rk.pitch = 0.0;
+                    rk.pitch_act = 0.0;
+                    rk.v = east * 6_600.0;
+                }
+            }
+        }
+        for _ in 0..12 {
+            self.advance(0.1); // ~1.2 s for the plasma to bloom
+        }
+        self.rocket_az = 4.2;
+        self.rocket_el = if kind == 0 { -0.05 } else { 0.05 };
+        self.rocket_dist = 95.0;
+    }
+
+    /// `J` handler: enter the next re-entry test attitude (cycles axial/tilt/side).
+    fn cycle_reentry_test(&mut self) {
+        let kind = self.reentry_test_kind % 3;
+        self.setup_reentry(kind);
+        self.reentry_test_kind = (kind + 1) % 3;
     }
 
     /// Live LOD-debug stats for the HUD: the active planet LOD (patch counts per
@@ -4623,75 +4685,22 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
         }
         "reentry" => {
             // a vehicle screaming back into the upper atmosphere: the reentry
-            // plasma bow shock + streaks at full heat.
-            world.view = View::Rocket;
-            world.ignite_launch();
-            let radius = world.body.radius;
-            let up = world.launch_up;
-            let east = world.launch_east;
-            if let Some(rk) = world.launch.as_mut() {
-                rk.r = up * (radius + 58_000.0);
-                rk.v = -up * 6_000.0 + east * 2_600.0;
-                rk.throttle = 0.0;
-                rk.pitch = 0.0;
-                rk.pitch_act = 0.0;
-            }
-            for _ in 0..12 {
-                world.advance(0.1); // ~1.2 s for the plasma to bloom
-            }
-            world.rocket_az = 4.2;
-            world.rocket_el = -0.05;
-            world.rocket_dist = 95.0;
+            // plasma bow shock + streaks at full heat (nose-first).
+            world.setup_reentry(0);
             0.0
         }
         "reentry_tilt" => {
             // Same fireball but with a steeply pitched-over airframe and a big
             // angle of attack (velocity well off the body axis): verifies the
             // wake hugs the rocket's own axis instead of skewing off downwind.
-            world.view = View::Rocket;
-            world.ignite_launch();
-            let radius = world.body.radius;
-            let up = world.launch_up;
-            let east = world.launch_east;
-            if let Some(rk) = world.launch.as_mut() {
-                rk.r = up * (radius + 58_000.0);
-                // airframe pitched ~46 deg from vertical toward the east
-                rk.pitch = 0.8;
-                rk.pitch_act = 0.8;
-                // velocity mostly horizontal + falling: a large angle of attack
-                rk.v = east * 5_400.0 - up * 3_200.0;
-                rk.throttle = 0.0;
-            }
-            for _ in 0..12 {
-                world.advance(0.1); // ~1.2 s for the plasma to bloom
-            }
-            world.rocket_az = 4.2;
-            world.rocket_el = 0.05;
-            world.rocket_dist = 95.0;
+            world.setup_reentry(1);
             0.0
         }
         "reentry_side" => {
             // belly-first: nose vertical, velocity purely horizontal (~90 deg
             // angle of attack), so the windward side is the flank and the wake
             // trails straight back along the airstream.
-            world.view = View::Rocket;
-            world.ignite_launch();
-            let radius = world.body.radius;
-            let up = world.launch_up;
-            let east = world.launch_east;
-            if let Some(rk) = world.launch.as_mut() {
-                rk.r = up * (radius + 55_000.0);
-                rk.pitch = 0.0;
-                rk.pitch_act = 0.0;
-                rk.v = east * 6_600.0; // broadside to the airstream
-                rk.throttle = 0.0;
-            }
-            for _ in 0..12 {
-                world.advance(0.1);
-            }
-            world.rocket_az = 4.2;
-            world.rocket_el = 0.05;
-            world.rocket_dist = 95.0;
+            world.setup_reentry(2);
             0.0
         }
         "sepfloat" => {
@@ -5822,6 +5831,13 @@ impl ApplicationHandler<UserEvent> for App {
                             state.world.back_to_vab()
                         }
                         KeyCode::KeyL => state.world.toggle_lod_debug(),
+                        // Re-entry plasma test bench: `J` drops into a re-entry
+                        // state (cycles axial/tilt/side), `M` toggles the plasma
+                        // renderer (volumetric raymarch <-> prototype glow mesh).
+                        KeyCode::KeyJ if state.world.view == View::Rocket => {
+                            state.world.cycle_reentry_test()
+                        }
+                        KeyCode::KeyM => state.world.toggle_plasma_mesh(),
                         // [ ] are always time compression (sim time scale).
                         KeyCode::BracketRight => {
                             state.world.warp = (state.world.warp * 2.0).min(10000.0);
