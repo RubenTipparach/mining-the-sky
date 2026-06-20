@@ -183,19 +183,25 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
             let fil = smoothstep(0.55, 0.95, tb1);
             var dens = clamp(glow * (0.22 + 1.3 * tb + 0.5 * fil), 0.0, 1.0);
 
-            // cooling along the smear: white-hot windward -> orange -> deep red.
+            // STEEP cooling gradient keyed to downstream distance, so the
+            // white-hot glow stays pinned to the windward surface (smear ~ 0) and
+            // drops fast to orange, then a long deep-red tail.
             let cool = clamp(smear / smear_len, 0.0, 1.0);
-            let temp = clamp((1.0 - cool) * 1.15, 0.0, 1.0);
-            var c = mix(vec3<f32>(0.45, 0.06, 0.02), vec3<f32>(1.0, 0.40, 0.09), smoothstep(0.0, 0.42, temp));
-            c = mix(c, vec3<f32>(1.0, 0.86, 0.5), smoothstep(0.42, 0.76, temp));
-            c = mix(c, vec3<f32>(1.3, 1.28, 1.22), smoothstep(0.82, 1.0, temp)); // white-hot windward
-            // a faint pink/violet ionised fringe in the mid-temperature gas
-            c = c + vec3<f32>(0.35, 0.06, 0.22) * smoothstep(0.3, 0.6, temp) * (1.0 - smoothstep(0.7, 0.95, temp));
-            // a cool blue-white sheen on the very hottest filaments
-            c = c + vec3<f32>(0.3, 0.45, 0.7) * fil * smoothstep(0.7, 1.0, temp);
+            let whitef = smoothstep(0.10, 0.0, cool);   // only right at the surface
+            let yellowf = smoothstep(0.22, 0.04, cool);
+            let orangef = smoothstep(0.45, 0.10, cool);
+            var c = vec3<f32>(0.40, 0.05, 0.02);                  // deep-red tail
+            c = mix(c, vec3<f32>(1.0, 0.36, 0.07), orangef);      // orange
+            c = mix(c, vec3<f32>(1.0, 0.78, 0.40), yellowf);      // yellow
+            c = mix(c, vec3<f32>(1.4, 1.32, 1.22), whitef);       // white-hot windward
+            // faint pink/violet ionised fringe in the mid-temperature gas
+            c = c + vec3<f32>(0.32, 0.05, 0.20) * orangef * (1.0 - yellowf) * 0.7;
+            // cool blue-white sheen on the hottest filaments (windward only)
+            c = c + vec3<f32>(0.3, 0.45, 0.7) * fil * whitef;
 
-            // more translucent overall; bright filaments read through the haze.
-            let a = dens * dens * (0.4 + 1.0 * temp) + fil * temp * 0.15;
+            // alpha biased to the hot windward glow; the cool tail stays wispy.
+            let hot = max(whitef, yellowf * 0.65);
+            let a = dens * dens * (0.3 + 1.1 * hot) + fil * whitef * 0.2;
             var col = vec4<f32>(c, a);
             col = vec4<f32>(col.rgb * col.a, col.a);
             rz = rz + col * (1.0 - rz.a);
