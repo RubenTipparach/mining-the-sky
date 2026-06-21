@@ -60,7 +60,7 @@ fn test_menu(ctx: &egui::Context, world: &mut World) {
 
     egui::Window::new("TEST SCENES")
         .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 12.0))
-        .default_open(true)
+        .default_open(false)
         .default_width(210.0)
         .resizable(false)
         .show(ctx, |ui| {
