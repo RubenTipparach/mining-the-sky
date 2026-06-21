@@ -137,9 +137,10 @@ const FX_CAP: u64 = 60000;
 /// Dynamic rocket-view geometry (pad + rocket + spent booster, or a surface
 /// mesh: moon base / cargo module / a full procedural asteroid ~66k verts).
 const DYN_MESH_CAP: u64 = 200_000;
-/// Procedural re-entry plasma glow mesh (prototype mesh approach). One teardrop
-/// envelope of swept rings, so a few thousand verts is plenty.
-const PLASMA_MESH_CAP: u64 = 32_768;
+/// Procedural re-entry plasma glow mesh (prototype mesh approach): an isosurface
+/// shell hugging the vehicle SDF (surface nets), so it can run to tens of
+/// thousands of verts on a boostered stack.
+const PLASMA_MESH_CAP: u64 = 262_144;
 /// Full-planet LOD terrain (rebuilt as the rocket moves across the grid). Sized
 /// for the high-detail budget (~1-2M triangles = 3-6M non-indexed vertices); the
 /// GPU buffer is this many vertices, so it bounds the densest terrain frame.
@@ -188,6 +189,40 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     let t = ((x - e0) / (e1 - e0).max(1e-6)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
+}
+
+/// Polynomial smooth-minimum (iq): blends two SDF values over a radius `k` so a
+/// union of overlapping shapes reads as one creaseless surface (no faceted ridge
+/// where the parts meet). Used to fuse the smeared wake copies of the hull SDF.
+fn smooth_min(a: f32, b: f32, k: f32) -> f32 {
+    let h = (0.5 + 0.5 * (b - a) / k.max(1e-6)).clamp(0.0, 1.0);
+    b * (1.0 - h) + a * h - k * h * (1.0 - h)
+}
+
+/// Signed distance to a round cone (capsule with end radii `r1`..`r2`) from `a`
+/// to `b`. Rust port of the iq round-cone SDF used in `plasma.wgsl`, for building
+/// the glow-mesh isosurface on the CPU.
+fn sd_round_cone(p: Vec3, a: Vec3, b: Vec3, r1: f32, r2: f32) -> f32 {
+    let ba = b - a;
+    let l2 = ba.dot(ba).max(1e-6);
+    let rr = r1 - r2;
+    let a2 = l2 - rr * rr;
+    let il2 = 1.0 / l2;
+    let pa = p - a;
+    let y = pa.dot(ba);
+    let z = y - l2;
+    let d2v = pa * l2 - ba * y;
+    let x2 = d2v.dot(d2v);
+    let y2 = y * y * l2;
+    let z2 = z * z * l2;
+    let k = rr.signum() * rr * rr * x2;
+    if z.signum() * a2 * z2 > k {
+        return (x2 + z2).sqrt() * il2 - r2;
+    }
+    if y.signum() * a2 * y2 < k {
+        return (x2 + y2).sqrt() * il2 - r1;
+    }
+    (x2 * a2 * il2).sqrt() * il2 + y * rr * il2 - r1
 }
 // The re-entry plasma is raymarched into a half-resolution HDR buffer (linear,
 // filterable) and then upscale-composited over the scene, so the expensive march
@@ -576,6 +611,11 @@ struct World {
     plasma_mesh_mode: bool,
     /// Vertex count of the plasma glow mesh built this frame (mesh mode only).
     plasma_mesh_n: u32,
+    /// Frozen re-entry test scene: the vehicle is held at full heat in place so
+    /// the plasma FX play continuously and you can orbit / re-aim it to inspect
+    /// the shock. No physics integration, no heat damage, never destroyed. Set
+    /// by `setup_reentry`, cleared on any normal ignite / reset.
+    reentry_test: bool,
     /// Background planet-terrain mesher (double-buffered). See [`terrain_job`].
     terrain_svc: terrain_job::TerrainService,
 
@@ -707,6 +747,7 @@ impl World {
             lod_debug: false,
             plasma_mesh_mode: false,
             plasma_mesh_n: 0,
+            reentry_test: false,
             terrain_verts: Vec::new(),
             terrain_count: 0,
             terrain_svc: terrain_job::TerrainService::new(),
@@ -905,9 +946,21 @@ impl World {
                 }
             }
         }
+        // Integrate a short while so the heating glow blooms to full, then
+        // freeze the scene: from here the vehicle holds its pose at full heat
+        // (see the `reentry_test` branch in `advance`) so the FX run forever and
+        // you can orbit / pitch it instead of watching it fall and burn up.
         for _ in 0..12 {
             self.advance(0.1); // ~1.2 s for the plasma to bloom
         }
+        if let Some(rk) = self.launch.as_mut() {
+            rk.health = 100.0; // pristine airframe for the test
+            rk.destroyed = false;
+            rk.crashed = false;
+            rk.throttle = 0.0;
+        }
+        self.exploded = false;
+        self.reentry_test = true;
         self.rocket_az = 4.2;
         self.rocket_el = if kind == 0 { -0.05 } else { 0.05 };
         self.rocket_dist = 95.0;
@@ -1169,20 +1222,19 @@ impl World {
         }
     }
 
-    /// PROTOTYPE (mesh approach): build a procedural glow-envelope mesh for the
-    /// re-entry plasma instead of raymarching it. A teardrop is swept along the
-    /// airflow axis - a sharp windward nose, a body-sized bulge that hugs the
-    /// vehicle radius, then a long tapering wake. Each vertex carries a "cool"
-    /// coordinate (0 at the windward nose .. 1 at the wake tail) in `color.x`,
-    /// which the glow shader maps through the same white -> orange -> red ramp.
-    /// Normals are radial (for the fresnel rim). Verts are in camera-relative
-    /// scene space, so the existing mesh view-proj transforms + depth-test it.
+    /// PROTOTYPE (mesh approach): build a glow shell that HUGS the vehicle hull
+    /// for the re-entry plasma, instead of raymarching it. The shell is the
+    /// isosurface (via surface nets) of the vehicle SDF, smeared downstream along
+    /// the airflow so it wraps the real geometry (boosters get their own bulge)
+    /// and trails into a wake. Each vertex carries a "cool" coordinate (0 at the
+    /// windward face .. 1 at the wake tail) in `color.x` for the white -> orange
+    /// -> red ramp, and an outward SDF-gradient normal for the fresnel rim. Verts
+    /// are camera-relative, so the mesh pass transforms + depth-tests it.
     fn plasma_mesh(&self) -> Vec<rocket::MeshVertex> {
         let rk = match self.launch.as_ref() {
             Some(rk) if !rk.destroyed => rk,
             _ => return Vec::new(),
         };
-        // Re-derive the same flow/extent geometry the raymarch uses.
         let base = self.to_local_d(rk.r);
         let quat = Quat::from_rotation_arc(Vec3::Y, self.dir_to_local(rk.point_dir()));
         let height = self.rocket_body.height.max(8.0);
@@ -1199,100 +1251,226 @@ impl World {
         } else {
             axis
         };
-        // Lead/tail extent of the attached SDF prims along the airflow.
-        let mut lead = f32::MIN;
-        let mut tail = f32::MAX;
-        let mut consider = |am: [f32; 3], r1: f32, bm: [f32; 3], r2: f32| {
-            let a = self.rel(base + (quat * Vec3::from(am)).as_dvec3());
-            let b = self.rel(base + (quat * Vec3::from(bm)).as_dvec3());
-            let da = (a - center).dot(flow);
-            let db = (b - center).dot(flow);
-            lead = lead.max(da + r1).max(db + r2);
-            tail = tail.min(da - r1).min(db - r2);
-        };
+
+        // Attached SDF prims in camera-relative space (the hull to hug).
+        let mut prims: Vec<(Vec3, f32, Vec3, f32)> = Vec::new();
+        let xform = |m: [f32; 3]| self.rel(base + (quat * Vec3::from(m)).as_dvec3());
         for (si, pr) in &self.rocket_body.sdf_stage {
             if *si >= rk.stage_base {
-                consider(pr.a, pr.r1, pr.b, pr.r2);
+                prims.push((xform(pr.a), pr.r1, xform(pr.b), pr.r2));
             }
         }
         for pr in &self.rocket_body.sdf_payload {
-            consider(pr.a, pr.r1, pr.b, pr.r2);
+            prims.push((xform(pr.a), pr.r1, xform(pr.b), pr.r2));
         }
-        if lead == f32::MIN {
-            lead = vrad;
-            tail = -vrad;
+        if prims.is_empty() {
+            return Vec::new();
         }
-        let body = lead - tail;                 // geometry extent along flow
-        let smear_len = height * 1.4;           // SMEAR_MULT * vehicle size
-        let wake = smear_len;                   // downstream glow length
-        let total = body + wake;
-        let rb = vrad * 1.9;                     // shock-shell radius around the body
 
-        // Perpendicular frame for the swept rings.
-        let up0 = if flow.dot(Vec3::Y).abs() > 0.9 { Vec3::X } else { Vec3::Y };
-        let rt = flow.cross(up0).normalize_or_zero();
+        let shell = vrad * 0.6; // glow standoff off the hull
+        let wake = height * 1.4; // downstream wake length
+
+        // Flow-aligned frame: +s windward, x/y perpendicular.
+        let upref = if flow.dot(Vec3::Y).abs() > 0.9 { Vec3::X } else { Vec3::Y };
+        let rt = flow.cross(upref).normalize_or_zero();
         let upv = rt.cross(flow).normalize_or_zero();
-        let nose = center + flow * lead;        // windward leading point
 
-        let rings = 24usize;
-        let segs = 28usize;
-        // ring i: position along the axis + its radius + cool coordinate
-        let ring = |i: usize| -> (Vec3, f32, f32) {
-            let u = i as f32 / rings as f32;
-            let s = u * total;                  // distance downstream from the nose
-            let p = nose - flow * s;
-            // radius: rise off the nose tip, hold near rb over the body, taper in
-            // the wake to a thin tail.
-            let rise = smoothstep(0.0, 0.12, u);
-            let wk = if s > body { ((s - body) / wake).clamp(0.0, 1.0) } else { 0.0 };
-            let taper = 1.0 - smoothstep(0.0, 1.0, wk);
-            let r = rb * rise * (0.05 + 0.95 * taper);
-            // Cooling coordinate: hot head over the geometry (0..0.30, white -> orange
-            // as in the raymarch ramp), then orange -> deep red through the wake. This
-            // keys the white-hot to the windward body regardless of body/wake ratio,
-            // so a tall axial entry and a broadside entry both read right.
-            let bodyf = body.max(1e-3);
-            let cool = if s <= body {
-                0.30 * (s / bodyf)
-            } else {
-                (0.30 + 0.70 * ((s - body) / wake)).min(1.0)
-            };
-            (p, r.max(0.02), cool)
+        // SDF of the hull (union of round cones) and a downstream-smeared field
+        // whose isosurface `== shell` hugs the windward hull and trails a wake.
+        let sdf = |p: Vec3| -> f32 {
+            prims
+                .iter()
+                .fold(f32::MAX, |d, &(a, r1, b, r2)| d.min(sd_round_cone(p, a, b, r1, r2)))
         };
 
-        let mut verts: Vec<rocket::MeshVertex> = Vec::with_capacity(rings * segs * 6);
-        let mut push = |p: Vec3, n: Vec3, cool: f32| {
-            verts.push(rocket::MeshVertex {
-                pos: [p.x, p.y, p.z],
-                normal: [n.x, n.y, n.z],
-                color: [cool, 0.0, 0.0],
-            });
-        };
-        let ringv = |p: Vec3, r: f32, j: usize| -> (Vec3, Vec3) {
-            let ang = std::f32::consts::TAU * j as f32 / segs as f32;
-            let dir = rt * ang.cos() + upv * ang.sin();
-            (p + dir * r, dir)
-        };
-        // nose cap fan + swept body
-        for i in 0..rings {
-            let (p0, r0, c0) = ring(i);
-            let (p1, r1, c1) = ring(i + 1);
-            for j in 0..segs {
-                let jn = (j + 1) % segs;
-                let (a, na) = ringv(p0, r0, j);
-                let (b, nb) = ringv(p0, r0, jn);
-                let (c, nc) = ringv(p1, r1, j);
-                let (d, nd) = ringv(p1, r1, jn);
-                // two triangles (a,c,b) (b,c,d), double-sided pipeline (no cull)
-                push(a, na, c0);
-                push(c, nc, c1);
-                push(b, nb, c0);
-                push(b, nb, c0);
-                push(c, nc, c1);
-                push(d, nd, c1);
+        // Bounds of the shell in the flow frame, lead/tail along the airflow.
+        let (mut smin, mut smax) = (f32::MAX, f32::MIN);
+        let (mut xmin, mut xmax) = (f32::MAX, f32::MIN);
+        let (mut ymin, mut ymax) = (f32::MAX, f32::MIN);
+        let mut lead = f32::MIN;
+        let mut tail = f32::MAX;
+        for &(a, r1, b, r2) in &prims {
+            for (p, r) in [(a, r1), (b, r2)] {
+                let d = p - center;
+                let (s, x, y) = (d.dot(flow), d.dot(rt), d.dot(upv));
+                let rr = r + shell;
+                smin = smin.min(s - rr);
+                smax = smax.max(s + rr);
+                xmin = xmin.min(x - rr);
+                xmax = xmax.max(x + rr);
+                ymin = ymin.min(y - rr);
+                ymax = ymax.max(y + rr);
+                lead = lead.max(s + r);
+                tail = tail.min(s - r);
             }
         }
-        verts
+        let body = (lead - tail).max(vrad);
+
+        // Downstream-smeared field whose `== shell` isosurface hugs the windward
+        // hull and trails a tapering wake. Smear = smooth-union over upstream
+        // shifts of the hull SDF: the smooth min fuses the shifted copies into one
+        // creaseless wake (no banding/scallops at any attitude), the step is kept
+        // within the smoothing radius so they always overlap, and a per-shift
+        // taper pinches the far wake to a point instead of a flat tube.
+        let smk = shell * 1.6; // wake-union smoothing radius
+        let ksmear = ((wake / smk).ceil() as usize + 1).clamp(8, 24);
+        let taper = shell * 2.2 / wake;
+        let field = |p: Vec3| -> f32 {
+            let mut d = sdf(p);
+            for m in 1..ksmear {
+                let kd = wake * m as f32 / (ksmear - 1) as f32;
+                d = smooth_min(d, sdf(p + flow * kd) + kd * taper, smk);
+            }
+            d - shell
+        };
+
+        smin -= wake; // wake trails downstream (toward low s)
+        let pad = shell;
+        smin -= pad;
+        xmin -= pad;
+        ymin -= pad;
+        smax += pad;
+        xmax += pad;
+        ymax += pad;
+
+        // Grid (cell ~ standoff), capped per axis to bound vert count + CPU cost.
+        let cell = (vrad * 0.55).max(0.7);
+        let dim = |lo: f32, hi: f32| (((hi - lo) / cell).ceil() as usize).clamp(2, 30);
+        let (gs, gx, gy) = (dim(smin, smax), dim(xmin, xmax), dim(ymin, ymax));
+        let cs = (smax - smin) / gs as f32;
+        let cx = (xmax - xmin) / gx as f32;
+        let cy = (ymax - ymin) / gy as f32;
+        let cpos = |i: usize, j: usize, k: usize| -> Vec3 {
+            center
+                + flow * (smin + i as f32 * cs)
+                + rt * (xmin + j as f32 * cx)
+                + upv * (ymin + k as f32 * cy)
+        };
+
+        // Sample the field at every grid corner.
+        let (nx, ny, nz) = (gs + 1, gx + 1, gy + 1);
+        let cidx = |i: usize, j: usize, k: usize| (i * ny + j) * nz + k;
+        let mut fval = vec![0.0f32; nx * ny * nz];
+        for i in 0..nx {
+            for j in 0..ny {
+                for k in 0..nz {
+                    fval[cidx(i, j, k)] = field(cpos(i, j, k));
+                }
+            }
+        }
+
+        // Surface nets: one vertex per surface-straddling cell, at the average of
+        // its edge zero-crossings; quads join the cells around each crossed edge.
+        const EDGES: [((usize, usize, usize), (usize, usize, usize)); 12] = [
+            ((0, 0, 0), (1, 0, 0)), ((0, 1, 0), (1, 1, 0)), ((0, 0, 1), (1, 0, 1)), ((0, 1, 1), (1, 1, 1)),
+            ((0, 0, 0), (0, 1, 0)), ((1, 0, 0), (1, 1, 0)), ((0, 0, 1), (0, 1, 1)), ((1, 0, 1), (1, 1, 1)),
+            ((0, 0, 0), (0, 0, 1)), ((1, 0, 0), (1, 0, 1)), ((0, 1, 0), (0, 1, 1)), ((1, 1, 0), (1, 1, 1)),
+        ];
+        let lidx = |i: usize, j: usize, k: usize| (i * gx + j) * gy + k;
+        let mut cellv: Vec<i32> = vec![-1; gs * gx * gy];
+        let mut pos: Vec<Vec3> = Vec::new();
+        let mut nrm: Vec<Vec3> = Vec::new();
+        let mut coolv: Vec<f32> = Vec::new();
+        let grad_eps = cell * 0.5;
+        for i in 0..gs {
+            for j in 0..gx {
+                for k in 0..gy {
+                    let mut acc = Vec3::ZERO;
+                    let mut cnt = 0.0f32;
+                    for &((ax, ay, az), (bx, by, bz)) in EDGES.iter() {
+                        let fa = fval[cidx(i + ax, j + ay, k + az)];
+                        let fb = fval[cidx(i + bx, j + by, k + bz)];
+                        if (fa < 0.0) != (fb < 0.0) {
+                            let t = fa / (fa - fb);
+                            acc += cpos(i + ax, j + ay, k + az)
+                                .lerp(cpos(i + bx, j + by, k + bz), t);
+                            cnt += 1.0;
+                        }
+                    }
+                    if cnt > 0.0 {
+                        let p = acc / cnt;
+                        // outward normal from the hull SDF gradient (for fresnel).
+                        let n = Vec3::new(
+                            sdf(p + Vec3::X * grad_eps) - sdf(p - Vec3::X * grad_eps),
+                            sdf(p + Vec3::Y * grad_eps) - sdf(p - Vec3::Y * grad_eps),
+                            sdf(p + Vec3::Z * grad_eps) - sdf(p - Vec3::Z * grad_eps),
+                        )
+                        .normalize_or_zero();
+                        // cool: downstream distance from the windward face (0 hot),
+                        // 0..0.30 over the hull, 0.30..1 through the wake.
+                        let ds = (lead - (p - center).dot(flow)).max(0.0);
+                        let cool = if ds <= body {
+                            0.30 * (ds / body)
+                        } else {
+                            (0.30 + 0.70 * ((ds - body) / wake)).min(1.0)
+                        };
+                        cellv[lidx(i, j, k)] = pos.len() as i32;
+                        pos.push(p);
+                        nrm.push(n);
+                        coolv.push(cool);
+                    }
+                }
+            }
+        }
+
+        let mut out: Vec<rocket::MeshVertex> = Vec::new();
+        let mut tri = |a: i32, b: i32, c: i32, out: &mut Vec<rocket::MeshVertex>| {
+            if a < 0 || b < 0 || c < 0 {
+                return;
+            }
+            for &vi in &[a as usize, b as usize, c as usize] {
+                let p = pos[vi];
+                let n = nrm[vi];
+                out.push(rocket::MeshVertex {
+                    pos: [p.x, p.y, p.z],
+                    normal: [n.x, n.y, n.z],
+                    color: [coolv[vi], 0.0, 0.0],
+                });
+            }
+        };
+        // Quad around each crossed interior edge (double-sided pipeline, so the
+        // winding does not matter - only the normals do).
+        let mut quad = |c0: i32, c1: i32, c2: i32, c3: i32, out: &mut Vec<rocket::MeshVertex>| {
+            tri(c0, c1, c2, out);
+            tri(c0, c2, c3, out);
+        };
+        for i in 0..gs {
+            for j in 1..gx {
+                for k in 1..gy {
+                    if (fval[cidx(i, j, k)] < 0.0) != (fval[cidx(i + 1, j, k)] < 0.0) {
+                        quad(
+                            cellv[lidx(i, j - 1, k - 1)], cellv[lidx(i, j, k - 1)],
+                            cellv[lidx(i, j, k)], cellv[lidx(i, j - 1, k)], &mut out,
+                        );
+                    }
+                }
+            }
+        }
+        for i in 1..gs {
+            for j in 0..gx {
+                for k in 1..gy {
+                    if (fval[cidx(i, j, k)] < 0.0) != (fval[cidx(i, j + 1, k)] < 0.0) {
+                        quad(
+                            cellv[lidx(i - 1, j, k - 1)], cellv[lidx(i, j, k - 1)],
+                            cellv[lidx(i, j, k)], cellv[lidx(i - 1, j, k)], &mut out,
+                        );
+                    }
+                }
+            }
+        }
+        for i in 1..gs {
+            for j in 1..gx {
+                for k in 0..gy {
+                    if (fval[cidx(i, j, k)] < 0.0) != (fval[cidx(i, j, k + 1)] < 0.0) {
+                        quad(
+                            cellv[lidx(i - 1, j - 1, k)], cellv[lidx(i, j - 1, k)],
+                            cellv[lidx(i, j, k)], cellv[lidx(i - 1, j, k)], &mut out,
+                        );
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Exhaust intensity of the active engine (0 when not thrusting / destroyed).
@@ -1492,10 +1670,22 @@ impl World {
         }
 
         // player-controlled launch + any tumbling spent booster
+        let frozen = self.reentry_test;
         if let Some(rk) = self.launch.as_mut() {
             rk.just_staged = None;
-            let dt = (frame_dt * self.warp).min(2.0);
-            rk.integrate(&self.body, dt as f64);
+            if frozen {
+                // Frozen plasma test: hold the vehicle in place at full heat so
+                // the FX play continuously and you can orbit / re-aim it. Skip
+                // integration entirely (no motion, no heat damage, never breaks
+                // up); attitude still tracks the command so W/S re-aims it.
+                rk.pitch_act = rk.pitch;
+                rk.health = 100.0;
+                rk.destroyed = false;
+                rk.crashed = false;
+            } else {
+                let dt = (frame_dt * self.warp).min(2.0);
+                rk.integrate(&self.body, dt as f64);
+            }
         }
         // break-up: a destroyed vehicle (burn-through or crash) explodes once.
         if self.launch.as_ref().map(|rk| rk.destroyed).unwrap_or(false) && !self.exploded {
@@ -1975,6 +2165,7 @@ impl World {
         self.exploded = false;
         self.smoke.clear();
         self.mission_captured = false;
+        self.reentry_test = false; // a real ignition flies; only the test freezes
         // you launch from the pad: ensure we're rolled out.
         self.vab_mode = false;
         self.rolling_out = false;
@@ -2042,6 +2233,7 @@ impl World {
         self.exploded = false;
         self.smoke.clear();
         self.mission_captured = false;
+        self.reentry_test = false;
     }
 
     /// Whether the active launch has reached a stable parking orbit.
@@ -4402,6 +4594,103 @@ fn make_shot_device() -> (wgpu::Device, wgpu::Queue) {
     .expect("device")
 }
 
+/// Measure the re-entry plasma cost on the real GPU. Loops the actual render
+/// passes K times in a single submit and blocks on the GPU (poll-wait), so wall
+/// time is dominated by GPU execution. Reports the isolated plasma pass and the
+/// whole rocket frame with plasma on vs off, so the plasma's share of the frame
+/// is a measured number rather than a guess.
+#[cfg(not(target_arch = "wasm32"))]
+fn bench_plasma(scenario: &str, width: u32, height: u32) {
+    use std::time::Instant;
+    let (device, queue) = make_shot_device();
+    let gpu = Gpu::new(&device, &queue, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let (mut world, time) = setup_world(scenario, width, height);
+    let (n, hn, dyn_n, fx_n, plasma_on, plume_on) =
+        gpu.prepare(&queue, &mut world, width, height, time);
+    if !plasma_on {
+        println!("plasma not active for scenario '{scenario}' - nothing to bench");
+        return;
+    }
+    let terrain_n = world.terrain_count;
+    let prims = {
+        let rk_base = world.launch.as_ref().map(|rk| rk.stage_base).unwrap_or(0);
+        world.rocket_body.sdf_stage.iter().filter(|(si, _)| *si >= rk_base).count()
+            + world.rocket_body.sdf_payload.len()
+    };
+
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("bench-target"),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+    let depth = create_depth(&device, width, height);
+    let pt = make_plasma_target(&device, &gpu, width, height);
+
+    // Encode the whole rocket-view frame (the same passes `render_shot` uses),
+    // optionally including the plasma pass.
+    let encode_frame = |enc: &mut wgpu::CommandEncoder, plasma: bool| {
+        {
+            let mut pass = mesh_pass(enc, &target_view, &depth);
+            gpu.draw_sky(&mut pass);
+            gpu.draw_meshes(&mut pass, terrain_n, dyn_n);
+            gpu.draw_plume(&mut pass, plume_on);
+            gpu.draw_fx(&mut pass, fx_n);
+        }
+        if plasma {
+            draw_plasma_halfres(enc, &gpu, &target_view, &pt);
+        }
+        {
+            let mut pass = overlay_pass(enc, &target_view);
+            gpu.draw_overlay(&mut pass, n, hn);
+        }
+    };
+
+    // Time `k` encodes (per repetition) of `encode`, GPU-synced; return best ms.
+    let time_k = |k: u32, reps: u32, encode: &dyn Fn(&mut wgpu::CommandEncoder)| -> f64 {
+        {
+            // warmup: shader compile, buffer upload, GPU clock ramp
+            let mut e = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            for _ in 0..32 {
+                encode(&mut e);
+            }
+            queue.submit([e.finish()]);
+            device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        }
+        let mut best = f64::INFINITY;
+        for _ in 0..reps {
+            let mut e = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            for _ in 0..k {
+                encode(&mut e);
+            }
+            let cb = e.finish();
+            let t0 = Instant::now();
+            queue.submit([cb]);
+            device.poll(wgpu::PollType::wait_indefinitely()).ok();
+            best = best.min(t0.elapsed().as_secs_f64() / k as f64 * 1000.0);
+        }
+        best
+    };
+
+    let plasma_only = time_k(300, 6, &|e| draw_plasma_halfres(e, &gpu, &target_view, &pt));
+    let frame_on = time_k(120, 6, &|e| encode_frame(e, true));
+    let frame_off = time_k(120, 6, &|e| encode_frame(e, false));
+
+    let (hw, hh) = (width / 2, height / 2);
+    println!("re-entry plasma bench, scenario '{scenario}'");
+    println!("  full-res {width}x{height}, raymarched at half-res {hw}x{hh}, {prims} SDF prims");
+    println!("  plasma pass alone (raymarch + composite): {plasma_only:.3} ms");
+    println!("  whole rocket frame, plasma ON:            {frame_on:.3} ms");
+    println!("  whole rocket frame, plasma OFF:           {frame_off:.3} ms");
+    println!("  => plasma adds {:.3} ms to the frame", frame_on - frame_off);
+}
+
 /// Build the world + sun time for a named validation scenario.
 #[cfg(not(target_arch = "wasm32"))]
 fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
@@ -4666,6 +4955,14 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
         "reentry" => {
             // a vehicle screaming back into the upper atmosphere: the reentry
             // plasma bow shock + streaks at full heat (nose-first).
+            world.setup_reentry(0);
+            0.0
+        }
+        "reentry_boost" => {
+            // a heavily boostered stack (6 strap-ons => ~16 SDF prims) at full
+            // heat: the worst case for the plasma SDF cost, used by `bench`.
+            world.vab.stages[0].boosters = 6;
+            world.vab.stages[0].booster = 1; // SRB-Heavy
             world.setup_reentry(0);
             0.0
         }
@@ -5897,6 +6194,28 @@ fn main() {
             println!("wrote {path}");
             return;
         }
+        // `bench [scenario] [WxH]`: time the re-entry plasma pass on the real
+        // GPU (loop the actual pipeline in one submit, GPU-synced), so the cost
+        // of the raymarch is a measured number instead of a guess.
+        if args.iter().any(|a| a == "bench") {
+            env_logger::init();
+            let scenario = args
+                .iter()
+                .position(|a| a == "bench")
+                .and_then(|i| args.get(i + 1))
+                .filter(|a| a.starts_with("reentry"))
+                .cloned()
+                .unwrap_or_else(|| "reentry".to_string());
+            let (w, h) = args
+                .iter()
+                .find_map(|a| {
+                    let (ws, hs) = a.split_once('x')?;
+                    Some((ws.parse::<u32>().ok()?, hs.parse::<u32>().ok()?))
+                })
+                .unwrap_or((1280, 800));
+            bench_plasma(&scenario, w, h);
+            return;
+        }
         // `anim <scenario> [out.png]`: a horizontal filmstrip of the scenario
         // playing out (the rocket falling + the volumetric FX boiling).
         if args.iter().any(|a| a == "anim") {
@@ -6173,5 +6492,64 @@ mod instant_now {
             .and_then(|w| w.performance())
             .map(|p| p.now())
             .unwrap_or(0.0)
+    }
+}
+
+#[cfg(test)]
+mod reentry_test_scene {
+    use super::*;
+
+    /// The frozen re-entry test scene must hold the vehicle still at full heat
+    /// indefinitely: no motion, no heat damage, never destroyed - so the plasma
+    /// FX can be inspected at leisure (this is the whole point of the test menu).
+    #[test]
+    fn frozen_scene_survives_a_long_run_without_moving() {
+        let mut w = World::new();
+        w.setup_reentry(0);
+        assert!(w.reentry_test, "scene should be frozen after setup");
+        let (r0, heat0) = {
+            let rk = w.launch.as_ref().expect("vehicle present");
+            (rk.r, rk.heat)
+        };
+        assert!(heat0 > 0.3, "plasma should have bloomed (heat={heat0})");
+
+        // Far longer than the few seconds it used to last before burning up.
+        for _ in 0..1200 {
+            w.advance(0.1); // 120 s at 1x
+        }
+
+        let rk = w.launch.as_ref().expect("still present - never destroyed");
+        assert!(!rk.destroyed, "frozen test vehicle must never break up");
+        assert!(!rk.crashed, "frozen test vehicle must never crash");
+        assert_eq!(rk.health, 100.0, "airframe stays pristine");
+        assert!(rk.heat > 0.3, "stays hot so the FX keep playing (heat={})", rk.heat);
+        assert_eq!(rk.r, r0, "vehicle must not move while frozen");
+    }
+
+    /// Re-aiming with the pitch command rotates the airframe instantly while
+    /// frozen (so you can inspect the shock from any attitude), without it ever
+    /// starting to move or take damage.
+    #[test]
+    fn frozen_scene_lets_you_re_aim_the_airframe() {
+        let mut w = World::new();
+        w.setup_reentry(0);
+        let r0 = w.launch.as_ref().unwrap().r;
+        if let Some(rk) = w.launch.as_mut() {
+            rk.pitch = 0.6; // command a new attitude (what W/S does)
+        }
+        w.advance(0.1);
+        let rk = w.launch.as_ref().unwrap();
+        assert!((rk.pitch_act - 0.6).abs() < 1e-9, "attitude tracks the command");
+        assert_eq!(rk.r, r0, "re-aiming must not move the vehicle");
+    }
+
+    /// A real ignition is never frozen - it flies normally.
+    #[test]
+    fn normal_ignition_is_not_frozen() {
+        let mut w = World::new();
+        w.setup_reentry(0);
+        assert!(w.reentry_test);
+        w.ignite_launch(); // a genuine launch clears the test freeze
+        assert!(!w.reentry_test);
     }
 }

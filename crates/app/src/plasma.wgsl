@@ -107,7 +107,7 @@ fn vehicle_sdf(p: vec3<f32>) -> f32 {
 const SHELL_MULT:    f32 = 1.3;   // shock-layer thickness, x vehicle radius
 const SMEAR_MULT:    f32 = 1.4;   // wake length, x vehicle size
 const SMEAR_FADE:    f32 = 0.5;   // wake fade (x smear length); smaller = shorter glow
-const SMEAR_SAMPLES: i32 = 16;    // upstream SDF samples (more = finer streaks)
+const SMEAR_STEPS:   i32 = 14;    // max upstream sphere-trace steps (cost ceiling)
 const WINDWARD_LO:   f32 = -0.18; // windward gate start (x along-flow extent)
 const WINDWARD_HI:   f32 = 0.22;  // windward gate end
 
@@ -169,7 +169,7 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     var tt = max(iv.x, 0.0);
     let tmax = iv.y;
     var rz = vec4<f32>(0.0);
-    let step = bound / 60.0;
+    let step = bound / 48.0;
     // A point can only glow if a vehicle surface sits within (shell + smear_len)
     // of it (the shock shell plus the downstream wake), so that band sets how
     // close to the geometry the expensive smear loop has to run.
@@ -192,29 +192,39 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
             continue;
         }
 
-        // SDF smear: walk a few samples UPSTREAM along the airflow. A point lights
-        // up if a *windward* surface sits upstream of it (band hugging the SDF on
-        // the leading side), so the windward shock smears straight downstream into
-        // the wake, fading + cooling with distance. This works at any attitude
-        // (the SDF + flow define it) and auto-rejects the leeward side (its
-        // upstream is the body interior, where the band is killed).
+        // SDF smear: find the *windward* surface that feeds this point by
+        // sphere-tracing a short ray UPSTREAM along the airflow. A point lights
+        // up if a windward surface sits upstream of it, so the shock smears
+        // straight downstream into the wake, fading + cooling with distance.
+        // Tracing by the SDF distance reaches that surface in a handful of evals
+        // (instead of a fixed dense scan) and never steps over a thin surface, so
+        // it is both cheaper and cleaner. We track the closest approach so the
+        // shock keeps its soft shell; the leeward side self-rejects (its upstream
+        // is the body interior / the windward gate zeroes it).
         var glow = 0.0;
         var smear = smear_len; // downstream distance of the lit surface (cooling)
-        // dither the sample offsets per pixel so the smear reads as soft streaks
-        // rather than regular bands.
-        let jit = fract(sin(dot(in.uv, vec2<f32>(127.1, 311.7)) + t) * 43758.5);
-        for (var j = 0; j < SMEAR_SAMPLES; j = j + 1) {
-            let k = (f32(j) + jit) / f32(SMEAR_SAMPLES) * smear_len;
-            let q = pos + vhat * k;
-            let dv = vehicle_sdf(q);
-            let band = smoothstep(shell, 0.0, dv) * smoothstep(-shell * 0.45, 0.1, dv);
-            let windward = smoothstep(WINDWARD_LO * lv, WINDWARD_HI * lv, dot(q - center, vhat));
-            let fade = exp(-k / (smear_len * SMEAR_FADE));
-            let g = band * windward * fade;
-            if (g > glow) {
-                glow = g;
-                smear = k;
+        // Seed the upstream trace with d0 (the eval we just did at s = 0), so the
+        // empty-space-skip SDF is reused instead of recomputed.
+        var mind = d0;         // closest upstream approach to a surface
+        var mins = 0.0;        // distance upstream at that closest approach
+        var s = max(d0, shell * 0.5);
+        for (var j = 0; j < SMEAR_STEPS; j = j + 1) {
+            if (s > smear_len || d0 < shell * 0.15) { break; }
+            let dv = vehicle_sdf(pos + vhat * s);
+            if (dv < mind) {
+                mind = dv;
+                mins = s;
             }
+            if (dv < shell * 0.15) { break; } // at the surface; upstream only cools
+            s = s + max(dv, shell * 0.5);     // sphere-trace step (min step avoids stalls)
+        }
+        if (mind < shell) {
+            let q = pos + vhat * mins;
+            let band = smoothstep(shell, 0.0, mind) * smoothstep(-shell * 0.45, 0.1, mind);
+            let windward = smoothstep(WINDWARD_LO * lv, WINDWARD_HI * lv, dot(q - center, vhat));
+            let fade = exp(-mins / (smear_len * SMEAR_FADE));
+            glow = band * windward * fade;
+            smear = mins;
         }
 
         if (glow > 0.0025) {
