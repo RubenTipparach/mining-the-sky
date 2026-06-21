@@ -31,6 +31,10 @@ const COL_YELLOW: vec3<f32> = vec3<f32>(1.00, 0.78, 0.40);
 const COL_WHITE:  vec3<f32> = vec3<f32>(1.40, 1.32, 1.22);
 const COL_SHEEN:  vec3<f32> = vec3<f32>(0.30, 0.45, 0.70);
 const ALPHA_CAP:  f32 = 0.72;
+const FLOW_AMP:   f32 = 0.9;   // metres of animated ripple (x layer) - flowing gas
+const SCROLL:     f32 = 1.8;   // turbulence scroll speed (higher = flames fly faster)
+const TAIL_FADE:  f32 = 0.35;  // cool value below which the wake is fully opaque
+const TAIL_END:   f32 = 0.85;  // cool value by which the wake is 100% transparent
 
 fn tri(x: f32) -> f32 { return abs(fract(x) - 0.5) - 0.25; }
 fn tri2(x: f32) -> f32 { return abs(fract(x) - 0.5); }
@@ -64,6 +68,7 @@ struct VsOut {
     @location(1) cool: f32,
     @location(2) flogz: f32,
     @location(3) wpos: vec3<f32>,
+    @location(4) layer: f32,
 };
 
 struct FsOut {
@@ -78,7 +83,14 @@ fn vs(
     @location(2) c: vec3<f32>,
 ) -> VsOut {
     var o: VsOut;
-    var clip = u.viewproj * vec4<f32>(p, 1.0);
+    let t = u.params.y;
+    let layer = c.y;
+    // Animated flow: ripple the shell along its normal with scrolling noise -
+    // gentle on the tight inner shell, big and wispy on the outer layers, so the
+    // gas looks like it boils and flows past the hull rather than sitting still.
+    let warp = tnoise(p * 0.05 + vec3<f32>(0.0, -t * SCROLL, 0.0), t) - 0.35;
+    let pp = p + n * (warp * (0.5 + 3.0 * layer) * FLOW_AMP);
+    var clip = u.viewproj * vec4<f32>(pp, 1.0);
     let fcoef = u.params.x;
     let w = max(clip.w, 1e-6);
     clip.z = log2(max(1e-6, 1.0 + w)) * fcoef * w;
@@ -86,7 +98,8 @@ fn vs(
     o.flogz = 1.0 + w;
     o.normal = n;
     o.cool = c.x;
-    o.wpos = p;
+    o.layer = layer;
+    o.wpos = pp;
     return o;
 }
 
@@ -95,11 +108,12 @@ fn fs(in: VsOut) -> FsOut {
     let t = u.params.y;
     let cool = clamp(in.cool, 0.0, 1.0);
 
-    // Boiling turbulence (two octaves) scrolling over the surface.
+    // Boiling turbulence (two octaves) scrolling over the surface; the outer
+    // layers get extra wisp so they read as flowing gas, not a hard shell.
     let q = in.wpos * 0.06;
-    let tb0 = tnoise(q + vec3<f32>(0.0, -t * 0.6, 0.0), t);
-    let tb1 = tnoise(q * 2.7 + vec3<f32>(5.0, -t * 1.1, 0.0), t);
-    let tb = clamp(tb0 * 0.8 + tb1 * 0.5, 0.0, 1.4);
+    let tb0 = tnoise(q + vec3<f32>(0.0, -t * SCROLL, 0.0), t);
+    let tb1 = tnoise(q * 2.7 + vec3<f32>(5.0, -t * SCROLL * 1.7, 0.0), t);
+    let tb = clamp(tb0 * 0.8 + tb1 * (0.5 + 0.5 * in.layer), 0.0, 1.4);
     let fil = smoothstep(0.55, 0.95, tb1);
 
     // Steep cooling ramp keyed to the downstream "cool" coordinate.
@@ -123,7 +137,13 @@ fn fs(in: VsOut) -> FsOut {
     // by turbulence and the fresnel rim (denser at grazing angles -> volumetric).
     let hot = max(whitef, yellowf * 0.7);
     let dens = clamp((0.30 + 1.1 * tb + 0.5 * fil) * (0.45 + 0.8 * rim), 0.0, 1.0);
-    var a = dens * (0.45 + 1.3 * hot) * (1.0 - 0.45 * cool);
+    // Blend the wake tail fully out to NOTHING well before the mesh's geometric
+    // end, so the long tail dissolves into space instead of ending on a hard
+    // edge. Fades across most of the wake (more fade), 100% transparent by
+    // TAIL_END. The outer wisp layers are fainter so they read as soft gas.
+    let tailfade = smoothstep(TAIL_END, TAIL_FADE, cool);
+    let layerfade = 1.0 - 0.5 * in.layer;
+    var a = dens * (0.45 + 1.3 * hot) * tailfade * layerfade;
     a = clamp(a, 0.0, ALPHA_CAP);
 
     var out: FsOut;

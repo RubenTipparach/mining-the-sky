@@ -127,7 +127,7 @@ fn fs(in: VsOut) -> FsOut {
         // cool white core fading to pale blue at the tip
         let rgb = mix(vec3<f32>(0.85, 0.93, 1.0), vec3<f32>(0.45, 0.6, 1.0), along);
         out.color = vec4<f32>(rgb * a * intensity * 1.6, 0.0); // additive
-    } else {
+    } else if (in.kind < 3.5) {
         // ---- reentry plasma shock (kind 3) ----
         // colour-graded after nimitz's "Re-entry": a cool blue-white compression
         // front over a deep-orange incandescent body fading to a violet wake,
@@ -161,6 +161,18 @@ fn fs(in: VsOut) -> FsOut {
         // cooling violet wake
         rgb = mix(rgb, vec3<f32>(0.5, 0.22, 0.62), smoothstep(0.55, 1.0, along) * 0.8);
         out.color = vec4<f32>(rgb * a * 1.8, 0.0); // additive
+    } else {
+        // ---- re-entry sparks (kind 4): tiny bright embers, additive ----
+        // color.x = seed, color.y = brightness (fades with age).
+        let seed = in.color.x;
+        let bright = in.color.y;
+        let r = length(in.uv * 2.0 - 1.0);
+        let core = smoothstep(1.0, 0.0, r);             // round ember
+        let flick = 0.7 + 0.3 * sin(t * 55.0 + seed * 6.28);
+        // white-hot core grading to gold embers
+        let rgb = mix(vec3<f32>(2.2, 1.8, 1.1), vec3<f32>(2.2, 0.95, 0.35), seed);
+        let a = core * core * bright * flick;
+        out.color = vec4<f32>(rgb * a * 3.5, 0.0); // additive
     }
     return out;
 }

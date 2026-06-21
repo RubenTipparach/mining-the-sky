@@ -507,6 +507,16 @@ struct Smoke {
     seed: f32,
 }
 
+/// One re-entry spark: a tiny bright ember shed off the windward shock and
+/// streaming downstream through the wake, in the rocket-view local frame.
+struct Spark {
+    pos: Vec3,
+    vel: Vec3,
+    age: f32,
+    life: f32,
+    seed: f32,
+}
+
 struct World {
     mission: Mission,
     body: CentralBody,
@@ -590,6 +600,9 @@ struct World {
     mission_captured: bool,
     smoke: Vec<Smoke>,
     smoke_accum: f32, // fractional particle spawn carry
+    /// Re-entry sparks shed off the plasma shock, streaming through the wake.
+    sparks: Vec<Spark>,
+    spark_accum: f32, // fractional spark spawn carry
     anim: f32,        // FX animation clock (seconds)
     // launch-site tangent frame (home-centred metres): origin + up/east/north.
     launch_origin: DVec3,
@@ -737,6 +750,8 @@ impl World {
             mission_captured: false,
             smoke: Vec::new(),
             smoke_accum: 0.0,
+            sparks: Vec::new(),
+            spark_accum: 0.0,
             anim: 0.0,
             launch_origin,
             launch_up,
@@ -1268,7 +1283,7 @@ impl World {
         }
 
         let shell = vrad * 0.6; // glow standoff off the hull
-        let wake = height * 1.4; // downstream wake length
+        let wake = height * 2.2; // downstream wake length (long, fades to nothing)
 
         // Flow-aligned frame: +s windward, x/y perpendicular.
         let upref = if flow.dot(Vec3::Y).abs() > 0.9 { Vec3::X } else { Vec3::Y };
@@ -1325,7 +1340,7 @@ impl World {
         };
 
         smin -= wake; // wake trails downstream (toward low s)
-        let pad = shell;
+        let pad = shell * 1.8; // room for the outer (offset) glow layers
         smin -= pad;
         xmin -= pad;
         ymin -= pad;
@@ -1359,113 +1374,120 @@ impl World {
             }
         }
 
-        // Surface nets: one vertex per surface-straddling cell, at the average of
-        // its edge zero-crossings; quads join the cells around each crossed edge.
+        // Surface nets, extracted at a few iso levels so the glow reads as nested
+        // shells (volume + flow) rather than one hard skin: the inner shell is
+        // bright and tight on the hull, the outer ones are fainter offset wisps
+        // that the shader ripples with animated noise. The expensive field
+        // sampling is shared - each extra layer is just another cheap extraction.
         const EDGES: [((usize, usize, usize), (usize, usize, usize)); 12] = [
             ((0, 0, 0), (1, 0, 0)), ((0, 1, 0), (1, 1, 0)), ((0, 0, 1), (1, 0, 1)), ((0, 1, 1), (1, 1, 1)),
             ((0, 0, 0), (0, 1, 0)), ((1, 0, 0), (1, 1, 0)), ((0, 0, 1), (0, 1, 1)), ((1, 0, 1), (1, 1, 1)),
             ((0, 0, 0), (0, 0, 1)), ((1, 0, 0), (1, 0, 1)), ((0, 1, 0), (0, 1, 1)), ((1, 1, 0), (1, 1, 1)),
         ];
         let lidx = |i: usize, j: usize, k: usize| (i * gx + j) * gy + k;
-        let mut cellv: Vec<i32> = vec![-1; gs * gx * gy];
-        let mut pos: Vec<Vec3> = Vec::new();
-        let mut nrm: Vec<Vec3> = Vec::new();
-        let mut coolv: Vec<f32> = Vec::new();
         let grad_eps = cell * 0.5;
-        for i in 0..gs {
-            for j in 0..gx {
-                for k in 0..gy {
-                    let mut acc = Vec3::ZERO;
-                    let mut cnt = 0.0f32;
-                    for &((ax, ay, az), (bx, by, bz)) in EDGES.iter() {
-                        let fa = fval[cidx(i + ax, j + ay, k + az)];
-                        let fb = fval[cidx(i + bx, j + by, k + bz)];
-                        if (fa < 0.0) != (fb < 0.0) {
-                            let t = fa / (fa - fb);
-                            acc += cpos(i + ax, j + ay, k + az)
-                                .lerp(cpos(i + bx, j + by, k + bz), t);
-                            cnt += 1.0;
+        // (iso offset into the field, layer coord 0=inner .. 1=outer for the shader).
+        let layers: [(f32, f32); 3] = [(0.0, 0.0), (shell * 0.7, 0.5), (shell * 1.5, 1.0)];
+        let mut out: Vec<rocket::MeshVertex> = Vec::new();
+        for &(iso, layer) in &layers {
+            let mut cellv: Vec<i32> = vec![-1; gs * gx * gy];
+            let mut pos: Vec<Vec3> = Vec::new();
+            let mut nrm: Vec<Vec3> = Vec::new();
+            let mut coolv: Vec<f32> = Vec::new();
+            for i in 0..gs {
+                for j in 0..gx {
+                    for k in 0..gy {
+                        let mut acc = Vec3::ZERO;
+                        let mut cnt = 0.0f32;
+                        for &((ax, ay, az), (bx, by, bz)) in EDGES.iter() {
+                            let fa = fval[cidx(i + ax, j + ay, k + az)] - iso;
+                            let fb = fval[cidx(i + bx, j + by, k + bz)] - iso;
+                            if (fa < 0.0) != (fb < 0.0) {
+                                let t = fa / (fa - fb);
+                                acc += cpos(i + ax, j + ay, k + az)
+                                    .lerp(cpos(i + bx, j + by, k + bz), t);
+                                cnt += 1.0;
+                            }
+                        }
+                        if cnt > 0.0 {
+                            let p = acc / cnt;
+                            // outward normal from the hull SDF gradient (for fresnel).
+                            let n = Vec3::new(
+                                sdf(p + Vec3::X * grad_eps) - sdf(p - Vec3::X * grad_eps),
+                                sdf(p + Vec3::Y * grad_eps) - sdf(p - Vec3::Y * grad_eps),
+                                sdf(p + Vec3::Z * grad_eps) - sdf(p - Vec3::Z * grad_eps),
+                            )
+                            .normalize_or_zero();
+                            // cool: downstream distance from the windward face (0 hot),
+                            // 0..0.30 over the hull, 0.30..1 through the wake.
+                            let ds = (lead - (p - center).dot(flow)).max(0.0);
+                            let cool = if ds <= body {
+                                0.30 * (ds / body)
+                            } else {
+                                (0.30 + 0.70 * ((ds - body) / wake)).min(1.0)
+                            };
+                            cellv[lidx(i, j, k)] = pos.len() as i32;
+                            pos.push(p);
+                            nrm.push(n);
+                            coolv.push(cool);
                         }
                     }
-                    if cnt > 0.0 {
-                        let p = acc / cnt;
-                        // outward normal from the hull SDF gradient (for fresnel).
-                        let n = Vec3::new(
-                            sdf(p + Vec3::X * grad_eps) - sdf(p - Vec3::X * grad_eps),
-                            sdf(p + Vec3::Y * grad_eps) - sdf(p - Vec3::Y * grad_eps),
-                            sdf(p + Vec3::Z * grad_eps) - sdf(p - Vec3::Z * grad_eps),
-                        )
-                        .normalize_or_zero();
-                        // cool: downstream distance from the windward face (0 hot),
-                        // 0..0.30 over the hull, 0.30..1 through the wake.
-                        let ds = (lead - (p - center).dot(flow)).max(0.0);
-                        let cool = if ds <= body {
-                            0.30 * (ds / body)
-                        } else {
-                            (0.30 + 0.70 * ((ds - body) / wake)).min(1.0)
-                        };
-                        cellv[lidx(i, j, k)] = pos.len() as i32;
-                        pos.push(p);
-                        nrm.push(n);
-                        coolv.push(cool);
-                    }
                 }
             }
-        }
 
-        let mut out: Vec<rocket::MeshVertex> = Vec::new();
-        let mut tri = |a: i32, b: i32, c: i32, out: &mut Vec<rocket::MeshVertex>| {
-            if a < 0 || b < 0 || c < 0 {
-                return;
-            }
-            for &vi in &[a as usize, b as usize, c as usize] {
-                let p = pos[vi];
-                let n = nrm[vi];
-                out.push(rocket::MeshVertex {
-                    pos: [p.x, p.y, p.z],
-                    normal: [n.x, n.y, n.z],
-                    color: [coolv[vi], 0.0, 0.0],
-                });
-            }
-        };
-        // Quad around each crossed interior edge (double-sided pipeline, so the
-        // winding does not matter - only the normals do).
-        let mut quad = |c0: i32, c1: i32, c2: i32, c3: i32, out: &mut Vec<rocket::MeshVertex>| {
-            tri(c0, c1, c2, out);
-            tri(c0, c2, c3, out);
-        };
-        for i in 0..gs {
-            for j in 1..gx {
-                for k in 1..gy {
-                    if (fval[cidx(i, j, k)] < 0.0) != (fval[cidx(i + 1, j, k)] < 0.0) {
-                        quad(
-                            cellv[lidx(i, j - 1, k - 1)], cellv[lidx(i, j, k - 1)],
-                            cellv[lidx(i, j, k)], cellv[lidx(i, j - 1, k)], &mut out,
-                        );
+            let mut tri = |a: i32, b: i32, c: i32, out: &mut Vec<rocket::MeshVertex>| {
+                if a < 0 || b < 0 || c < 0 {
+                    return;
+                }
+                for &vi in &[a as usize, b as usize, c as usize] {
+                    let p = pos[vi];
+                    let n = nrm[vi];
+                    out.push(rocket::MeshVertex {
+                        pos: [p.x, p.y, p.z],
+                        normal: [n.x, n.y, n.z],
+                        color: [coolv[vi], layer, 0.0],
+                    });
+                }
+            };
+            // Quad around each crossed interior edge (double-sided pipeline, so the
+            // winding does not matter - only the normals do).
+            let mut quad = |c0: i32, c1: i32, c2: i32, c3: i32, out: &mut Vec<rocket::MeshVertex>| {
+                tri(c0, c1, c2, out);
+                tri(c0, c2, c3, out);
+            };
+            for i in 0..gs {
+                for j in 1..gx {
+                    for k in 1..gy {
+                        if (fval[cidx(i, j, k)] < iso) != (fval[cidx(i + 1, j, k)] < iso) {
+                            quad(
+                                cellv[lidx(i, j - 1, k - 1)], cellv[lidx(i, j, k - 1)],
+                                cellv[lidx(i, j, k)], cellv[lidx(i, j - 1, k)], &mut out,
+                            );
+                        }
                     }
                 }
             }
-        }
-        for i in 1..gs {
-            for j in 0..gx {
-                for k in 1..gy {
-                    if (fval[cidx(i, j, k)] < 0.0) != (fval[cidx(i, j + 1, k)] < 0.0) {
-                        quad(
-                            cellv[lidx(i - 1, j, k - 1)], cellv[lidx(i, j, k - 1)],
-                            cellv[lidx(i, j, k)], cellv[lidx(i - 1, j, k)], &mut out,
-                        );
+            for i in 1..gs {
+                for j in 0..gx {
+                    for k in 1..gy {
+                        if (fval[cidx(i, j, k)] < iso) != (fval[cidx(i, j + 1, k)] < iso) {
+                            quad(
+                                cellv[lidx(i - 1, j, k - 1)], cellv[lidx(i, j, k - 1)],
+                                cellv[lidx(i, j, k)], cellv[lidx(i - 1, j, k)], &mut out,
+                            );
+                        }
                     }
                 }
             }
-        }
-        for i in 1..gs {
-            for j in 1..gx {
-                for k in 0..gy {
-                    if (fval[cidx(i, j, k)] < 0.0) != (fval[cidx(i, j, k + 1)] < 0.0) {
-                        quad(
-                            cellv[lidx(i - 1, j - 1, k)], cellv[lidx(i, j - 1, k)],
-                            cellv[lidx(i, j, k)], cellv[lidx(i - 1, j, k)], &mut out,
-                        );
+            for i in 1..gs {
+                for j in 1..gx {
+                    for k in 0..gy {
+                        if (fval[cidx(i, j, k)] < iso) != (fval[cidx(i, j, k + 1)] < iso) {
+                            quad(
+                                cellv[lidx(i - 1, j - 1, k)], cellv[lidx(i, j - 1, k)],
+                                cellv[lidx(i, j, k)], cellv[lidx(i - 1, j, k)], &mut out,
+                            );
+                        }
                     }
                 }
             }
@@ -1697,6 +1719,7 @@ impl World {
         self.advance_sep(frame_dt * self.warp.min(8.0));
         self.advance_debris(frame_dt * self.warp.min(8.0));
         self.advance_smoke(fx_dt);
+        self.advance_sparks(fx_dt);
 
         // Keep the planet terrain in sync with the floating-origin reference.
         if self.view == View::Rocket {
@@ -2107,6 +2130,105 @@ impl World {
         }
     }
 
+    /// Emit + advect re-entry sparks: tiny bright embers shed off the windward
+    /// shock that streak downstream through the wake while the plasma is hot.
+    fn advance_sparks(&mut self, dt: f32) {
+        if dt <= 0.0 {
+            return;
+        }
+        for s in self.sparks.iter_mut() {
+            s.age += dt;
+            s.vel *= 1.0 - (0.35 * dt).min(0.35); // light drag - let them streak out
+            s.pos += s.vel * dt;
+        }
+        self.sparks.retain(|s| s.age < s.life);
+
+        let heat = self.plasma_heat();
+        let Some(rk) = self.launch.as_ref() else {
+            self.sparks.clear();
+            return;
+        };
+        if rk.destroyed || heat < 0.34 {
+            return;
+        }
+
+        // Airflow + windward point in the local frame (same derivation as the
+        // plasma mesh): sparks are born on the windward face and stream downwind.
+        let base = self.to_local(rk.r);
+        let axis = self.dir_to_local(rk.point_dir());
+        let vdir = self.dir_to_local(rk.v.normalize_or_zero());
+        let flow = if vdir.length_squared() > 1e-6 {
+            let axis_signed = if vdir.dot(axis) < 0.0 { -axis } else { axis };
+            let aoa = vdir.dot(axis_signed).clamp(-1.0, 1.0).acos();
+            let t = ((aoa - 0.21) / (0.96 - 0.21)).clamp(0.0, 1.0);
+            let blend = t * t * (3.0 - 2.0 * t);
+            axis_signed.lerp(vdir, blend).normalize_or_zero()
+        } else {
+            axis
+        };
+        let height = self.rocket_body.height.max(8.0);
+        let vrad = self.rocket_body.engine_r.first().copied().unwrap_or(2.0).max(2.5);
+        let q = Quat::from_rotation_arc(Vec3::Y, axis);
+        let center = base + q * Vec3::new(0.0, height * 0.45, 0.0);
+        let upref = if flow.dot(Vec3::Y).abs() > 0.9 { Vec3::X } else { Vec3::Y };
+        let rt = flow.cross(upref).normalize_or_zero();
+        let upv = rt.cross(flow).normalize_or_zero();
+
+        // Windward extent (`lead`, along the airflow) and perpendicular extent
+        // (`prad`, across it) of the hull, so sparks are born right on the hottest
+        // windward face of the mesh (cool ~ 0), not way out ahead of it.
+        let mut lead = vrad;
+        let mut prad = vrad;
+        let mut consider = |m: [f32; 3], rr: f32| {
+            let d = base + q * Vec3::from(m) - center;
+            let s = d.dot(flow);
+            lead = lead.max(s + rr);
+            prad = prad.max((d - flow * s).length() + rr);
+        };
+        for (si, pr) in &self.rocket_body.sdf_stage {
+            if *si >= rk.stage_base {
+                consider(pr.a, pr.r1);
+                consider(pr.b, pr.r2);
+            }
+        }
+        for pr in &self.rocket_body.sdf_payload {
+            consider(pr.a, pr.r1);
+            consider(pr.b, pr.r2);
+        }
+
+        let rate = 110.0 * heat;
+        self.spark_accum += rate * dt;
+        let n = self.spark_accum.floor() as i32;
+        self.spark_accum -= n as f32;
+        let mut seed = (self.anim * 1597.0).to_bits() ^ 0x9e37_79b9;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32
+        };
+        for _ in 0..n.min(24) {
+            // Spawn across the windward face at the hot leading surface (s ~ lead),
+            // then streak downstream (-flow).
+            let a = rnd() * std::f32::consts::TAU;
+            let off = (rt * a.cos() + upv * a.sin()) * (rnd().sqrt() * prad);
+            let p = center + off + flow * (lead - rnd() * vrad * 1.2);
+            // Spray downstream with a moderate fan: embers streak back through and
+            // around the wake (some on its darker fringes, where they read).
+            let downstream = -flow * (50.0 + rnd() * 90.0);
+            let fan = (rt * (rnd() - 0.5) + upv * (rnd() - 0.5)) * 22.0;
+            self.sparks.push(Spark {
+                pos: p,
+                vel: downstream + fan,
+                age: 0.0,
+                life: 0.45 + rnd() * 0.95,
+                seed: rnd(),
+            });
+        }
+        if self.sparks.len() > 700 {
+            let drop = self.sparks.len() - 700;
+            self.sparks.drain(0..drop);
+        }
+    }
+
     /// World->local point in the rocket-view tangent frame (metres).
     fn to_local(&self, w: DVec3) -> Vec3 {
         let d = w - self.launch_origin;
@@ -2232,6 +2354,7 @@ impl World {
         self.boom.clear();
         self.exploded = false;
         self.smoke.clear();
+        self.sparks.clear();
         self.mission_captured = false;
         self.reentry_test = false;
     }
@@ -2638,6 +2761,29 @@ impl World {
             let cm = [col[0] * alpha, col[1] * alpha, col[2] * alpha, alpha];
             for &i in &[0usize, 1, 2, 0, 2, 3] {
                 out.push(FxVertex { pos: q[i].0.into(), uv: q[i].1, color: cm, kind: 1.0 });
+            }
+        }
+
+        // ---- re-entry sparks: bright additive embers shed off the shock ----
+        for s in &self.sparks {
+            let t = (s.age / s.life).clamp(0.0, 1.0);
+            let bright = (1.0 - t) * (s.age / 0.03).min(1.0); // quick birth, fade with age
+            if bright <= 0.02 {
+                continue;
+            }
+            let size = 0.6 * (0.5 + 0.5 * (1.0 - t));
+            let r = right * size;
+            let u = up * size;
+            let c = self.rel(s.pos.as_dvec3());
+            let col = [s.seed, bright, 0.0, 0.0];
+            let q = [
+                (c - r - u, [0.0f32, 0.0]),
+                (c + r - u, [1.0, 0.0]),
+                (c + r + u, [1.0, 1.0]),
+                (c - r + u, [0.0, 1.0]),
+            ];
+            for &i in &[0usize, 1, 2, 0, 2, 3] {
+                out.push(FxVertex { pos: q[i].0.into(), uv: q[i].1, color: col, kind: 4.0 });
             }
         }
         out
@@ -4525,11 +4671,12 @@ impl State {
                 self.gpu.draw_sky(&mut pass);
                 self.gpu.draw_meshes(&mut pass, terrain_n, dyn_n);
                 self.gpu.draw_plume(&mut pass, plume_on);
-                self.gpu.draw_fx(&mut pass, fx_n);
                 // Prototype mesh approach: depth-tested glow geometry, in-pass.
                 if plasma_on && mesh_plasma {
                     self.gpu.draw_plasma_mesh(&mut pass, plasma_mesh_n);
                 }
+                // FX last, so additive sparks/embers sit on top of the plasma glow.
+                self.gpu.draw_fx(&mut pass, fx_n);
             }
             // Re-entry plasma (default): raymarched at half resolution, then
             // upscaled over the scene. Only runs during re-entry.
@@ -5643,10 +5790,11 @@ fn render_shot(
             gpu.draw_sky(&mut pass);
             gpu.draw_meshes(&mut pass, terrain_n, dyn_n);
             gpu.draw_plume(&mut pass, plume_on);
-            gpu.draw_fx(&mut pass, fx_n);
             if plasma_on && mesh_plasma {
                 gpu.draw_plasma_mesh(&mut pass, plasma_mesh_n);
             }
+            // FX last, so additive sparks/embers sit on top of the plasma glow.
+            gpu.draw_fx(&mut pass, fx_n);
         }
         if plasma_on && !mesh_plasma {
             let pt = make_plasma_target(device, gpu, width, height);
