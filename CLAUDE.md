@@ -43,6 +43,22 @@ New UI should be built with egui rather than more hand-rolled text-quad drawing,
 and the existing HUD/menus should migrate to egui as they grow. Keep UI code out
 of the render hot path (egui composits over the wgpu frame).
 
+### UI-first controls (no hotkeys for menus/tests)
+
+Everything the player or developer can do must be reachable through the egui UI.
+Do not add a keyboard shortcut as the only (or primary) way to trigger an
+action.
+
+- Keyboard shortcuts are reserved for controlling the active vehicle (throttle,
+  pitch, staging, camera) and for complementing an existing on-screen UI control.
+  A key may mirror a button, but never replace it.
+- Test/debug scenes and dev toggles (e.g. jumping into a re-entry test,
+  switching the plasma renderer) belong in a dedicated egui menu - never bound to
+  a hotkey. Put them in the "Test Scenes" panel (`test_menu` in `ui.rs`) and add
+  new test scenarios there as buttons, not key bindings.
+- When in doubt, add the UI control first; only add a complementary hotkey
+  afterwards if it genuinely helps flying.
+
 ## Verifying rendering headlessly (software GPU)
 
 The cloud/CI environment has no physical GPU or display, but you can still run

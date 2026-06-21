@@ -574,9 +574,6 @@ struct World {
     /// Prototype toggle: render the re-entry plasma as a procedural glow mesh
     /// (depth-tested geometry) instead of the fullscreen volumetric raymarch.
     plasma_mesh_mode: bool,
-    /// Which re-entry test attitude the live `J` key last set (0 axial, 1 tilt,
-    /// 2 side); pressing `J` again cycles to the next one.
-    reentry_test_kind: u8,
     /// Vertex count of the plasma glow mesh built this frame (mesh mode only).
     plasma_mesh_n: u32,
     /// Background planet-terrain mesher (double-buffered). See [`terrain_job`].
@@ -710,7 +707,6 @@ impl World {
             lod_debug: false,
             plasma_mesh_mode: false,
             plasma_mesh_n: 0,
-            reentry_test_kind: 0,
             terrain_verts: Vec::new(),
             terrain_count: 0,
             terrain_svc: terrain_job::TerrainService::new(),
@@ -875,20 +871,11 @@ impl World {
         }
     }
 
-    /// Toggle the re-entry plasma renderer between the volumetric raymarch
-    /// (default) and the prototype glow mesh. Bound to `M` in the rocket view.
-    fn toggle_plasma_mesh(&mut self) {
-        self.plasma_mesh_mode = !self.plasma_mesh_mode;
-        log::info!(
-            "Re-entry plasma: {}",
-            if self.plasma_mesh_mode { "procedural MESH" } else { "volumetric RAYMARCH" }
-        );
-    }
-
     /// Drop the live view straight into a re-entry test: a vehicle at full heating
-    /// in the upper atmosphere. Repeated calls cycle the attitude - 0 = axial
+    /// in the upper atmosphere. `kind` selects the attitude - 0 = axial
     /// (nose-first), 1 = pitched-over (high angle of attack), 2 = broadside. The
-    /// shot scenarios `reentry`, `reentry_tilt`, `reentry_side` use the same setup.
+    /// shot scenarios `reentry`, `reentry_tilt`, `reentry_side` use the same setup,
+    /// and the "Test Scenes" UI menu calls this directly (no hotkey).
     fn setup_reentry(&mut self, kind: u8) {
         self.view = View::Rocket;
         self.ignite_launch();
@@ -924,13 +911,6 @@ impl World {
         self.rocket_az = 4.2;
         self.rocket_el = if kind == 0 { -0.05 } else { 0.05 };
         self.rocket_dist = 95.0;
-    }
-
-    /// `J` handler: enter the next re-entry test attitude (cycles axial/tilt/side).
-    fn cycle_reentry_test(&mut self) {
-        let kind = self.reentry_test_kind % 3;
-        self.setup_reentry(kind);
-        self.reentry_test_kind = (kind + 1) % 3;
     }
 
     /// Live LOD-debug stats for the HUD: the active planet LOD (patch counts per
@@ -5831,13 +5811,6 @@ impl ApplicationHandler<UserEvent> for App {
                             state.world.back_to_vab()
                         }
                         KeyCode::KeyL => state.world.toggle_lod_debug(),
-                        // Re-entry plasma test bench: `J` drops into a re-entry
-                        // state (cycles axial/tilt/side), `M` toggles the plasma
-                        // renderer (volumetric raymarch <-> prototype glow mesh).
-                        KeyCode::KeyJ if state.world.view == View::Rocket => {
-                            state.world.cycle_reentry_test()
-                        }
-                        KeyCode::KeyM => state.world.toggle_plasma_mesh(),
                         // [ ] are always time compression (sim time scale).
                         KeyCode::BracketRight => {
                             state.world.warp = (state.world.warp * 2.0).min(10000.0);

@@ -43,6 +43,57 @@ pub fn build(ctx: &egui::Context, world: &mut World) {
             maneuver_node_panel(ctx, world);
         }
     }
+    test_menu(ctx, world);
+}
+
+/// Dedicated dev/test menu: jump into test scenes and flip dev toggles from the
+/// UI (no hotkeys - see CLAUDE.md "UI-first controls"). Collapsible, top-right,
+/// available in every view. Add new test scenarios here as buttons.
+fn test_menu(ctx: &egui::Context, world: &mut World) {
+    #[derive(Clone, Copy)]
+    enum T {
+        Renderer(bool),
+        Reentry(u8),
+    }
+    let mut act: Option<T> = None;
+    let mesh = world.plasma_mesh_mode;
+
+    egui::Window::new("TEST SCENES")
+        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 12.0))
+        .default_open(true)
+        .default_width(210.0)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.label(egui::RichText::new("RE-ENTRY PLASMA").color(DIM));
+            ui.label("Enter a re-entry test:");
+            ui.horizontal(|ui| {
+                if ui.button("Axial").clicked() {
+                    act = Some(T::Reentry(0));
+                }
+                if ui.button("Pitched").clicked() {
+                    act = Some(T::Reentry(1));
+                }
+                if ui.button("Broadside").clicked() {
+                    act = Some(T::Reentry(2));
+                }
+            });
+            ui.separator();
+            ui.label("Plasma renderer:");
+            ui.horizontal(|ui| {
+                if ui.selectable_label(!mesh, "Raymarch").clicked() {
+                    act = Some(T::Renderer(false));
+                }
+                if ui.selectable_label(mesh, "Mesh (prototype)").clicked() {
+                    act = Some(T::Renderer(true));
+                }
+            });
+        });
+
+    match act {
+        Some(T::Renderer(m)) => world.plasma_mesh_mode = m,
+        Some(T::Reentry(k)) => world.setup_reentry(k),
+        None => {}
+    }
 }
 
 fn apply_theme(ctx: &egui::Context) {
@@ -276,7 +327,6 @@ fn pad_panel(ctx: &egui::Context, world: &mut World) {
     let rolling = world.rolling_out;
     let mut launch = false;
     let mut back = false;
-    let mut reentry_test = false;
 
     egui::Window::new("LAUNCH PAD")
         .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 12.0))
@@ -304,24 +354,14 @@ fn pad_panel(ctx: &egui::Context, world: &mut World) {
                     launch = true;
                 }
                 ui.label(egui::RichText::new("Space ignite  Shift/Ctrl throttle  W/S pitch").color(DIM));
-                ui.horizontal(|ui| {
-                    if ui.button("Back to VAB").clicked() {
-                        back = true;
-                    }
-                    // Jump straight to a re-entry test (skips flying up). Cycles
-                    // axial/tilt/side; `M` then flips raymarch <-> mesh plasma.
-                    if ui.button("Re-entry test (J)").clicked() {
-                        reentry_test = true;
-                    }
-                });
+                if ui.button("Back to VAB").clicked() {
+                    back = true;
+                }
             }
         });
 
     if launch {
         world.ignite_launch();
-    }
-    if reentry_test {
-        world.cycle_reentry_test();
     }
     if back {
         world.back_to_vab();
@@ -493,8 +533,6 @@ fn launch_panel(ctx: &egui::Context, world: &mut World) {
         Stage,
         Reset,
         NewMission,
-        TogglePlasma,
-        ReentryTest,
     }
     let mut act: Option<Act> = None;
 
@@ -605,23 +643,6 @@ fn launch_panel(ctx: &egui::Context, world: &mut World) {
                 ui.label(
                     egui::RichText::new("Shift/Ctrl throttle  W/S pitch  Space stage").color(DIM),
                 );
-                ui.separator();
-                // Re-entry plasma test bench: jump into a re-entry state and flip
-                // between the two plasma renderers to compare them live.
-                ui.horizontal(|ui| {
-                    let mode = if world.plasma_mesh_mode { "MESH" } else { "RAYMARCH" };
-                    ui.label(egui::RichText::new("Plasma").color(DIM));
-                    if ui.button(mode).clicked() {
-                        act = Some(Act::TogglePlasma);
-                    }
-                    if ui.button("Re-entry test").clicked() {
-                        act = Some(Act::ReentryTest);
-                    }
-                });
-                ui.label(
-                    egui::RichText::new("J re-entry test (cycles)  M plasma raymarch/mesh")
-                        .color(DIM),
-                );
             }
         });
 
@@ -632,8 +653,6 @@ fn launch_panel(ctx: &egui::Context, world: &mut World) {
             }
         }
         Some(Act::Stage) => world.stage_launch(),
-        Some(Act::TogglePlasma) => world.toggle_plasma_mesh(),
-        Some(Act::ReentryTest) => world.cycle_reentry_test(),
         Some(Act::Reset) => world.reset_launch(),
         Some(Act::NewMission) => world.back_to_vab(),
         None => {}
