@@ -14,7 +14,7 @@ struct P {
     center: vec4<f32>, // xyz bounding centre, w = bounding radius
     dir: vec4<f32>,    // xyz exhaust direction (unit), w = plume length
     params: vec4<f32>, // x = tan(fov/2), y = aspect, z = time, w = intensity
-    nnoz: vec4<f32>,   // x = nozzle count, y = base radius
+    nnoz: vec4<f32>,   // x = nozzle count, y = base radius, z = log-depth Fcoef
     noz: array<vec4<f32>, 12>, // xyz nozzle pos, w = per-nozzle radius scale
 };
 @group(0) @binding(0) var<uniform> u: P;
@@ -22,6 +22,13 @@ struct P {
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
+};
+
+struct FsOut {
+    @location(0) color: vec4<f32>,
+    // Depth of the plume's near surface, in the scene's log-depth encoding, so the
+    // hardware depth test occludes the plume behind the rocket body / terrain.
+    @builtin(frag_depth) depth: f32,
 };
 
 @vertex
@@ -100,11 +107,15 @@ fn plume_at(pos: vec3<f32>) -> vec3<f32> {
 }
 
 @fragment
-fn fs(in: VsOut) -> @location(0) vec4<f32> {
+fn fs(in: VsOut) -> FsOut {
+    var out: FsOut;
+    out.color = vec4<f32>(0.0);
+    out.depth = 1.0; // far: a miss must never occlude anything
     let t = u.params.z;
     let inten = u.params.w;
     let len = u.dir.w;
     let baseR = u.nnoz.y;
+    let fcoef = u.nnoz.z;
 
     let rd = normalize(u.fwd.xyz
         + u.right.xyz * (in.uv.x * u.params.x * u.params.y)
@@ -112,13 +123,14 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let ro = u.eye.xyz;
     let iv = sphere_iv(ro, rd, u.center.xyz, u.center.w);
     if (iv.y < 0.0) {
-        return vec4<f32>(0.0);
+        return out;
     }
 
     var tt = max(iv.x, 0.0);
     let tmax = iv.y;
     let step = (tmax - tt) / 40.0 + 1e-3;
     var acc = vec3<f32>(0.0);
+    var hit_t = -1.0; // distance to the first lit plume sample (its near surface)
     for (var i = 0; i < 48; i = i + 1) {
         if (tt > tmax) {
             break;
@@ -127,6 +139,9 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         let pl = plume_at(pos);
         let d = pl.x;
         if (d > 0.003) {
+            if (hit_t < 0.0) {
+                hit_t = tt;
+            }
             let frac = pl.y;       // 0 throat -> 1 tip
             let rn = pl.z;         // 0 axis -> 1 cone edge
             // boiling turbulence along the jet
@@ -148,5 +163,12 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         }
         tt = tt + step;
     }
-    return vec4<f32>(acc * inten * 1.6, 0.0); // additive (alpha 0)
+    out.color = vec4<f32>(acc * inten * 1.6, 0.0); // additive (alpha 0)
+    if (hit_t > 0.0) {
+        // log-depth of the near plume surface (matches the scene mesh encoding:
+        // w = view-space depth = distance along the camera forward).
+        let w = hit_t * max(dot(rd, u.fwd.xyz), 1e-4);
+        out.depth = log2(max(1e-6, 1.0 + w)) * fcoef;
+    }
+    return out;
 }

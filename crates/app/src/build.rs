@@ -35,7 +35,7 @@ pub struct Payload {
 pub const ENGINES: &[Engine] = &[
     Engine { name: "Sparrow", thrust: 0.95e6, isp: 315.0, mass: 1200.0, vac: false },
     Engine { name: "Merlin", thrust: 3.8e6, isp: 300.0, mass: 6000.0, vac: false },
-    Engine { name: "Titan-9", thrust: 9.2e6, isp: 295.0, mass: 16000.0, vac: false },
+    Engine { name: "Titan-9", thrust: 6.0e6, isp: 295.0, mass: 16000.0, vac: false },
     Engine { name: "Vac-1", thrust: 1.1e6, isp: 345.0, mass: 2500.0, vac: true },
     Engine { name: "Vac-3", thrust: 2.6e6, isp: 350.0, mass: 4200.0, vac: true },
 ];
@@ -116,10 +116,10 @@ pub struct Vab {
 }
 
 impl Vab {
-    /// A sensible default two-stage launcher. The first stage carries a lot of
-    /// propellant so it lifts off at a gentle ~1.9 g (not a 3 g leap) and the felt
-    /// acceleration ramps up through the burn toward the crew g-limit, the way a
-    /// real launcher does.
+    /// A sensible default two-stage launcher, tuned to a realistic ascent: it
+    /// lifts off at TWR ~1.3 (a gentle ~1.2 g, like a Saturn V's ~1.2) and the
+    /// first stage burns for ~180 s, the felt acceleration ramping up through the
+    /// burn as propellant drains - rather than leaping off the pad.
     pub fn default_build() -> Vab {
         Vab {
             stages: vec![

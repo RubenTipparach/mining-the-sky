@@ -70,6 +70,7 @@ struct VsOut {
     @location(2) flogz: f32,
     @location(3) wpos: vec3<f32>,
     @location(4) layer: f32,
+    @location(5) heat: f32,
 };
 
 struct FsOut {
@@ -100,6 +101,7 @@ fn vs(
     o.normal = n;
     o.cool = c.x;
     o.layer = layer;
+    o.heat = c.z;
     o.wpos = pp;
     return o;
 }
@@ -117,10 +119,15 @@ fn fs(in: VsOut) -> FsOut {
     let tb = clamp(tb0 * 0.8 + tb1 * (0.5 + 0.5 * in.layer), 0.0, 1.4);
     let fil = smoothstep(0.55, 0.95, tb1);
 
-    // Steep cooling ramp keyed to the downstream "cool" coordinate.
-    let whitef = smoothstep(WHITE_END, 0.0, cool);
-    let yellowf = smoothstep(YELLOW_END, WHITE_END * 0.4, cool);
-    let orangef = smoothstep(ORANGE_END, WHITE_END, cool);
+    // Heat level (friction): the whole effect ramps with it. Low friction is a
+    // faint dull-red wisp; the yellow body and white-hot shock only develop as the
+    // heat climbs, so re-entry builds low->high instead of snapping on.
+    let heat = clamp(in.heat, 0.0, 1.4);
+    // Steep cooling ramp keyed to the downstream "cool" coordinate, gated by heat
+    // so the hotter colours appear only once it is actually that hot.
+    let whitef = smoothstep(WHITE_END, 0.0, cool) * smoothstep(0.55, 1.0, heat);
+    let yellowf = smoothstep(YELLOW_END, WHITE_END * 0.4, cool) * smoothstep(0.3, 0.8, heat);
+    let orangef = smoothstep(ORANGE_END, WHITE_END, cool) * smoothstep(0.12, 0.55, heat);
     var col = COL_RED;
     col = mix(col, COL_ORANGE, orangef);
     col = mix(col, COL_YELLOW, yellowf);
@@ -148,7 +155,10 @@ fn fs(in: VsOut) -> FsOut {
     // grazing angles) so the nested shells melt into one soft volume instead of
     // each showing a hard polygon edge. The inner hull-hugging shell is untouched.
     let edge_soft = 1.0 - SELF_BLEND * in.layer * rim;
-    var a = dens * (0.45 + 1.3 * hot) * tailfade * layerfade * edge_soft;
+    // Opacity fades in with heat (a soft floor at low friction so a faint glow is
+    // visible early), and grows toward full as it heats up.
+    let heatfade = smoothstep(0.03, 0.4, heat) * (0.4 + 0.6 * min(heat, 1.0));
+    var a = dens * (0.45 + 1.3 * hot) * tailfade * layerfade * edge_soft * heatfade;
     a = clamp(a, 0.0, ALPHA_CAP);
 
     var out: FsOut;

@@ -44,6 +44,59 @@ pub fn build(ctx: &egui::Context, world: &mut World) {
         }
     }
     test_menu(ctx, world);
+    time_panel(ctx, world);
+}
+
+/// Seconds -> HH:MM:SS for the mission clock.
+fn fmt_hms(secs: f64) -> String {
+    let s = secs.max(0.0) as u64;
+    format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+}
+
+/// Top-centre time panel: the mission-elapsed timer plus a time-compression
+/// (warp) control. Warp drives the on-rails orbital sim; it is reset to 1x on a
+/// fresh ignition so the ascent always flies in real time. Shown in every view.
+fn time_panel(ctx: &egui::Context, world: &mut World) {
+    // Mission-elapsed time: the flown rocket's MET if launching, else the scripted
+    // mission clock (0 on the pad / in the VAB).
+    let met = world
+        .launch
+        .as_ref()
+        .map(|rk| rk.met)
+        .unwrap_or(world.clock as f64);
+    let mut warp = world.warp;
+
+    egui::Window::new("TIME")
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 10.0))
+        .title_bar(false)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("T+").color(DIM).monospace());
+                ui.label(egui::RichText::new(fmt_hms(met)).color(AMBER).monospace().size(16.0));
+                ui.separator();
+                ui.label(egui::RichText::new("WARP").color(DIM).small());
+                for &w in &[1.0f32, 10.0, 100.0, 1000.0, 10000.0] {
+                    let on = (warp - w).abs() < w * 0.25;
+                    let label = if w >= 1000.0 {
+                        format!("{:.0}k", w / 1000.0)
+                    } else {
+                        format!("{w:.0}x")
+                    };
+                    if ui.selectable_label(on, label).clicked() {
+                        warp = w;
+                    }
+                }
+                if ui.button("-").on_hover_text("halve").clicked() {
+                    warp = (warp * 0.5).max(1.0);
+                }
+                if ui.button("+").on_hover_text("double").clicked() {
+                    warp = (warp * 2.0).min(10000.0);
+                }
+            });
+        });
+
+    world.warp = warp;
 }
 
 /// Dedicated dev/test menu: jump into test scenes and flip dev toggles from the
@@ -58,6 +111,8 @@ fn test_menu(ctx: &egui::Context, world: &mut World) {
         Payload(usize),
     }
     let mut act: Option<T> = None;
+    let mut friction = world.test_friction;
+    let in_test = world.reentry_test;
 
     egui::Window::new("TEST SCENES")
         .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 12.0))
@@ -77,6 +132,16 @@ fn test_menu(ctx: &egui::Context, world: &mut World) {
                     act = Some(T::Reentry(2));
                 }
             });
+            // Friction (heating) slider: drives the heat glow in the test so the
+            // re-entry FX can be swept from cold to white-hot and verified smooth.
+            ui.add(
+                egui::Slider::new(&mut friction, 0.0..=1.0)
+                    .text("friction")
+                    .show_value(true),
+            );
+            if in_test {
+                ui.label(egui::RichText::new("drag to ramp the heat FX").color(DIM).small());
+            }
             ui.separator();
             ui.label(egui::RichText::new("DESCENT").color(DIM));
             ui.horizontal(|ui| {
@@ -99,6 +164,7 @@ fn test_menu(ctx: &egui::Context, world: &mut World) {
             });
         });
 
+    world.test_friction = friction;
     match act {
         Some(T::Reentry(k)) => world.setup_reentry(k),
         Some(T::Parachute) => world.setup_parachute(),
@@ -170,7 +236,10 @@ fn vehicle_panel(ctx: &egui::Context, world: &mut World) {
 
     egui::Window::new("VEHICLE ASSEMBLY")
         .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 12.0))
-        .default_width(330.0)
+        .default_width(320.0)
+        // Cap the window width so the parts palettes wrap to new rows instead of
+        // auto-sizing the panel across the screen (covering the time widget).
+        .max_width(330.0)
         .resizable(false)
         .show(ctx, |ui| {
             ui.label(egui::RichText::new("VEHICLE ASSEMBLY").heading().color(AMBER));
@@ -256,23 +325,23 @@ fn vehicle_panel(ctx: &egui::Context, world: &mut World) {
 
             ui.separator();
             // ---- parts palette: draggable chips ----
+            // Lay the chips out in explicit rows, manually wrapped to a width
+            // budget. egui's `horizontal_wrapped` wraps at the available width,
+            // which is unbounded inside an auto-sizing window, so it would put
+            // every chip on one line and stretch the panel across the screen
+            // (covering the time widget). Fixed `horizontal` rows keep it narrow.
             ui.label(egui::RichText::new("ENGINES").color(DIM).small());
-            ui.horizontal_wrapped(|ui| {
-                for (k, e) in build::ENGINES.iter().enumerate() {
-                    drag_chip(ui, egui::Id::new(("eng", k)), Drag::Engine(k), e.name, GOOD);
-                }
+            chip_palette(ui, build::ENGINES.len(), |k| build::ENGINES[k].name, |ui, k| {
+                drag_chip(ui, egui::Id::new(("eng", k)), Drag::Engine(k), build::ENGINES[k].name, GOOD);
             });
             ui.label(egui::RichText::new("TANKS").color(DIM).small());
-            ui.horizontal_wrapped(|ui| {
-                for (k, t) in build::TANKS.iter().enumerate() {
-                    drag_chip(ui, egui::Id::new(("tank", k)), Drag::Tank(k), t.name, egui::Color32::from_rgb(150, 200, 255));
-                }
+            let tank_col = egui::Color32::from_rgb(150, 200, 255);
+            chip_palette(ui, build::TANKS.len(), |k| build::TANKS[k].name, |ui, k| {
+                drag_chip(ui, egui::Id::new(("tank", k)), Drag::Tank(k), build::TANKS[k].name, tank_col);
             });
             ui.label(egui::RichText::new("PAYLOADS").color(DIM).small());
-            ui.horizontal_wrapped(|ui| {
-                for (k, p) in build::PAYLOADS.iter().enumerate() {
-                    drag_chip(ui, egui::Id::new(("pl", k)), Drag::Payload(k), p.name, AMBER);
-                }
+            chip_palette(ui, build::PAYLOADS.len(), |k| build::PAYLOADS[k].name, |ui, k| {
+                drag_chip(ui, egui::Id::new(("pl", k)), Drag::Payload(k), build::PAYLOADS[k].name, AMBER);
             });
 
             ui.separator();
@@ -493,6 +562,41 @@ fn moonbase_panel(ctx: &egui::Context, _world: &mut World) {
 }
 
 /// A draggable part chip for the VAB palette.
+/// Lay out part chips in explicit rows, greedily wrapped to a width budget so
+/// the panel stays narrow. `name(k)` supplies the label (used to estimate width)
+/// and `emit(ui, k)` draws chip `k`. Used instead of `horizontal_wrapped`, which
+/// does not wrap inside an auto-sizing window (its available width is unbounded).
+fn chip_palette<N, E>(ui: &mut egui::Ui, count: usize, name: N, mut emit: E)
+where
+    N: Fn(usize) -> &'static str,
+    E: FnMut(&mut egui::Ui, usize),
+{
+    const BUDGET: usize = 38; // approx chars per row (~300 px at this font)
+    let mut row: Vec<usize> = Vec::new();
+    let mut used = 0usize;
+    for k in 0..count {
+        let w = name(k).len() + 4; // chip text + padding, in char-widths
+        if used + w > BUDGET && !row.is_empty() {
+            let items = std::mem::take(&mut row);
+            ui.horizontal(|ui| {
+                for j in items {
+                    emit(ui, j);
+                }
+            });
+            used = 0;
+        }
+        used += w;
+        row.push(k);
+    }
+    if !row.is_empty() {
+        ui.horizontal(|ui| {
+            for j in row {
+                emit(ui, j);
+            }
+        });
+    }
+}
+
 fn drag_chip<P: std::any::Any + Send + Sync + Clone>(
     ui: &mut egui::Ui,
     id: egui::Id,
@@ -507,7 +611,13 @@ fn drag_chip<P: std::any::Any + Send + Sync + Clone>(
                 .inner_margin(egui::Margin::symmetric(6, 3))
                 .corner_radius(4);
             frame.show(ui, |ui| {
-                ui.label(egui::RichText::new(label).color(col));
+                // Extend (don't wrap) so a long name keeps the chip its natural
+                // width and `horizontal_wrapped` moves it to the next row, instead
+                // of squeezing the text into a vertical one-letter-per-line column.
+                ui.add(
+                    egui::Label::new(egui::RichText::new(label).color(col))
+                        .wrap_mode(egui::TextWrapMode::Extend),
+                );
             });
         })
         .response;
@@ -539,6 +649,7 @@ fn launch_panel(ctx: &egui::Context, world: &mut World) {
     let twr_col = if tel.twr < 1.0 && tel.phase == "POWERED" { WARN } else { GOOD };
     let complete = world.mission_complete();
     let n_orbit = world.orbits.len();
+    let reentry_test = world.reentry_test;
 
     enum Act {
         Throttle(f64),
@@ -657,9 +768,12 @@ fn launch_panel(ctx: &egui::Context, world: &mut World) {
                         act = Some(Act::Reset);
                     }
                 });
-                ui.label(
-                    egui::RichText::new("Shift/Ctrl throttle  W/S pitch  Space stage").color(DIM),
-                );
+                let hint = if reentry_test {
+                    "TEST: W/S pitch  A/D yaw  Q/E roll  -  drag to orbit"
+                } else {
+                    "Shift/Ctrl throttle  W/S pitch  Space stage"
+                };
+                ui.label(egui::RichText::new(hint).color(DIM));
             }
         });
 

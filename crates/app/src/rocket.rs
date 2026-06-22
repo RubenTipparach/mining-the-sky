@@ -961,7 +961,7 @@ pub struct RocketBody {
     pub booster_rings: Vec<(u32, f32)>,
     /// Per-part SDF primitives (round cones) in the model frame, tagged by the
     /// stage they belong to (so they drop with it). Their union, plus
-    /// `sdf_payload`, is the vehicle SDF the re-entry plasma raymarches.
+    /// `sdf_payload`, is the vehicle SDF the re-entry plasma glow mesh hugs.
     pub sdf_stage: Vec<(usize, SdfPrim)>,
     /// Payload/nose SDF primitives (always attached).
     pub sdf_payload: Vec<SdfPrim>,

@@ -602,6 +602,10 @@ struct World {
     /// the shock. No physics integration, no heat damage, never destroyed. Set
     /// by `setup_reentry`, cleared on any normal ignite / reset.
     reentry_test: bool,
+    /// Friction (heating) level dialed by the test-scene slider, 0..1. In the
+    /// frozen test it drives the vehicle's heat glow directly so you can sweep the
+    /// re-entry FX from cold to white-hot and confirm it ramps smoothly.
+    test_friction: f32,
     /// Background planet-terrain mesher (double-buffered). See [`terrain_job`].
     terrain_svc: terrain_job::TerrainService,
 
@@ -735,6 +739,7 @@ impl World {
             lod_debug: false,
             plasma_mesh_n: 0,
             reentry_test: false,
+            test_friction: 0.9,
             terrain_verts: Vec::new(),
             terrain_count: 0,
             terrain_svc: terrain_job::TerrainService::new(),
@@ -1205,7 +1210,8 @@ impl World {
             _ => return Vec::new(),
         };
         let base = self.to_local_d(rk.r);
-        let quat = Quat::from_rotation_arc(Vec3::Y, self.dir_to_local(rk.point_dir()));
+        let quat = self.rocket_quat(rk); // full attitude incl. roll
+        let heat = (rk.heat as f32).clamp(0.0, 1.4); // glow intensity, fades the FX in
         let height = self.rocket_body.height.max(8.0);
         let center = self.rel(base + (quat * Vec3::new(0.0, height * 0.45, 0.0)).as_dvec3());
         let vrad = self.rocket_body.engine_r.first().copied().unwrap_or(2.0).max(2.5);
@@ -1406,7 +1412,7 @@ impl World {
                     out.push(rocket::MeshVertex {
                         pos: [p.x, p.y, p.z],
                         normal: [n.x, n.y, n.z],
-                        color: [coolv[vi], layer, 0.0],
+                        color: [coolv[vi], layer, heat], // z = heat (FX fades in with it)
                     });
                 }
             };
@@ -1515,7 +1521,9 @@ impl World {
             center: [center.x, center.y, center.z, bound],
             dir: [dir.x, dir.y, dir.z, length],
             params: [tan, aspect, self.anim, inten],
-            nnoz: [nn as f32, base_r, 0.0, 0.0],
+            // z = log-depth Fcoef (same as the scene mesh) so the plume's frag
+            // depth occludes correctly against the rocket / terrain.
+            nnoz: [nn as f32, base_r, 1.0 / (LOG_DEPTH_FAR + 1.0).log2(), 0.0],
             noz,
         }
     }
@@ -1654,17 +1662,20 @@ impl World {
 
         // player-controlled launch + any tumbling spent booster
         let frozen = self.reentry_test;
+        let test_heat = (self.test_friction * 1.4) as f64; // slider -> glow level
         if let Some(rk) = self.launch.as_mut() {
             rk.just_staged = None;
             if frozen {
-                // Frozen plasma test: hold the vehicle in place at full heat so
-                // the FX play continuously and you can orbit / re-aim it. Skip
-                // integration entirely (no motion, no heat damage, never breaks
-                // up); attitude tracks the command so W/S re-aims it.
+                // Frozen plasma test: hold the vehicle in place so the FX play
+                // continuously and you can orbit / re-aim it. Skip integration
+                // entirely (no motion, no damage, never breaks up); attitude tracks
+                // the command (W/S/A/D/Q/E), and the friction slider drives the heat
+                // glow so you can sweep the re-entry FX from cold to white-hot.
                 rk.place_attitude();
                 rk.health = 100.0;
                 rk.destroyed = false;
                 rk.crashed = false;
+                rk.heat = test_heat;
             } else {
                 let dt = (frame_dt * self.warp).min(2.0);
                 rk.integrate(&self.body, dt as f64);
@@ -2114,10 +2125,20 @@ impl World {
         if dt <= 0.0 {
             return;
         }
+        // Carry the embers along with the vehicle: in real flight the rocket is
+        // travelling at km/s, so a spark must inherit that bulk velocity or it gets
+        // left light-years behind in a single frame. `s.vel` holds only the small
+        // velocity RELATIVE to the airframe (the downwind drift that forms the
+        // wake); the rocket's own velocity is added here. The frozen test pins the
+        // vehicle in place, so there is nothing to inherit there.
+        let carry = match self.launch.as_ref() {
+            Some(rk) if !self.reentry_test => self.dir_to_local_vec(rk.v),
+            _ => Vec3::ZERO,
+        };
         for s in self.sparks.iter_mut() {
             s.age += dt;
-            s.vel *= 1.0 - (0.35 * dt).min(0.35); // light drag - let them streak out
-            s.pos += s.vel * dt;
+            s.vel *= 1.0 - (0.6 * dt).min(0.5); // drag on the relative drift only
+            s.pos += (carry + s.vel) * dt;
         }
         self.sparks.retain(|s| s.age < s.life);
 
@@ -2126,8 +2147,8 @@ impl World {
             self.sparks.clear();
             return;
         };
-        if rk.destroyed || heat < 0.34 {
-            return;
+        if rk.destroyed || heat < 0.18 {
+            return; // embers only once it's genuinely hot (after the glow fades in)
         }
 
         // Airflow + windward point in the local frame (same derivation as the
@@ -2144,37 +2165,25 @@ impl World {
         } else {
             axis
         };
-        let height = self.rocket_body.height.max(8.0);
-        let vrad = self.rocket_body.engine_r.first().copied().unwrap_or(2.0).max(2.5);
-        let q = Quat::from_rotation_arc(Vec3::Y, axis);
-        let center = base + q * Vec3::new(0.0, height * 0.45, 0.0);
-        let upref = if flow.dot(Vec3::Y).abs() > 0.9 { Vec3::X } else { Vec3::Y };
-        let rt = flow.cross(upref).normalize_or_zero();
-        let upv = rt.cross(flow).normalize_or_zero();
-
-        // Windward extent (`lead`, along the airflow) and perpendicular extent
-        // (`prad`, across it) of the hull, so sparks are born right on the hottest
-        // windward face of the mesh (cool ~ 0), not way out ahead of it.
-        let mut lead = vrad;
-        let mut prad = vrad;
-        let mut consider = |m: [f32; 3], rr: f32| {
-            let d = base + q * Vec3::from(m) - center;
-            let s = d.dot(flow);
-            lead = lead.max(s + rr);
-            prad = prad.max((d - flow * s).length() + rr);
-        };
+        // Pose the hull prims into the local frame (q = the SAME body orientation
+        // the rocket is drawn with, incl. roll), so the spawn rotates with the
+        // airframe's pitch/yaw/roll - the embers come off the rocket, aligned to it.
+        let q = self.rocket_quat(rk);
+        let downwind = -flow; // sparks stream downstream into the wake
+        let mut prims: Vec<(Vec3, f32, Vec3, f32)> = Vec::new();
         for (si, pr) in &self.rocket_body.sdf_stage {
             if *si >= rk.stage_base {
-                consider(pr.a, pr.r1);
-                consider(pr.b, pr.r2);
+                prims.push((base + q * Vec3::from(pr.a), pr.r1, base + q * Vec3::from(pr.b), pr.r2));
             }
         }
         for pr in &self.rocket_body.sdf_payload {
-            consider(pr.a, pr.r1);
-            consider(pr.b, pr.r2);
+            prims.push((base + q * Vec3::from(pr.a), pr.r1, base + q * Vec3::from(pr.b), pr.r2));
+        }
+        if prims.is_empty() {
+            return;
         }
 
-        let rate = 110.0 * heat;
+        let rate = 130.0 * heat;
         self.spark_accum += rate * dt;
         let n = self.spark_accum.floor() as i32;
         self.spark_accum -= n as f32;
@@ -2184,18 +2193,39 @@ impl World {
             (seed >> 8) as f32 / (1u32 << 24) as f32
         };
         for _ in 0..n.min(24) {
-            // Spawn across the windward face at the hot leading surface (s ~ lead),
-            // then streak downstream (-flow).
-            let a = rnd() * std::f32::consts::TAU;
-            let off = (rt * a.cos() + upv * a.sin()) * (rnd().sqrt() * prad);
-            let p = center + off + flow * (lead - rnd() * vrad * 1.2);
-            // Spray downstream with a moderate fan: embers streak back through and
-            // around the wake (some on its darker fringes, where they read).
-            let downstream = -flow * (50.0 + rnd() * 90.0);
-            let fan = (rt * (rnd() - 0.5) + upv * (rnd() - 0.5)) * 22.0;
+            // Shed an ember off a hull prim's WINDWARD surface (the side facing the
+            // oncoming wind `vdir`): on the flank when the wind hits the side, or
+            // off the leading end when it hits end-on (axial). Spawning on the real
+            // hull means the embers track the rocket's orientation.
+            let (a, r1, b, r2) = prims[(rnd() * prims.len() as f32) as usize % prims.len()];
+            let axv = b - a;
+            let axn = axv / axv.length().max(1e-3);
+            let vperp = vdir - axn * vdir.dot(axn);
+            let flank = vperp.length() > 0.2;
+            let tt = if flank {
+                rnd()
+            } else if vdir.dot(axn) > 0.0 {
+                0.7 + 0.3 * rnd() // windward end = b
+            } else {
+                0.3 * rnd() // windward end = a
+            };
+            let rr = r1 + (r2 - r1) * tt;
+            let wdir = if flank {
+                Quat::from_axis_angle(axn, (rnd() - 0.5) * 2.4) * vperp.normalize_or_zero()
+            } else {
+                let e1raw = if axn.dot(Vec3::Y).abs() > 0.9 { Vec3::X } else { Vec3::Y };
+                let e1 = axn.cross(e1raw).normalize_or_zero();
+                let e2 = axn.cross(e1).normalize_or_zero();
+                let ang = rnd() * std::f32::consts::TAU;
+                e1 * ang.cos() + e2 * ang.sin()
+            };
+            let surf = a + axv * tt + wdir * rr;
+            let tang = axn.cross(wdir).normalize_or_zero();
             self.sparks.push(Spark {
-                pos: p,
-                vel: downstream + fan,
+                pos: surf,
+                vel: downwind * (50.0 + rnd() * 90.0)
+                    + wdir * (4.0 + rnd() * 8.0)
+                    + tang * ((rnd() - 0.5) * 18.0),
                 age: 0.0,
                 life: 0.45 + rnd() * 0.95,
                 seed: rnd(),
@@ -2215,6 +2245,18 @@ impl World {
             d.dot(self.launch_up) as f32,
             d.dot(self.launch_north) as f32,
         )
+    }
+
+    /// Body->local orientation of the rocket (f32), including the commanded ROLL.
+    /// The nose direction (pitch + yaw) comes from `point_dir()` exactly as before;
+    /// the roll about the nose axis is applied on top, so a roll command shows up
+    /// without disturbing the proven nose orientation. (We can't convert `orient`
+    /// through the launch-tangent basis - that frame is left-handed, so the matrix
+    /// route produces a reflected, invalid quaternion: the bug that flung the
+    /// rocket under the pad.)
+    fn rocket_quat(&self, rk: &launch::Rocket) -> Quat {
+        let nose = self.dir_to_local(rk.point_dir());
+        Quat::from_rotation_arc(Vec3::Y, nose) * Quat::from_rotation_y(rk.roll as f32)
     }
 
     /// World->local direction (no translation).
@@ -2537,7 +2579,7 @@ impl World {
         let (base_local, quat, active) = match self.launch.as_ref() {
             Some(rk) => {
                 let base = self.to_local_d(rk.r);
-                let q = Quat::from_rotation_arc(Vec3::Y, self.dir_to_local(rk.point_dir()));
+                let q = self.rocket_quat(rk); // full attitude incl. roll
                 (base, q, rk.stage_base)
             }
             None => (self.resting_base_local(), Quat::IDENTITY, 0),
@@ -2871,14 +2913,35 @@ impl World {
 
     /// Integrate the jettisoned booster (local frame, ~9.2 m/s^2 down).
     fn advance_sep(&mut self, dt: f32) {
+        // Launch-frame basis (Copy) captured before the &mut borrow, so we can
+        // find the stage's altitude (hence air density) without borrowing self.
+        let radius = self.body.radius;
+        let (origin, east, up, north) =
+            (self.launch_origin, self.launch_east, self.launch_up, self.launch_north);
         if let Some(s) = self.sep.as_mut() {
             s.age += dt;
-            // fall away under the real (altitude-appropriate) gravity, so high up
-            // it drifts slowly and low down it arcs back below the upper stage.
+            // air density at the stage's current altitude (sea level = 1, ~0 in
+            // space): a stage shed in vacuum coasts; one shed low brakes hard.
+            let world = origin
+                + east * s.pos.x as f64
+                + up * s.pos.y as f64
+                + north * s.pos.z as f64;
+            let alt = (world.length() - radius).max(0.0) as f32;
+            let rho = (-alt / 8500.0).exp();
+            // gravity (altitude-appropriate, captured at separation)
             s.vel += s.grav * dt;
+            // atmospheric drag: F/m ~ rho * v^2 opposing motion, decelerating the
+            // stage toward a terminal velocity in dense air. Clamp the per-step
+            // impulse so a fast stage hitting thick air stays stable.
+            let speed = s.vel.length();
+            let drag_f = (0.0004 * rho * speed * dt).min(0.5);
+            s.vel -= s.vel * drag_f;
             s.pos += s.vel * dt;
-            s.rot = (Quat::from_scaled_axis(s.spin * dt) * s.rot).normalize();
-            if s.age > 14.0 {
+            // tumble: aerodynamic torque spins it faster the higher the dynamic
+            // pressure (rho*v^2); in vacuum it keeps its gentle hand-off spin.
+            let tumble = 1.0 + (rho * speed * speed * 1.0e-4).min(4.0);
+            s.rot = (Quat::from_scaled_axis(s.spin * tumble * dt) * s.rot).normalize();
+            if s.age > 25.0 {
                 self.sep = None;
             }
         }
@@ -3661,7 +3724,10 @@ impl Gpu {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
                 depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Always),
+                // Occlude the plume behind closer geometry (the rocket body when it
+                // is between the camera and the exhaust). The shader writes the
+                // plume's near-surface depth; this tests it against the scene.
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -3818,10 +3884,12 @@ impl Gpu {
                 queue.write_buffer(&self.mesh_uniform_buf, 0, bytemuck::bytes_of(&mu));
                 let sk = world.sky_uniforms(res);
                 queue.write_buffer(&self.sky_uniform_buf, 0, bytemuck::bytes_of(&sk));
-                // re-entry plasma: build the procedural glow-mesh envelope at
-                // genuine reentry heating (a normal ascent stays well below this).
+                // re-entry plasma: build the glow-mesh envelope once there is any
+                // meaningful heating. The mesh brightness then scales with the heat
+                // level (per-vertex), so the glow fades in low->high with friction
+                // instead of snapping on at a threshold.
                 world.plasma_mesh_n = 0;
-                if world.plasma_heat() > 0.32 {
+                if world.plasma_heat() > 0.04 {
                     plasma_on = true;
                     let mv = world.plasma_mesh();
                     let mn = (mv.len() as u64).min(PLASMA_MESH_CAP) as u32;
@@ -4822,12 +4890,60 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.setup_reentry(0);
             0.0
         }
+        "plumetest" => {
+            // A firing rocket viewed from above the nose, so the BODY is between
+            // the camera and the exhaust: the plume must be occluded by the body,
+            // not drawn through it. Used to verify plume depth occlusion.
+            world.view = View::Rocket;
+            world.ignite_launch();
+            let (radius, up) = (world.body.radius, world.launch_up);
+            if let Some(rk) = world.launch.as_mut() {
+                rk.r = up * (radius + 20_000.0); // 20 km up, no ground in frame
+                rk.throttle = 1.0;
+                rk.spool = 1.0; // full thrust so the plume is lit
+            }
+            world.advance(0.05); // build the plume
+            world.rocket_az = 0.6;
+            world.rocket_el = 1.32; // look nearly straight DOWN the body's axis
+            world.rocket_dist = 30.0; // ...so the body covers the exhaust behind it
+            0.0
+        }
+        "reentry_lowheat" => {
+            // low friction: the FX should be a faint dull-red wisp (verifies the
+            // glow fades in low->high rather than snapping on).
+            world.setup_reentry(0);
+            if let Some(rk) = world.launch.as_mut() {
+                rk.heat = 0.22;
+            }
+            0.0
+        }
+        "reentry_midheat" => {
+            // mid friction: orange body building toward yellow, no white-hot yet.
+            world.setup_reentry(0);
+            if let Some(rk) = world.launch.as_mut() {
+                rk.heat = 0.55;
+            }
+            0.0
+        }
         "reentry_boost" => {
             // a heavily boostered stack (6 strap-ons => ~16 SDF prims) at full
             // heat: the worst case for the plasma SDF cost, used by `bench`.
             world.vab.stages[0].boosters = 6;
             world.vab.stages[0].booster = 1; // SRB-Heavy
             world.setup_reentry(0);
+            0.0
+        }
+        "reentry_roll" => {
+            // boostered + pitched + rolled about the nose: verifies a roll command
+            // is actually rendered (the strap-ons rotate about the axis), now that
+            // the drawn pose carries the full attitude and not just the nose.
+            world.vab.stages[0].boosters = 6;
+            world.vab.stages[0].booster = 1; // SRB-Heavy
+            world.setup_reentry(1); // pitched-over entry
+            if let Some(rk) = world.launch.as_mut() {
+                rk.roll = 1.1; // ~63 deg roll about the nose axis
+                rk.place_attitude();
+            }
             0.0
         }
         "reentry_tilt" => {
@@ -5950,25 +6066,40 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                     // player-controlled launch: pitch (W/S), throttle (Shift/Ctrl,
-                    // Z full / X cut). These repeat while held.
+                    // Z full / X cut). In the frozen re-entry test, the same WASDQE
+                    // freely rotate the airframe in 3 axes (pitch/yaw/roll) so you
+                    // can inspect re-entry from any orientation. These repeat held.
+                    let test = state.world.reentry_test;
                     if let Some(rk) = state.world.launch.as_mut() {
                         let step = 2f64.to_radians();
-                        match code {
-                            KeyCode::KeyW | KeyCode::ArrowUp => {
-                                rk.pitch = (rk.pitch + step).min(110f64.to_radians())
+                        if test {
+                            match code {
+                                KeyCode::KeyW | KeyCode::ArrowUp => rk.pitch += step,
+                                KeyCode::KeyS | KeyCode::ArrowDown => rk.pitch -= step,
+                                KeyCode::KeyA | KeyCode::ArrowLeft => rk.yaw += step,
+                                KeyCode::KeyD | KeyCode::ArrowRight => rk.yaw -= step,
+                                KeyCode::KeyQ => rk.roll += step,
+                                KeyCode::KeyE => rk.roll -= step,
+                                _ => {}
                             }
-                            KeyCode::KeyS | KeyCode::ArrowDown => {
-                                rk.pitch = (rk.pitch - step).max(0.0)
+                        } else {
+                            match code {
+                                KeyCode::KeyW | KeyCode::ArrowUp => {
+                                    rk.pitch = (rk.pitch + step).min(110f64.to_radians())
+                                }
+                                KeyCode::KeyS | KeyCode::ArrowDown => {
+                                    rk.pitch = (rk.pitch - step).max(0.0)
+                                }
+                                KeyCode::ShiftLeft | KeyCode::ShiftRight => {
+                                    rk.throttle = (rk.throttle + 0.06).min(1.0)
+                                }
+                                KeyCode::ControlLeft | KeyCode::ControlRight => {
+                                    rk.throttle = (rk.throttle - 0.06).max(0.0)
+                                }
+                                KeyCode::KeyZ => rk.throttle = 1.0,
+                                KeyCode::KeyX => rk.throttle = 0.0,
+                                _ => {}
                             }
-                            KeyCode::ShiftLeft | KeyCode::ShiftRight => {
-                                rk.throttle = (rk.throttle + 0.06).min(1.0)
-                            }
-                            KeyCode::ControlLeft | KeyCode::ControlRight => {
-                                rk.throttle = (rk.throttle - 0.06).max(0.0)
-                            }
-                            KeyCode::KeyZ => rk.throttle = 1.0,
-                            KeyCode::KeyX => rk.throttle = 0.0,
-                            _ => {}
                         }
                     }
                     if key_event.repeat {
@@ -6142,9 +6273,9 @@ fn main() {
             }
             return;
         }
-        // `bench [scenario] [WxH]`: time the re-entry plasma pass on the real
-        // GPU (loop the actual pipeline in one submit, GPU-synced), so the cost
-        // of the raymarch is a measured number instead of a guess.
+        // `bench [scenario] [WxH]`: time the re-entry plasma glow-mesh pass on the
+        // real GPU (loop the actual pipeline in one submit, GPU-synced), so its
+        // cost is a measured number instead of a guess.
         if args.iter().any(|a| a == "bench") {
             env_logger::init();
             let scenario = args
@@ -6287,6 +6418,16 @@ fn main() {
                 "reentry_tilt"
             } else if args.iter().any(|a| a == "reentry_side") {
                 "reentry_side"
+            } else if args.iter().any(|a| a == "reentry_roll") {
+                "reentry_roll"
+            } else if args.iter().any(|a| a == "reentry_boost") {
+                "reentry_boost"
+            } else if args.iter().any(|a| a == "plumetest") {
+                "plumetest"
+            } else if args.iter().any(|a| a == "reentry_lowheat") {
+                "reentry_lowheat"
+            } else if args.iter().any(|a| a == "reentry_midheat") {
+                "reentry_midheat"
             } else if args.iter().any(|a| a == "reentry") {
                 "reentry"
             } else if args.iter().any(|a| a == "parachute") {
@@ -6356,6 +6497,11 @@ fn main() {
                 "sepfloat" => "out/sepfloat.png",
                 "reentry" => "out/reentry.png",
                 "reentry_tilt" => "out/reentry_tilt.png",
+                "reentry_roll" => "out/reentry_roll.png",
+                "reentry_boost" => "out/reentry_boost.png",
+                "reentry_lowheat" => "out/reentry_lowheat.png",
+                "reentry_midheat" => "out/reentry_midheat.png",
+                "plumetest" => "out/plumetest.png",
                 "crash" => "out/crash.png",
                 "boosters" => "out/boosters.png",
                 "boosterlaunch" => "out/boosterlaunch.png",
@@ -6493,6 +6639,38 @@ mod reentry_test_scene {
         assert_eq!(rk.r, r0, "re-aiming must not move the vehicle");
     }
 
+    /// In the frozen test you can yaw and roll the airframe (not just pitch), so
+    /// re-entry can be inspected from any 3-axis orientation. Yaw swings the nose;
+    /// roll spins about the nose (nose direction unchanged) - neither moves it.
+    #[test]
+    fn frozen_scene_yaw_and_roll_rotate_the_airframe() {
+        let mut w = World::new();
+        w.setup_reentry(0);
+        let r0 = w.launch.as_ref().unwrap().r;
+        let nose0 = w.launch.as_ref().unwrap().point_dir();
+
+        // Yaw swings the nose off its current direction.
+        if let Some(rk) = w.launch.as_mut() {
+            rk.yaw = 0.6;
+        }
+        w.advance(0.1);
+        let (nose1, orient1) = {
+            let rk = w.launch.as_ref().unwrap();
+            (rk.point_dir(), rk.orient)
+        };
+        assert!(nose0.dot(nose1) < 0.99, "yaw should rotate the nose off-axis");
+
+        // Roll spins about the nose axis: the nose stays put, the orientation turns.
+        if let Some(rk) = w.launch.as_mut() {
+            rk.roll = 0.8;
+        }
+        w.advance(0.1);
+        let rk = w.launch.as_ref().unwrap();
+        assert!(rk.point_dir().dot(nose1) > 0.999, "roll must keep the nose fixed");
+        assert!(rk.orient.angle_between(orient1) > 1e-3, "roll must change the orientation");
+        assert_eq!(rk.r, r0, "rotating must not move the vehicle");
+    }
+
     /// A real ignition is never frozen - it flies normally.
     #[test]
     fn normal_ignition_is_not_frozen() {
@@ -6501,5 +6679,27 @@ mod reentry_test_scene {
         assert!(w.reentry_test);
         w.ignite_launch(); // a genuine launch clears the test freeze
         assert!(!w.reentry_test);
+    }
+
+    /// The rocket must never sink through the pad during the engine spool-up: it
+    /// is held down until thrust exceeds weight, then lifts off and climbs.
+    #[test]
+    fn launch_does_not_sink_into_the_pad() {
+        let mut w = World::new();
+        w.ignite_launch();
+        let pad_alt = w.launch.as_ref().unwrap().altitude(&w.body);
+        let mut min_alt = pad_alt;
+        for _ in 0..160 {
+            w.advance(0.05); // ~8 s through spool-up + early ascent
+            if let Some(rk) = w.launch.as_ref() {
+                min_alt = min_alt.min(rk.altitude(&w.body));
+            }
+        }
+        assert!(
+            min_alt >= pad_alt - 0.5,
+            "rocket sank below the pad during launch: min_alt={min_alt:.2} pad={pad_alt:.2}"
+        );
+        let end_alt = w.launch.as_ref().unwrap().altitude(&w.body);
+        assert!(end_alt > pad_alt + 1.0, "rocket failed to lift off: end={end_alt:.2} pad={pad_alt:.2}");
     }
 }

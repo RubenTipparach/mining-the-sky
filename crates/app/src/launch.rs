@@ -105,6 +105,12 @@ pub struct Rocket {
     /// This is the target the player / autopilot dials; the attitude controller
     /// torques the airframe toward it (it does not snap).
     pub pitch: f64,
+    /// Commanded yaw (rad, about local-up, out of the launch plane) and roll
+    /// (rad, about the nose axis). Only the frozen test scenes use these (to spin
+    /// the airframe and inspect re-entry from any attitude); normal flight steers
+    /// in the launch plane with `pitch` alone and leaves these at 0.
+    pub yaw: f64,
+    pub roll: f64,
     /// Full 3-axis orientation (body -> world). Body +Y is the nose / thrust axis.
     /// Driven by torques + angular momentum; the drawn rocket, thrust and FX all
     /// follow `point_dir()` = orient * +Y.
@@ -125,6 +131,13 @@ pub struct Rocket {
     /// Orbital-plane normal (up0 x launch-heading); the turn stays in this plane.
     pub plane_n: DVec3,
     pub met: f64,
+    /// Radius (m) of the rocket base resting on the launch pad. Until the engine
+    /// builds enough thrust to actually rise, the vehicle is held down here so it
+    /// does not sink through the pad during the spool-up (real pads clamp the
+    /// vehicle until thrust exceeds weight).
+    pub pad_radius: f64,
+    /// Set once the vehicle has climbed clear of the pad; the hold-down releases.
+    pub lifted: bool,
     pub crashed: bool,
     pub orbit_reached: bool,
     /// Structural integrity, 0..100. Aerodynamic heating past the airframe's
@@ -187,6 +200,8 @@ impl Rocket {
             throttle: 0.0,
             spool: 0.0,
             pitch: 0.0,
+            yaw: 0.0,
+            roll: 0.0,
             // nose pointing straight up at the pad (rotate body +Y onto the radial)
             orient: DQuat::from_rotation_arc(DVec3::Y, up0),
             omega: DVec3::ZERO,
@@ -196,6 +211,8 @@ impl Rocket {
             up0,
             plane_n,
             met: 0.0,
+            pad_radius: r.length(),
+            lifted: false,
             crashed: false,
             orbit_reached: false,
             health: 100.0,
@@ -310,13 +327,28 @@ impl Rocket {
         (up * self.pitch.cos() + horiz * self.pitch.sin()).normalize_or_zero()
     }
 
-    /// Snap the orientation to the commanded attitude (nose on `target_nose`) and
-    /// kill the rates. Used for instant placement / the frozen test scenes.
+    /// Snap the orientation to the commanded attitude and kill the rates. Used for
+    /// instant placement / the frozen test scenes. `pitch` tilts the nose from
+    /// local-up toward downrange (in the launch plane, matching `target_nose`),
+    /// `yaw` swings it out of that plane about local-up, and `roll` spins the
+    /// airframe about its own nose axis - so the test scenes can pose the vehicle
+    /// at any attitude relative to the (fixed) airflow.
     pub fn place_attitude(&mut self) {
-        let tgt = self.target_nose();
-        if tgt.length_squared() > 1e-9 {
-            self.orient = DQuat::from_rotation_arc(DVec3::Y, tgt);
+        let up = self.r.normalize_or_zero();
+        if up.length_squared() < 1e-9 {
+            return;
         }
+        let horiz = self.horizontal(up);
+        let side = up.cross(horiz).normalize_or_zero(); // out-of-plane (pitch axis)
+        // Upright basis: body X -> downrange, Y -> up (nose), Z -> horiz x up.
+        let q0 = DQuat::from_mat3(&glam::DMat3::from_cols(horiz, up, horiz.cross(up)));
+        // pitch tilts the nose up->downrange (about `side`); yaw swings it out of
+        // the launch plane (about `horiz`, so it still moves the nose when the nose
+        // is straight up - no gimbal lock there); roll spins about the nose axis.
+        self.orient = DQuat::from_axis_angle(horiz, self.yaw)
+            * DQuat::from_axis_angle(side, self.pitch)
+            * q0
+            * DQuat::from_rotation_y(self.roll);
         self.omega = DVec3::ZERO;
         self.sync_pitch_readout();
     }
@@ -515,6 +547,23 @@ impl Rocket {
             if thrust_n > 0.0 {
                 if let Some(s) = self.stages.first_mut() {
                     s.prop = (s.prop - thrust_n / (s.isp * G0) * h).max(0.0);
+                }
+            }
+
+            // Pad hold-down: while the engine is still spooling up (thrust below
+            // weight) the vehicle would otherwise fall and sink through the pad.
+            // Keep it resting on the pad until it actually starts to rise, then
+            // release. Only applies to a genuine surface launch (the pad sits just
+            // above the planet surface) - not to a vehicle started mid-air (a
+            // descending stage / capsule), so a falling craft is never trapped.
+            if !self.lifted && self.pad_radius < body.radius + 1000.0 {
+                if self.r.length() > self.pad_radius + 0.4 {
+                    self.lifted = true; // climbed off the pad - flying now
+                } else if self.r.length() < self.pad_radius {
+                    let up = self.r.normalize_or_zero();
+                    self.r = up * self.pad_radius;
+                    let into_pad = self.v.dot(up).min(0.0);
+                    self.v -= up * into_pad; // cancel the downward component
                 }
             }
 
@@ -760,6 +809,60 @@ mod tests {
         );
         let orb = orbit_from_state(rk.r, rk.v, body.mu);
         assert!(orb.e < 1.0 && orb.a > 0.0, "trajectory is not bound: e={:.3}", orb.e);
+    }
+
+    /// DIAGNOSTIC (run with --nocapture): prints our ascent profile so it can be
+    /// compared against real rockets (Saturn V S-IC: ~160 s to ~67 km / ~2750 m/s,
+    /// liftoff TWR ~1.2).
+    #[test]
+    fn ascent_profile_diagnostic() {
+        let body = CentralBody::home();
+        // the actual in-game default the player flies (Vab::default_build), not the
+        // scripted-mission `pioneer` vehicle, so this measures what they feel.
+        let veh = crate::build::Vab::default_build().to_vehicle();
+        let up = DVec3::new(1.0, 0.0, 0.0);
+        let heading = DVec3::Y.cross(up).normalize();
+        let mut rk = Rocket::on_pad(&veh, up * body.radius, DVec3::ZERO, up, heading);
+        rk.throttle = 1.0;
+        let g0 = body.surface_gravity();
+        let liftoff_twr = rk.stages[0].thrust / (rk.mass() * g0);
+        let mut log = Vec::new();
+        log.push(format!("LIFTOFF mass={:.0} t  TWR={:.2}", rk.mass() / 1000.0, liftoff_twr));
+        log.push("  MET   alt(km)  vel(m/s)  TWR   stage".to_string());
+        let mut s1: Option<(f64, f64, f64)> = None;
+        let mut reach67: Option<f64> = None;
+        for i in 0..2000 {
+            let t = rk.met;
+            rk.pitch = ((t - 10.0) / 150.0).clamp(0.0, 1.0) * 88f64.to_radians();
+            if rk.prop_frac() <= 0.0 && rk.stages.len() > 1 {
+                if s1.is_none() {
+                    s1 = Some((t, rk.altitude(&body), rk.speed()));
+                }
+                rk.jettison();
+            }
+            rk.integrate(&body, 0.5);
+            if reach67.is_none() && rk.altitude(&body) > 67_000.0 {
+                reach67 = Some(rk.met);
+            }
+            if i % 20 == 0 {
+                let twr = rk.stages.first().map(|s| s.thrust / (rk.mass() * g0)).unwrap_or(0.0);
+                log.push(format!(
+                    "{:5.0}  {:7.1}  {:8.0}  {:5.2}  S{}",
+                    rk.met, rk.altitude(&body) / 1000.0, rk.speed(), twr, rk.stage_base + 1
+                ));
+            }
+            if rk.crashed || rk.altitude(&body) > 200_000.0 {
+                break;
+            }
+        }
+        if let Some((t, a, v)) = s1 {
+            log.push(format!("STAGE-1 BURNOUT: t={:.0}s  alt={:.1}km  vel={:.0}m/s", t, a / 1000.0, v));
+        }
+        if let Some(t) = reach67 {
+            log.push(format!("reached 67 km (Saturn V staging alt) at t={t:.0}s"));
+        }
+        let _ = std::fs::create_dir_all("out");
+        std::fs::write("out/ascent_profile.txt", log.join("\n")).ok();
     }
 
     #[test]

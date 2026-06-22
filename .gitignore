@@ -1,5 +1,6 @@
 /target
 /out
+/crates/app/out
 **/*.rs.bk
 Cargo.lock.orig
 # wasm build output
