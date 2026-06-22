@@ -5,7 +5,7 @@
 //! atmospheric drag + thrust core as `flight::Craft`, but with a stack of stages
 //! and a thrust vector the player steers.
 
-use glam::{DVec3, Vec3};
+use glam::{DQuat, DVec3, Vec3};
 use sim::body::CentralBody;
 use sim::orbit::orbit_from_state;
 use sim::vehicle::{Vehicle, G0};
@@ -29,14 +29,26 @@ const G_EARTH: f64 = 9.80665; // standard g for the crew-load reference
 const CDA_CHUTE: f64 = 600.0; // Cd*area of a fully open main canopy (m^2)
 const CHUTE_OPEN_RATE: f64 = 0.5; // open fraction per second (~2 s to full)
 
-// Attitude (pitch) response: the airframe steers toward the commanded pitch
-// like a thruster-controlled rigid body instead of snapping. `STEER_GAIN` turns
-// the angle error into a target rate (so it eases in near the command);
-// `MAX_PITCH_RATE` caps how fast it can rotate; `MAX_PITCH_ACC` caps how fast
-// that rate can change, which is what gives the rotation its inertia/momentum.
-const STEER_GAIN: f64 = 2.5; // 1/s
-const MAX_PITCH_RATE: f64 = 0.35; // rad/s (~20 deg/s)
-const MAX_PITCH_ACC: f64 = 0.5; // rad/s^2
+// Attitude as a full 3-axis rigid body. The airframe carries an inertia tensor
+// (a long thin cylinder: small roll inertia, large pitch/yaw inertia), and its
+// orientation is driven by real torques and angular momentum rather than a
+// scripted slew:
+//   - gimballed thrust (TVC) and reaction-control thrusters steer it toward the
+//     commanded attitude through a PD law, with limited control authority;
+//   - aerodynamics weathervane it toward the airflow (so it follows prograde in
+//     the gravity turn, and an uncontrolled vehicle tumbles at high q).
+// `STEER_GAIN`/`MAX_PITCH_*` are retained only for the legacy 1-axis slew helper.
+const STEER_GAIN: f64 = 2.5; // 1/s (legacy slew)
+const MAX_PITCH_RATE: f64 = 0.35; // rad/s (legacy slew)
+const MAX_PITCH_ACC: f64 = 0.5; // rad/s^2 (legacy slew)
+
+const GIMBAL_MAX: f64 = 0.10; // max thrust-vector deflection (~6 deg)
+const RCS_TORQUE: f64 = 6.0e5; // baseline reaction-control authority (N*m), always on
+const ATT_KP: f64 = 1.6; // attitude PD: proportional (toward the commanded nose)
+const ATT_KD: f64 = 2.6; // attitude PD: rate damping
+const AERO_TORQUE_K: f64 = 220.0; // weathervane strength: tau ~ K * q * sin(alpha)
+const ROLL_DAMP: f64 = 1.2; // roll-rate damping (RCS holds roll near zero)
+const BODY_RADIUS: f64 = 3.0; // nominal airframe radius for the inertia tensor (m)
 
 // Aerodynamic heating. The convective heat flux on a blunt body goes roughly as
 // q ~ sqrt(rho) * v^3 (Sutton-Graves form). We normalise that against
@@ -93,15 +105,23 @@ pub struct Rocket {
     /// comes on smoothly instead of snapping to full.
     pub spool: f64,
     /// Commanded steering angle from local-up toward downrange (rad). 0 = up.
-    /// This is the target the player / autopilot dials; the rocket's actual
-    /// attitude (`pitch_act`) slews toward it at a limited rate so steering
-    /// reads as a rigid body pitching over, not an instant snap.
+    /// This is the target the player / autopilot dials; the attitude controller
+    /// torques the airframe toward it (it does not snap).
     pub pitch: f64,
-    /// Actual attitude angle the airframe currently holds (rad). Thrust and the
-    /// drawn rocket both follow this, so it lags the command realistically.
+    /// Full 3-axis orientation (body -> world). Body +Y is the nose / thrust axis.
+    /// Driven by torques + angular momentum; the drawn rocket, thrust and FX all
+    /// follow `point_dir()` = orient * +Y.
+    pub orient: DQuat,
+    /// Angular velocity in the BODY frame (rad/s), integrated via Euler's
+    /// equations against the inertia tensor.
+    pub omega: DVec3,
+    /// When set, the attitude is pinned to the commanded direction instead of
+    /// running the rigid-body dynamics (used by the frozen test scenes / instant
+    /// placement so a set-up re-entry attitude is not weathervaned away).
+    pub attitude_hold: bool,
+    /// Pitch angle from local-up (rad) and its rate, derived from `orient` each
+    /// step for the HUD/telemetry and the legacy tests.
     pub pitch_act: f64,
-    /// Current pitch angular rate (rad/s); integrated under a limited angular
-    /// acceleration so the airframe has rotational inertia.
     pub pitch_rate: f64,
     /// Launch-site radial at ignition (defines the launch plane with `plane_n`).
     pub up0: DVec3,
@@ -170,6 +190,10 @@ impl Rocket {
             throttle: 0.0,
             spool: 0.0,
             pitch: 0.0,
+            // nose pointing straight up at the pad (rotate body +Y onto the radial)
+            orient: DQuat::from_rotation_arc(DVec3::Y, up0),
+            omega: DVec3::ZERO,
+            attitude_hold: false,
             pitch_act: 0.0,
             pitch_rate: 0.0,
             up0,
@@ -280,19 +304,130 @@ impl Rocket {
         h.normalize_or_zero()
     }
 
-    /// Unit thrust / pointing direction for the airframe's *actual* attitude
-    /// (which lags the command, so the rocket rotates instead of snapping).
+    /// Unit nose / thrust direction: the airframe's actual orientation (body +Y).
     pub fn point_dir(&self) -> DVec3 {
-        let up = self.r.normalize_or_zero();
-        let horiz = self.horizontal(up);
-        (up * self.pitch_act.cos() + horiz * self.pitch_act.sin()).normalize_or_zero()
+        (self.orient * DVec3::Y).normalize_or_zero()
     }
 
-    /// Slew the actual attitude toward the commanded pitch over `dt` seconds with
-    /// a limited angular rate and acceleration, so the airframe carries
-    /// rotational inertia rather than teleporting to the new angle. A
-    /// proportional law sets the target rate (easing off near the command); the
-    /// rate itself can only change so fast (the inertia / control authority).
+    /// The direction the player/autopilot is commanding the nose to point: the
+    /// `pitch` angle in the launch plane (0 = local up, toward downrange).
+    fn target_nose(&self) -> DVec3 {
+        let up = self.r.normalize_or_zero();
+        let horiz = self.horizontal(up);
+        (up * self.pitch.cos() + horiz * self.pitch.sin()).normalize_or_zero()
+    }
+
+    /// Snap the orientation to the commanded attitude (nose on `target_nose`) and
+    /// kill the rates. Used for instant placement / the frozen test scenes.
+    pub fn place_attitude(&mut self) {
+        let tgt = self.target_nose();
+        if tgt.length_squared() > 1e-9 {
+            self.orient = DQuat::from_rotation_arc(DVec3::Y, tgt);
+        }
+        self.omega = DVec3::ZERO;
+        self.sync_pitch_readout();
+    }
+
+    /// Body-frame principal moments of inertia (kg*m^2). The stack is modelled as
+    /// a uniform solid cylinder of the current mass: a small roll moment about the
+    /// long (+Y) axis and a large pitch/yaw moment from the length.
+    fn inertia(&self) -> DVec3 {
+        let m = self.mass().max(1.0);
+        let len = (self.stage_total as f64 * 14.0 + 12.0).max(8.0); // ~stack height (m)
+        let r2 = BODY_RADIUS * BODY_RADIUS;
+        let i_trans = m * (3.0 * r2 + len * len) / 12.0;
+        let i_long = 0.5 * m * r2;
+        DVec3::new(i_trans, i_long, i_trans)
+    }
+
+    /// Refresh the derived pitch readout (angle of the nose from local up) and its
+    /// rate, for the HUD/telemetry and legacy tests.
+    fn sync_pitch_readout(&mut self) {
+        let up = self.r.normalize_or_zero();
+        let nose = self.point_dir();
+        self.pitch_act = nose.dot(up).clamp(-1.0, 1.0).acos();
+        // transverse angular rate (world frame), magnitude
+        let omega_world = self.orient * self.omega;
+        let roll = omega_world.dot(nose) * nose;
+        self.pitch_rate = (omega_world - roll).length();
+    }
+
+    /// Advance the attitude one step under rigid-body dynamics: control torque
+    /// (gimballed thrust + RCS via a PD law toward the commanded nose), the
+    /// aerodynamic weathervane, and roll damping, integrated as angular momentum.
+    fn update_attitude(&mut self, body: &CentralBody, dt: f64) {
+        if self.attitude_hold {
+            self.place_attitude();
+            return;
+        }
+        let nose = self.point_dir();
+        let tgt = self.target_nose();
+        let inertia = self.inertia();
+        let i_trans = inertia.x;
+        let omega_world = self.orient * self.omega;
+
+        // --- attitude error -> desired control torque (world frame) ---
+        // err axis*angle takes the nose toward the target (small-angle ~ cross).
+        let cross = nose.cross(tgt);
+        let s = cross.length().clamp(-1.0, 1.0);
+        let ang = s.asin();
+        let err = if cross.length_squared() > 1e-12 {
+            cross.normalize() * ang
+        } else {
+            DVec3::ZERO
+        };
+        // transverse angular rate only (don't fight roll here)
+        let omega_trans = omega_world - omega_world.dot(nose) * nose;
+        let tau_des = (err * ATT_KP - omega_trans * ATT_KD) * i_trans;
+        // control authority: gimballed thrust (lever arm ~ half the stack) + RCS.
+        let arm = (self.stage_total as f64 * 14.0 + 12.0).max(8.0) * 0.45;
+        let tvc_max = self.live_thrust() * GIMBAL_MAX.sin() * arm;
+        let tau_max = tvc_max + RCS_TORQUE;
+        let tau_ctrl = if tau_des.length() > tau_max {
+            tau_des.normalize() * tau_max
+        } else {
+            tau_des
+        };
+
+        // --- aerodynamic weathervane (world frame) ---
+        let alt = self.r.length() - body.radius;
+        let rho = body.density(alt);
+        let speed = self.v.length();
+        let mut tau_aero = DVec3::ZERO;
+        if rho > 0.0 && speed > 1.0 {
+            let vhat = self.v / speed;
+            let q = 0.5 * rho * speed * speed; // dynamic pressure
+            // torque rotates the nose toward the airflow (restoring -> stable);
+            // magnitude ~ q * sin(angle of attack).
+            tau_aero = nose.cross(vhat) * (AERO_TORQUE_K * q);
+        }
+
+        // --- integrate angular momentum in the body frame (Euler's equations) ---
+        let inv = self.orient.inverse();
+        let mut tau_body = inv * (tau_ctrl + tau_aero);
+        // roll damping (RCS holds roll near zero) about body +Y
+        tau_body.y -= ROLL_DAMP * self.omega.y * inertia.y;
+        let iw = DVec3::new(
+            inertia.x * self.omega.x,
+            inertia.y * self.omega.y,
+            inertia.z * self.omega.z,
+        );
+        let gyro = self.omega.cross(iw);
+        let ang_acc = DVec3::new(
+            (tau_body.x - gyro.x) / inertia.x,
+            (tau_body.y - gyro.y) / inertia.y,
+            (tau_body.z - gyro.z) / inertia.z,
+        );
+        self.omega += ang_acc * dt;
+        // integrate the orientation by the body rate
+        if self.omega.length_squared() > 1e-18 {
+            self.orient = (self.orient * DQuat::from_scaled_axis(self.omega * dt)).normalize();
+        }
+        self.sync_pitch_readout();
+    }
+
+    /// Legacy 1-axis slew (kept for the unit test); unused by the live sim.
+    #[allow(dead_code)]
     fn slew_attitude(&mut self, dt: f64) {
         let err = self.pitch - self.pitch_act;
         let target_rate = (err * STEER_GAIN).clamp(-MAX_PITCH_RATE, MAX_PITCH_RATE);
@@ -349,9 +484,9 @@ impl Rocket {
         let steps = ((dt_sim / h).ceil() as i64).clamp(1, 2000);
         for _ in 0..steps {
             self.met += h;
-            // rotate the airframe toward the commanded pitch before reading the
-            // thrust direction, so thrust follows the actual (lagging) attitude.
-            self.slew_attitude(h);
+            // step the rigid-body attitude (control torque + aero + roll damping)
+            // before reading the thrust direction, so thrust follows the nose.
+            self.update_attitude(body, h);
             // inflate the parachute once armed (the canopy fills over ~2 s).
             if self.chute_armed && self.chute < 1.0 {
                 self.chute = (self.chute + CHUTE_OPEN_RATE * h).min(1.0);

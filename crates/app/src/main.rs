@@ -945,21 +945,22 @@ impl World {
                     rk.r = up * (radius + 58_000.0);
                     rk.v = -up * 6_000.0 + east * 2_600.0;
                     rk.pitch = 0.0;
-                    rk.pitch_act = 0.0;
                 }
                 1 => {
                     rk.r = up * (radius + 58_000.0);
                     rk.pitch = 0.8;
-                    rk.pitch_act = 0.8;
                     rk.v = east * 5_400.0 - up * 3_200.0;
                 }
                 _ => {
                     rk.r = up * (radius + 55_000.0);
                     rk.pitch = 0.0;
-                    rk.pitch_act = 0.0;
                     rk.v = east * 6_600.0;
                 }
             }
+            // hold the set-up attitude (so a broadside/tilt entry is not weathervaned
+            // away during the bloom) and place the nose there immediately.
+            rk.attitude_hold = true;
+            rk.place_attitude();
         }
         // Integrate a short while so the heating glow blooms to full, then
         // freeze the scene: from here the vehicle holds its pose at full heat
@@ -1001,7 +1002,8 @@ impl World {
             rk.r = up * (radius + 3500.0);
             rk.v = -up * 130.0; // falling
             rk.pitch = 0.0;
-            rk.pitch_act = 0.0;
+            rk.attitude_hold = true; // hangs nose-up under the canopy
+            rk.place_attitude();
             rk.deploy_chute();
         }
         for _ in 0..45 {
@@ -1028,7 +1030,8 @@ impl World {
             rk.r = up * (radius + 1800.0);
             rk.v = -up * 160.0; // falling
             rk.pitch = 0.0;
-            rk.pitch_act = 0.0;
+            rk.attitude_hold = true; // hold nose-up for the retro-burn
+            rk.place_attitude();
             rk.auto_land = true; // engage the powered-descent autopilot
         }
         for _ in 0..30 {
@@ -1776,8 +1779,8 @@ impl World {
                 // Frozen plasma test: hold the vehicle in place at full heat so
                 // the FX play continuously and you can orbit / re-aim it. Skip
                 // integration entirely (no motion, no heat damage, never breaks
-                // up); attitude still tracks the command so W/S re-aims it.
-                rk.pitch_act = rk.pitch;
+                // up); attitude tracks the command so W/S re-aims it.
+                rk.place_attitude();
                 rk.health = 100.0;
                 rk.destroyed = false;
                 rk.crashed = false;
