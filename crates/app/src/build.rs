@@ -116,11 +116,14 @@ pub struct Vab {
 }
 
 impl Vab {
-    /// A sensible default two-stage launcher (~the old Pioneer).
+    /// A sensible default two-stage launcher. The first stage carries a lot of
+    /// propellant so it lifts off at a gentle ~1.9 g (not a 3 g leap) and the felt
+    /// acceleration ramps up through the burn toward the crew g-limit, the way a
+    /// real launcher does.
     pub fn default_build() -> Vab {
         Vab {
             stages: vec![
-                StageCfg::new(2, 2), // Titan-9 + Large booster
+                StageCfg::new(2, 3), // Titan-9 + X-Large tank (heavy, gentle liftoff)
                 StageCfg::new(3, 1), // Vac-1 + Medium upper
             ],
             payload: 1, // ComSat

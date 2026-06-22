@@ -577,6 +577,11 @@ fn launch_panel(ctx: &egui::Context, world: &mut World) {
                 ui.label(egui::RichText::new("TWR").color(DIM));
                 ui.label(egui::RichText::new(format!("{:.2}", tel.twr)).color(twr_col));
                 ui.end_row();
+                // Crew acceleration; amber as it nears the g-limit (auto-capped).
+                let g_col = if tel.g_force >= 2.9 { AMBER } else { GOOD };
+                ui.label(egui::RichText::new("G-force").color(DIM));
+                ui.label(egui::RichText::new(format!("{:.2} g", tel.g_force)).color(g_col));
+                ui.end_row();
                 kv(ui, "Apoapsis", &fmt_alt(tel.apo_km));
                 kv(ui, "Periapsis", &fmt_alt(tel.peri_km));
                 kv(ui, "Pitch", &format!("{:.0} deg", tel.pitch_deg));

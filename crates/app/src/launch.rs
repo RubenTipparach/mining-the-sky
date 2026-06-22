@@ -13,6 +13,16 @@ use sim::vehicle::{Vehicle, G0};
 const CDA: f64 = 6.0; // Cd * frontal area (m^2), matches the ascent model
 const CRASH_SPEED: f64 = 18.0; // m/s surface-relative impact tolerance
 
+// Liftoff realism. Real engines build to full thrust over a couple of seconds
+// (held down on the pad until then) rather than snapping on, and the throttle is
+// pulled back so the crew never sees more than a few g of acceleration. On a
+// Saturn V the felt acceleration ramps from ~1.25 g at liftoff up toward ~4 g as
+// the stage burns light, where the centre engine is cut to hold the limit (see
+// the Apollo 8 ascent profile); we model that ceiling with an automatic g-limit.
+const SPOOL_TIME: f64 = 2.5; // s for an igniting stage to build to full thrust
+const CREW_G_LIMIT: f64 = 3.0; // g the auto-throttle will not let the crew exceed
+const G_EARTH: f64 = 9.80665; // standard g for the crew-load reference
+
 // Recovery parachute. A deployed main canopy adds a large Cd*area so the vehicle
 // settles to a survivable terminal velocity in the lower atmosphere; it opens
 // over a couple of seconds (the canopy inflating) rather than instantly.
@@ -56,6 +66,8 @@ pub struct Tel {
     pub vspeed: f32,
     pub throttle: f32,
     pub twr: f32,
+    /// Acceleration felt by the crew (g); the auto-throttle caps this.
+    pub g_force: f32,
     pub stage_name: &'static str,
     pub stage_idx: usize,
     pub stage_total: usize,
@@ -76,6 +88,10 @@ pub struct Rocket {
     pub stages: Vec<LiveStage>,
     pub payload: f64,
     pub throttle: f64, // 0..1
+    /// Engine spool: actual thrust fraction the lit stage has built up, 0..1. It
+    /// ramps up over `SPOOL_TIME` after ignition (and resets on staging) so thrust
+    /// comes on smoothly instead of snapping to full.
+    pub spool: f64,
     /// Commanded steering angle from local-up toward downrange (rad). 0 = up.
     /// This is the target the player / autopilot dials; the rocket's actual
     /// attitude (`pitch_act`) slews toward it at a limited rate so steering
@@ -152,6 +168,7 @@ impl Rocket {
             stages,
             payload: veh.payload,
             throttle: 0.0,
+            spool: 0.0,
             pitch: 0.0,
             pitch_act: 0.0,
             pitch_rate: 0.0,
@@ -229,12 +246,31 @@ impl Rocket {
             .unwrap_or(0.0)
     }
 
-    /// Throttle * available thrust (0 when the active stage is dry / cut).
+    /// Net thrust this instant (N): commanded throttle * engine thrust, ramped by
+    /// the spool-up and then pulled back by the crew g-limiter so the proper
+    /// acceleration (thrust / mass) never exceeds `CREW_G_LIMIT`. Because real
+    /// thrust is ~constant while mass burns away, the felt g naturally climbs
+    /// through a stage until it hits this ceiling - the Saturn-V ramp - and the
+    /// limiter then holds it there (as the centre-engine cutoff did on Apollo).
     pub fn live_thrust(&self) -> f64 {
-        match self.active() {
+        let raw = match self.active() {
             Some(s) if s.prop > 0.0 && self.throttle > 0.0 => s.thrust * self.throttle,
-            _ => 0.0,
+            _ => return 0.0,
+        };
+        let spooled = raw * self.spool;
+        let g_cap = CREW_G_LIMIT * G_EARTH * self.mass();
+        spooled.min(g_cap)
+    }
+
+    /// Felt acceleration on the crew right now, in g (proper acceleration =
+    /// non-gravitational force / mass). Used for the HUD and the launch-profile
+    /// check; the g-limiter keeps this at or below `CREW_G_LIMIT`.
+    pub fn crew_g(&self) -> f64 {
+        let mass = self.mass();
+        if mass <= 0.0 {
+            return 0.0;
         }
+        self.live_thrust() / mass / G_EARTH
     }
 
     /// Current downrange horizontal (in the launch plane, perpendicular to up).
@@ -271,6 +307,7 @@ impl Rocket {
             self.stages.remove(0);
             self.just_staged = Some(self.stage_base);
             self.stage_base += 1;
+            self.spool = 0.0; // the next stage's engine has to spool up from cold
         }
     }
 
@@ -324,6 +361,16 @@ impl Rocket {
             if self.auto_land && !self.landed {
                 self.auto_descent_control(body);
             }
+            // engine spool: build thrust up over SPOOL_TIME while the lit stage is
+            // commanded (and bleed it back off when cut), so liftoff ramps in.
+            let lit = self.throttle > 0.0 && self.active().map(|s| s.prop > 0.0).unwrap_or(false);
+            let want = if lit { 1.0 } else { 0.0 };
+            let drate = h / SPOOL_TIME;
+            self.spool = if self.spool < want {
+                (self.spool + drate).min(want)
+            } else {
+                (self.spool - drate).max(want)
+            };
             let mass = self.mass();
             let thrust_n = self.live_thrust();
             let tdir = self.point_dir();
@@ -450,6 +497,7 @@ impl Rocket {
             vspeed: self.vertical_speed() as f32,
             throttle: self.throttle as f32,
             twr,
+            g_force: self.crew_g() as f32,
             stage_name: self.stage_name(),
             stage_idx: self.stage_base,
             stage_total: self.stage_total,
@@ -678,5 +726,77 @@ mod tests {
             }
         }
         assert!(rk.landed && !rk.crashed, "powered descent did not land softly");
+    }
+
+    #[test]
+    fn launch_g_profile_is_smooth_and_capped() {
+        // Fly the actual default vehicle and sample its ascent. It must: not jump
+        // off the pad (engines spool up), ramp velocity smoothly, and never push
+        // the crew past the g-limit (the auto-throttle pulls back at the ceiling).
+        let body = CentralBody::home();
+        let veh = crate::build::Vab::default_build().to_vehicle();
+        let up = DVec3::new(1.0, 0.0, 0.0);
+        let heading = DVec3::Y.cross(up).normalize();
+        let mut rk = Rocket::on_pad(&veh, up * body.radius, DVec3::ZERO, up, heading);
+        rk.throttle = 1.0;
+
+        let dt = 0.1;
+        let mut prev = 0.0;
+        let mut max_g = 0.0f64;
+        let mut first10_max_dv = 0.0f64;
+        let mut lifted_at = -1.0;
+        let mut last_speed = 0.0;
+        println!("\n   t(s)  alt(km)  speed(m/s)  net_a(m/s^2)  crew_g  spool  stage");
+        for i in 1..=3000 {
+            let t = i as f64 * dt;
+            // gentle open-loop gravity turn, like a flown ascent
+            rk.pitch = ((t - 12.0) / 150.0).clamp(0.0, 1.0) * 80f64.to_radians();
+            if rk.prop_frac() <= 0.0 && rk.stages.len() > 1 {
+                rk.jettison();
+            }
+            rk.integrate(&body, dt);
+            let sp = rk.speed();
+            let dv = sp - prev;
+            let g = rk.crew_g();
+            max_g = max_g.max(g);
+            if t <= 10.0 {
+                first10_max_dv = first10_max_dv.max(dv.abs());
+            }
+            if lifted_at < 0.0 && rk.altitude(&body) > 1.0 {
+                lifted_at = t;
+            }
+            if (i % 50 == 0) || (t <= 10.0 && i % 10 == 0) {
+                println!(
+                    "   {:>5.1} {:>7.2} {:>10.0} {:>12.2} {:>6.2} {:>6.2}   {}",
+                    t,
+                    rk.altitude(&body) / 1000.0,
+                    sp,
+                    dv / dt,
+                    g,
+                    rk.spool,
+                    rk.stage_base
+                );
+            }
+            prev = sp;
+            last_speed = sp;
+            if rk.crashed || rk.orbit_reached {
+                break;
+            }
+        }
+        println!(
+            "   --> lifted off at t={:.1}s, peak crew g={:.2}, final speed={:.0} m/s",
+            lifted_at, max_g, last_speed
+        );
+        // crew never exceeds the limit (tiny numerical margin)
+        assert!(max_g <= CREW_G_LIMIT + 0.15, "crew g exceeded the limit: {max_g:.2}");
+        // no instant leap off the pad: thrust spools up, so it holds down ~1 s
+        assert!(lifted_at > 0.5, "lifted off instantly (no spool-up): t={lifted_at:.2}");
+        // velocity ramps in small increments through the first 10 s (no jump)
+        assert!(
+            first10_max_dv < 2.5,
+            "velocity jumped {first10_max_dv:.2} m/s in one 0.1 s step in the first 10 s"
+        );
+        // the g-limit did not starve the ascent: it still built real speed
+        assert!(last_speed > 3000.0, "ascent stalled: only {last_speed:.0} m/s");
     }
 }

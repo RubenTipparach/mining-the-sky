@@ -2369,6 +2369,7 @@ impl World {
         self.vab_mode = false;
         self.rolling_out = false;
         self.rollout = 1.0;
+        self.warp = 1.0; // launch in real time so the ascent reads at its true pace
         log::info!("Ignition: {} - throttle up, pitch over, stage when dry", veh.name);
     }
 
