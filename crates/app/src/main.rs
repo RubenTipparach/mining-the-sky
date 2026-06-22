@@ -2155,7 +2155,10 @@ impl World {
         // air density fraction: lots of smoke low down, little in the thin upper
         // atmosphere, none in vacuum (the flame remains regardless).
         let dens = (-(alt / 9000.0)).exp().clamp(0.0, 1.0) as f32;
-        let on_pad = alt < 30.0;
+        // Height above the launch site (the pad sits on terrain well above the
+        // body's reference radius, so absolute altitude is the wrong gauge here).
+        let agl = (rk.r.length() - self.launch_origin.length()) as f32;
+        let on_pad = agl < 30.0;
         let base = self.to_local(rk.r);
         let down = -self.dir_to_local(rk.point_dir()); // exhaust direction
         // emit from the ACTIVE stage's nozzle (up the mesh by nozzle_y)
@@ -2164,8 +2167,17 @@ impl World {
         let nozzle = base + q * Vec3::new(0.0, ny - 1.2, 0.0);
         let er = self.rocket_body.engine_r.get(rk.stage_base).copied().unwrap_or(0.9);
 
+        // Ignition billow: the deflector throws an enormous ground cloud in the
+        // first seconds. `billow` is 1 at ignition and fades to 0 by ~6 s, scaling
+        // up the spawn rate, particle size, spread and lifetime so liftoff kicks
+        // off a big mushrooming cloud that then settles into the normal trail.
+        let billow = if on_pad {
+            (1.0 - rk.met as f32 / 6.0).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         // spawn rate: heavy at the pad (the ground billow), thinning with density.
-        let rate = thrust_frac * (8.0 + 120.0 * dens) * if on_pad { 2.5 } else { 1.0 };
+        let rate = thrust_frac * (8.0 + 120.0 * dens) * if on_pad { 2.5 + 9.0 * billow } else { 1.0 };
         self.smoke_accum += rate * dt;
         let n = self.smoke_accum.floor() as i32;
         self.smoke_accum -= n as f32;
@@ -2175,18 +2187,23 @@ impl World {
             (seed >> 8) as f32 / (1u32 << 24) as f32
         };
         let ground = Vec3::new(base.x, rocket::PAD_TOP, base.z);
-        for _ in 0..n.min(40) {
+        for _ in 0..n.min(110) {
             let jit = Vec3::new(rnd() - 0.5, rnd() - 0.5, rnd() - 0.5);
             if on_pad {
-                // exhaust deflects off the pad: billow outward + up from the ground
+                // exhaust deflects off the pad: billow outward + up from the ground.
+                // During the ignition billow the cloud spreads much wider, bigger
+                // and lingers longer (the iconic mushroom at liftoff).
                 let a = rnd() * std::f32::consts::TAU;
-                let out = Vec3::new(a.cos(), 0.12, a.sin());
+                let out = Vec3::new(a.cos(), 0.10 + 0.10 * rnd(), a.sin());
+                let spread = 3.0 + 8.0 * billow;
                 self.smoke.push(Smoke {
-                    pos: ground + Vec3::new(jit.x, jit.y.abs() * 0.5, jit.z) * 3.0,
-                    vel: out * (9.0 + rnd() * 12.0) + Vec3::Y * (2.0 + rnd() * 3.0),
+                    pos: ground + Vec3::new(jit.x, jit.y.abs() * 0.5, jit.z) * spread,
+                    // billow gas rolls out slowly (dense cloud) rather than blasting
+                    // away; the big size + lifetime make it read as a launch plume.
+                    vel: out * (8.0 + rnd() * 8.0 + 8.0 * billow) + Vec3::Y * (2.0 + rnd() * 3.0 + 4.0 * billow),
                     age: 0.0,
-                    life: 2.4 + rnd() * 1.8,
-                    size0: 3.0 + rnd() * 2.5,
+                    life: 2.4 + rnd() * 1.8 + 3.0 * billow,
+                    size0: (2.5 + rnd() * 2.0) * (1.0 + 1.8 * billow),
                     seed: rnd(),
                 });
             } else {
@@ -2200,9 +2217,9 @@ impl World {
                 });
             }
         }
-        // keep the particle count bounded
-        if self.smoke.len() > 900 {
-            let drop = self.smoke.len() - 900;
+        // keep the particle count bounded (headroom for the big launch billow)
+        if self.smoke.len() > 1800 {
+            let drop = self.smoke.len() - 1800;
             self.smoke.drain(0..drop);
         }
     }
@@ -5091,11 +5108,11 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
         "liftoff" => {
             world.view = View::Rocket;
             world.rocket_az = 4.97;
-            world.rocket_el = 0.07;
-            world.rocket_dist = 60.0;
-            world.rocket_el = 0.12;
+            world.rocket_el = 0.20;
+            world.rocket_dist = 150.0;
+            world.rocket_focus_y = 28.0; // frame the rocket rising out of the cloud
             world.ignite_launch();
-            fly(&mut world, 1.4); // ignition: plume + billowing pad smoke
+            fly(&mut world, 2.8); // climbing out of the big ignition billow
             0.0
         }
         "liftoff2" => {

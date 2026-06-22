@@ -20,7 +20,7 @@ const CRASH_SPEED: f64 = 18.0; // m/s surface-relative impact tolerance
 // the stage burns light, where the centre engine is cut to hold the limit (see
 // the Apollo 8 ascent profile); we model that ceiling with an automatic g-limit.
 const SPOOL_TIME: f64 = 2.5; // s for an igniting stage to build to full thrust
-const CREW_G_LIMIT: f64 = 3.0; // g the auto-throttle will not let the crew exceed
+const CREW_G_LIMIT: f64 = 4.0; // g the auto-throttle will not let the crew exceed (Apollo S-IC peaked ~3.9 g)
 const G_EARTH: f64 = 9.80665; // standard g for the crew-load reference
 
 // Recovery parachute. A deployed main canopy adds a large Cd*area so the vehicle

@@ -578,7 +578,7 @@ fn launch_panel(ctx: &egui::Context, world: &mut World) {
                 ui.label(egui::RichText::new(format!("{:.2}", tel.twr)).color(twr_col));
                 ui.end_row();
                 // Crew acceleration; amber as it nears the g-limit (auto-capped).
-                let g_col = if tel.g_force >= 2.9 { AMBER } else { GOOD };
+                let g_col = if tel.g_force >= 3.8 { AMBER } else { GOOD };
                 ui.label(egui::RichText::new("G-force").color(DIM));
                 ui.label(egui::RichText::new(format!("{:.2} g", tel.g_force)).color(g_col));
                 ui.end_row();
