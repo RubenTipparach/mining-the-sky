@@ -1,11 +1,10 @@
-// PROTOTYPE: re-entry plasma as a procedural glow mesh (alternative to the
-// fullscreen volumetric raymarch in plasma.wgsl). A teardrop envelope swept along
-// the airflow axis is rasterized as ordinary depth-tested geometry; this shader
-// shades it with the same white -> orange -> red cooling ramp keyed to the per
-// -vertex "cool" coordinate (color.x, 0 at the windward nose .. 1 at the wake),
-// plus triangle-wave turbulence for the boil and a fresnel rim for a soft,
-// volumetric-looking edge. Cost is geometry-bound and it occludes correctly
-// against terrain/the vehicle (unlike the Always-draw raymarch).
+// Re-entry plasma as a procedural glow mesh. A shell that hugs the vehicle hull
+// (built on the CPU from the vehicle SDF, smeared downstream into a wake) is
+// rasterized as ordinary depth-tested geometry; this shader shades it with a
+// white -> orange -> red cooling ramp keyed to the per-vertex "cool" coordinate
+// (color.x, 0 at the windward face .. 1 at the wake), plus triangle-wave
+// turbulence for the boil and a fresnel rim for a soft, volumetric-looking edge.
+// Cost is geometry-bound and it occludes correctly against terrain/the vehicle.
 //
 // Turbulence is the triangle-wave noise from nimitz's "Re-entry" (Shadertoy
 // 4dGyRh), CC BY-NC-SA 3.0 - attribution retained.
@@ -21,7 +20,7 @@ struct U {
 };
 @group(0) @binding(0) var<uniform> u: U;
 
-// Look knobs mirror plasma.wgsl's TUNABLES so the two approaches read alike.
+// Look knobs for the cooling ramp + opacity.
 const WHITE_END:  f32 = 0.10;
 const YELLOW_END: f32 = 0.22;
 const ORANGE_END: f32 = 0.45;

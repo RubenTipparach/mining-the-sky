@@ -52,14 +52,12 @@ pub fn build(ctx: &egui::Context, world: &mut World) {
 fn test_menu(ctx: &egui::Context, world: &mut World) {
     #[derive(Clone, Copy)]
     enum T {
-        Renderer(bool),
         Reentry(u8),
         Parachute,
         Powered,
         Payload(usize),
     }
     let mut act: Option<T> = None;
-    let mesh = world.plasma_mesh_mode;
 
     egui::Window::new("TEST SCENES")
         .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 12.0))
@@ -99,20 +97,9 @@ fn test_menu(ctx: &egui::Context, world: &mut World) {
                     act = Some(T::Payload(11));
                 }
             });
-            ui.separator();
-            ui.label(egui::RichText::new("RE-ENTRY PLASMA RENDERER").color(DIM));
-            ui.horizontal(|ui| {
-                if ui.selectable_label(!mesh, "Raymarch").clicked() {
-                    act = Some(T::Renderer(false));
-                }
-                if ui.selectable_label(mesh, "Mesh (prototype)").clicked() {
-                    act = Some(T::Renderer(true));
-                }
-            });
         });
 
     match act {
-        Some(T::Renderer(m)) => world.plasma_mesh_mode = m,
         Some(T::Reentry(k)) => world.setup_reentry(k),
         Some(T::Parachute) => world.setup_parachute(),
         Some(T::Powered) => world.setup_powered_descent(),
