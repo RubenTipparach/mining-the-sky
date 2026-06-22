@@ -141,6 +141,14 @@ const DYN_MESH_CAP: u64 = 200_000;
 /// shell hugging the vehicle SDF (surface nets), so it can run to tens of
 /// thousands of verts on a boostered stack.
 const PLASMA_MESH_CAP: u64 = 262_144;
+// ---- Re-entry glow-mesh look (play with these) ----
+/// Number of nested glow shells extracted from the vehicle SDF. More shells read
+/// as a softer, more volumetric fireball (the inner one hugs the hull, the outer
+/// ones are progressively fainter, offset wisps).
+const PLASMA_GLOW_LAYERS: usize = 8;
+/// How far the outermost shell stands off the hull, as a multiple of the glow
+/// standoff. Bigger = the glow diffuses further out (softer, puffier silhouette).
+const PLASMA_GLOW_SPREAD: f32 = 1.9;
 /// Full-planet LOD terrain (rebuilt as the rocket moves across the grid). Sized
 /// for the high-detail budget (~1-2M triangles = 3-6M non-indexed vertices); the
 /// GPU buffer is this many vertices, so it bounds the densest terrain frame.
@@ -1332,8 +1340,15 @@ impl World {
         ];
         let lidx = |i: usize, j: usize, k: usize| (i * gx + j) * gy + k;
         let grad_eps = cell * 0.5;
-        // (iso offset into the field, layer coord 0=inner .. 1=outer for the shader).
-        let layers: [(f32, f32); 3] = [(0.0, 0.0), (shell * 0.7, 0.5), (shell * 1.5, 1.0)];
+        // Nested iso levels (iso offset into the field, layer coord 0=inner ..
+        // 1=outer for the shader), spaced from the hull out to PLASMA_GLOW_SPREAD.
+        let nlayers = PLASMA_GLOW_LAYERS.max(1);
+        let layers: Vec<(f32, f32)> = (0..nlayers)
+            .map(|i| {
+                let f = if nlayers > 1 { i as f32 / (nlayers - 1) as f32 } else { 0.0 };
+                (shell * PLASMA_GLOW_SPREAD * f, f)
+            })
+            .collect();
         let mut out: Vec<rocket::MeshVertex> = Vec::new();
         for &(iso, layer) in &layers {
             let mut cellv: Vec<i32> = vec![-1; gs * gx * gy];

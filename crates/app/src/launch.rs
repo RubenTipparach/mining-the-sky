@@ -14,13 +14,10 @@ const CDA: f64 = 6.0; // Cd * frontal area (m^2), matches the ascent model
 const CRASH_SPEED: f64 = 18.0; // m/s surface-relative impact tolerance
 
 // Liftoff realism. Real engines build to full thrust over a couple of seconds
-// (held down on the pad until then) rather than snapping on, and the throttle is
-// pulled back so the crew never sees more than a few g of acceleration. On a
-// Saturn V the felt acceleration ramps from ~1.25 g at liftoff up toward ~4 g as
-// the stage burns light, where the centre engine is cut to hold the limit (see
-// the Apollo 8 ascent profile); we model that ceiling with an automatic g-limit.
+// (held down on the pad until then) rather than snapping on. As the stage burns
+// light the felt acceleration naturally ramps up (the Saturn-V ascent profile);
+// managing the g-load with the throttle is left to the player.
 const SPOOL_TIME: f64 = 2.5; // s for an igniting stage to build to full thrust
-const CREW_G_LIMIT: f64 = 4.0; // g the auto-throttle will not let the crew exceed (Apollo S-IC peaked ~3.9 g)
 const G_EARTH: f64 = 9.80665; // standard g for the crew-load reference
 
 // Recovery parachute. A deployed main canopy adds a large Cd*area so the vehicle
@@ -78,7 +75,7 @@ pub struct Tel {
     pub vspeed: f32,
     pub throttle: f32,
     pub twr: f32,
-    /// Acceleration felt by the crew (g); the auto-throttle caps this.
+    /// Acceleration felt by the crew (g); informational (uncapped).
     pub g_force: f32,
     pub stage_name: &'static str,
     pub stage_idx: usize,
@@ -271,24 +268,20 @@ impl Rocket {
     }
 
     /// Net thrust this instant (N): commanded throttle * engine thrust, ramped by
-    /// the spool-up and then pulled back by the crew g-limiter so the proper
-    /// acceleration (thrust / mass) never exceeds `CREW_G_LIMIT`. Because real
-    /// thrust is ~constant while mass burns away, the felt g naturally climbs
-    /// through a stage until it hits this ceiling - the Saturn-V ramp - and the
-    /// limiter then holds it there (as the centre-engine cutoff did on Apollo).
+    /// the spool-up. Throttle (and so the g-load) is the player's to manage - the
+    /// felt g naturally climbs through a stage as mass burns away (the Saturn-V
+    /// ramp); `crew_g()` reports it for the HUD but nothing caps it.
     pub fn live_thrust(&self) -> f64 {
         let raw = match self.active() {
             Some(s) if s.prop > 0.0 && self.throttle > 0.0 => s.thrust * self.throttle,
             _ => return 0.0,
         };
-        let spooled = raw * self.spool;
-        let g_cap = CREW_G_LIMIT * G_EARTH * self.mass();
-        spooled.min(g_cap)
+        raw * self.spool
     }
 
     /// Felt acceleration on the crew right now, in g (proper acceleration =
     /// non-gravitational force / mass). Used for the HUD and the launch-profile
-    /// check; the g-limiter keeps this at or below `CREW_G_LIMIT`.
+    /// check. Nothing caps it - throttle (and so the g-load) is the player's to manage.
     pub fn crew_g(&self) -> f64 {
         let mass = self.mass();
         if mass <= 0.0 {
@@ -864,7 +857,7 @@ mod tests {
     }
 
     #[test]
-    fn launch_g_profile_is_smooth_and_capped() {
+    fn launch_g_profile_is_smooth() {
         // Fly the actual default vehicle and sample its ascent. It must: not jump
         // off the pad (engines spool up), ramp velocity smoothly, and never push
         // the crew past the g-limit (the auto-throttle pulls back at the ceiling).
@@ -922,8 +915,6 @@ mod tests {
             "   --> lifted off at t={:.1}s, peak crew g={:.2}, final speed={:.0} m/s",
             lifted_at, max_g, last_speed
         );
-        // crew never exceeds the limit (tiny numerical margin)
-        assert!(max_g <= CREW_G_LIMIT + 0.15, "crew g exceeded the limit: {max_g:.2}");
         // no instant leap off the pad: thrust spools up, so it holds down ~1 s
         assert!(lifted_at > 0.5, "lifted off instantly (no spool-up): t={lifted_at:.2}");
         // velocity ramps in small increments through the first 10 s (no jump)
@@ -931,7 +922,7 @@ mod tests {
             first10_max_dv < 2.5,
             "velocity jumped {first10_max_dv:.2} m/s in one 0.1 s step in the first 10 s"
         );
-        // the g-limit did not starve the ascent: it still built real speed
+        // it builds real speed (the ascent works end to end)
         assert!(last_speed > 3000.0, "ascent stalled: only {last_speed:.0} m/s");
     }
 }

@@ -34,6 +34,8 @@ const FLOW_AMP:   f32 = 0.9;   // metres of animated ripple (x layer) - flowing 
 const SCROLL:     f32 = 1.8;   // turbulence scroll speed (higher = flames fly faster)
 const TAIL_FADE:  f32 = 0.35;  // cool value below which the wake is fully opaque
 const TAIL_END:   f32 = 0.85;  // cool value by which the wake is 100% transparent
+const SELF_BLEND: f32 = 0.7;   // 0 = hard shell edges; 1 = soft, dissolved silhouette
+const LAYER_FADE: f32 = 0.7;   // how much fainter each outer shell is (x layer coord)
 
 fn tri(x: f32) -> f32 { return abs(fract(x) - 0.5) - 0.25; }
 fn tri2(x: f32) -> f32 { return abs(fract(x) - 0.5); }
@@ -141,8 +143,12 @@ fn fs(in: VsOut) -> FsOut {
     // edge. Fades across most of the wake (more fade), 100% transparent by
     // TAIL_END. The outer wisp layers are fainter so they read as soft gas.
     let tailfade = smoothstep(TAIL_END, TAIL_FADE, cool);
-    let layerfade = 1.0 - 0.5 * in.layer;
-    var a = dens * (0.45 + 1.3 * hot) * tailfade * layerfade;
+    let layerfade = 1.0 - LAYER_FADE * in.layer;
+    // Self-blend: dissolve the silhouette of the OUTER shells (fade their alpha at
+    // grazing angles) so the nested shells melt into one soft volume instead of
+    // each showing a hard polygon edge. The inner hull-hugging shell is untouched.
+    let edge_soft = 1.0 - SELF_BLEND * in.layer * rim;
+    var a = dens * (0.45 + 1.3 * hot) * tailfade * layerfade * edge_soft;
     a = clamp(a, 0.0, ALPHA_CAP);
 
     var out: FsOut;
