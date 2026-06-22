@@ -876,6 +876,32 @@ mod tests {
         std::fs::write("out/ascent_profile.txt", log.join("\n")).ok();
     }
 
+    /// Mission time must equal the wall-clock time fed in, no matter how the
+    /// frames are sliced. The old integrator rounded every frame up to a fixed
+    /// 0.05 s sub-step, so at 60-240 fps the clock ran several times too fast;
+    /// this pins MET to the exact elapsed time at any frame rate.
+    #[test]
+    fn met_tracks_elapsed_time_regardless_of_frame_size() {
+        let body = CentralBody::home();
+        // 240 fps: 600 tiny frames must advance MET by exactly 2.5 s (not round
+        // each 1/240 s frame up to a full 0.05 s step the way the old loop did).
+        let mut fast = pad_rocket(&body);
+        fast.throttle = 1.0;
+        let dt = 1.0 / 240.0;
+        for _ in 0..600 {
+            fast.integrate(&body, dt);
+        }
+        assert!((fast.met - 2.5).abs() < 1e-6, "MET {:.4} != 2.5 s at 240 fps", fast.met);
+
+        // 10 fps over the same 2.5 s of wall-clock reaches the same MET.
+        let mut slow = pad_rocket(&body);
+        slow.throttle = 1.0;
+        for _ in 0..25 {
+            slow.integrate(&body, 0.1);
+        }
+        assert!((slow.met - 2.5).abs() < 1e-6, "MET {:.4} != 2.5 s at 10 fps", slow.met);
+    }
+
     #[test]
     fn staging_drops_mass_and_advances() {
         let body = CentralBody::home();
