@@ -85,6 +85,11 @@ pub const PAYLOADS: &[Payload] = &[
     Payload { name: "Solar Generator", mass: 4_500.0, color: [0.30, 0.40, 0.70], module: 2 },
     Payload { name: "Habitat Module", mass: 6_000.0, color: [0.84, 0.86, 0.90], module: 3 },
     Payload { name: "ISRU Drill Rig", mass: 7_500.0, color: [0.78, 0.62, 0.22], module: 4 },
+    // Crewed flight: a re-entry capsule and the service module that flies behind
+    // it. The capsule is recovered under parachute; the pair test the crew/service
+    // stack, powered descent and parachute descent.
+    Payload { name: "Crew Capsule", mass: 3_200.0, color: [0.88, 0.90, 0.94], module: 5 },
+    Payload { name: "Service Module", mass: 4_600.0, color: [0.86, 0.72, 0.34], module: 6 },
 ];
 
 #[derive(Clone, Copy)]

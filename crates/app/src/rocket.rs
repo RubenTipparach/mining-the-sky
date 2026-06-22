@@ -618,8 +618,57 @@ fn mod_drill(m: &mut Mesh) {
     }
 }
 
+/// A crewed re-entry capsule: an Apollo-style "gumdrop" cone on an ablative heat
+/// shield, with a window band, a forward recovery (parachute) bay and a docking
+/// probe. This is the payload that the parachute-descent test recovers.
+fn mod_crew_capsule(m: &mut Mesh) {
+    mod_collar(m);
+    // ablative heat-shield rim flaring out to the capsule's widest point
+    m.frustum(0.0, 0.0, 0.6, 0.85, 0.62, 0.84, 20, BB_DARK, true, false);
+    // crew cabin: wide base tapering to a narrow forward shoulder (the cone)
+    m.frustum(0.0, 0.0, 0.85, 2.55, 0.84, 0.40, 20, BB_WHITE, false, false);
+    // wrap-around window band
+    m.frustum(0.0, 0.0, 1.25, 1.5, 0.66, 0.61, 20, BB_WIN, false, false);
+    // forward pressure-hatch ring
+    m.frustum(0.0, 0.0, 2.55, 2.75, 0.40, 0.38, 16, BB_TRIM, false, false);
+    // recovery / parachute bay (a stowed drum) + docking probe on top
+    m.frustum(0.0, 0.0, 2.75, 3.45, 0.38, 0.30, 16, BB_STEEL, false, true);
+    m.frustum(0.0, 0.0, 3.45, 3.95, 0.10, 0.05, 8, BB_TRIM, false, true);
+    // four RCS thruster nubs around the cone
+    for k in 0..4 {
+        let a = (k as f32 + 0.5) * std::f32::consts::FRAC_PI_2;
+        m.bx(Vec3::new(0.56 * a.cos(), 2.15, 0.56 * a.sin()), Vec3::new(0.08, 0.09, 0.08), BB_DARK);
+    }
+}
+
+/// A service module: the unpressurised bus that flies behind the capsule -
+/// propulsion (a single big engine bell), gold thermal blanketing, flat radiator
+/// wings, RCS quads and a high-gain dish. Used to test the service+crew stack and
+/// powered descent.
+fn mod_service_module(m: &mut Mesh) {
+    mod_collar(m);
+    // equipment drum with a gold thermal-blanket band
+    m.frustum(0.0, 0.0, 0.6, 3.2, 0.74, 0.74, 18, BB_STEEL, true, false);
+    m.frustum(0.0, 0.0, 1.0, 2.6, 0.76, 0.76, 18, BB_GOLD, false, false);
+    // main propulsion bell at the forward end (stacks engine-up in the fairing)
+    m.frustum(0.0, 0.0, 3.2, 4.1, 0.30, 0.62, 16, BB_DARK, false, true);
+    // two flat radiator wings
+    for s in [-1.0f32, 1.0] {
+        m.bx(Vec3::new(s * 0.96, 1.9, 0.0), Vec3::new(0.03, 1.0, 0.6), BB_TRIM);
+    }
+    // four RCS thruster quads near the base
+    for k in 0..4 {
+        let a = (k as f32 + 0.5) * std::f32::consts::FRAC_PI_2;
+        m.bx(Vec3::new(0.78 * a.cos(), 1.0, 0.78 * a.sin()), Vec3::new(0.11, 0.11, 0.11), BB_DARK);
+    }
+    // high-gain dish on a short boom
+    m.strut(Vec3::new(0.0, 2.4, 0.74), Vec3::new(0.0, 2.4, 1.05), 0.04, BB_TRIM);
+    m.dome(0.0, 1.05, 2.4, 0.28, 0.12, 12, 2, BB_WHITE);
+}
+
 /// A fairing-packed cargo module (index matches the `module` field in the
-/// payload catalog: 0 refinery, 1 reactor, 2 generator, 3 habitat, 4 drill).
+/// payload catalog: 0 refinery, 1 reactor, 2 generator, 3 habitat, 4 drill,
+/// 5 crew capsule, 6 service module).
 pub fn cargo_module(idx: usize) -> Mesh {
     let mut m = Mesh::default();
     match idx {
@@ -627,7 +676,9 @@ pub fn cargo_module(idx: usize) -> Mesh {
         1 => mod_reactor(&mut m),
         2 => mod_generator(&mut m),
         3 => mod_habitat(&mut m),
-        _ => mod_drill(&mut m),
+        4 => mod_drill(&mut m),
+        5 => mod_crew_capsule(&mut m),
+        _ => mod_service_module(&mut m),
     }
     m
 }
@@ -817,8 +868,9 @@ pub const ASTEROID_NAMES: &[&str] = &["Hebe", "Pallas", "Itokara", "Eron"];
 pub fn cargo_catalog() -> Mesh {
     let mut m = Mesh::default();
     let spacing = 4.0f32;
-    for i in 0..5usize {
-        let cx = (i as f32 - 2.0) * spacing;
+    let n = 7usize; // refinery, reactor, generator, habitat, drill, crew, service
+    for i in 0..n {
+        let cx = (i as f32 - (n as f32 - 1.0) * 0.5) * spacing;
         let cm = cargo_module(i);
         for v in &cm.verts {
             let p = Vec3::new(v.pos[0] + cx, v.pos[1], v.pos[2]);

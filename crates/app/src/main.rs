@@ -5488,6 +5488,36 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.rocket_dist = 15.0;
             0.0
         }
+        "crewcap" => {
+            // a rocket on the pad with the fairing open, revealing the crew capsule.
+            world.vab.payload = 10; // Crew Capsule
+            world.rebuild_vehicle();
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.fairing_open = 0.6;
+            let top = world.rocket_body.height;
+            world.rocket_az = 5.05;
+            world.rocket_el = 0.06;
+            world.rocket_focus_y = top - 7.0;
+            world.rocket_dist = 16.0;
+            0.0
+        }
+        "servicemod" => {
+            // a rocket on the pad with the fairing open, revealing the service module.
+            world.vab.payload = 11; // Service Module
+            world.rebuild_vehicle();
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.fairing_open = 0.6;
+            let top = world.rocket_body.height;
+            world.rocket_az = 5.05;
+            world.rocket_el = 0.06;
+            world.rocket_focus_y = top - 7.0;
+            world.rocket_dist = 16.0;
+            0.0
+        }
         "cargoparts" => {
             // the fairing-packed module catalog, unpacked in a row on the moon.
             world.view = View::Rocket;
@@ -5497,7 +5527,7 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.base_mesh = Some(rocket::cargo_catalog());
             world.rocket_az = 4.71;
             world.rocket_el = 0.14;
-            world.rocket_dist = 26.0;
+            world.rocket_dist = 34.0;
             world.rocket_focus_y = 2.6;
             0.0
         }
@@ -6431,6 +6461,10 @@ fn main() {
                 "ast_surf"
             } else if args.iter().any(|a| a == "cargoparts") {
                 "cargoparts"
+            } else if args.iter().any(|a| a == "crewcap") {
+                "crewcap"
+            } else if args.iter().any(|a| a == "servicemod") {
+                "servicemod"
             } else if args.iter().any(|a| a == "cargo") {
                 "cargo"
             } else if args.iter().any(|a| a == "delivery") {
