@@ -666,6 +666,58 @@ fn mod_service_module(m: &mut Mesh) {
     m.dome(0.0, 1.05, 2.4, 0.28, 0.12, 12, 2, BB_WHITE);
 }
 
+/// A recovery parachute canopy, built in the vehicle's local model space so the
+/// rocket's pose transform carries it. `attach_y` is the model-space height of
+/// the vehicle's top (where the risers attach); `open` is the inflation fraction
+/// 0..1 (the canopy grows and lifts as it fills). Drawn as a gored hemisphere on
+/// suspension lines down to the attach point.
+pub fn parachute_canopy(attach_y: f32, open: f32) -> Mesh {
+    let mut m = Mesh::default();
+    if open <= 0.02 {
+        return m;
+    }
+    let orange = [0.95, 0.45, 0.12];
+    let white = [0.92, 0.93, 0.96];
+    let line = [0.85, 0.86, 0.90];
+    let r = 1.0 + open * 6.5; // canopy radius as it inflates
+    let lift = 3.0 + open * 9.0; // gap between the vehicle top and the rim
+    let rim_y = attach_y + lift;
+    let bulge = r * 0.7; // canopy height (apex above the rim)
+    let segs = 18usize;
+    let rings = 4usize;
+    // Gored hemisphere: alternate panel colours for the classic parachute look.
+    for s in 0..segs {
+        let a0 = s as f32 / segs as f32 * TAU;
+        let a1 = (s + 1) as f32 / segs as f32 * TAU;
+        let col = if s % 2 == 0 { orange } else { white };
+        for ri in 0..rings {
+            // phi sweeps from the apex (0) to the rim (PI/2)
+            let p0 = ri as f32 / rings as f32 * std::f32::consts::FRAC_PI_2;
+            let p1 = (ri + 1) as f32 / rings as f32 * std::f32::consts::FRAC_PI_2;
+            let pt = |ph: f32, an: f32| {
+                Vec3::new(r * ph.sin() * an.cos(), rim_y + bulge * ph.cos(), r * ph.sin() * an.sin())
+            };
+            let v00 = pt(p0, a0);
+            let v01 = pt(p0, a1);
+            let v10 = pt(p1, a0);
+            let v11 = pt(p1, a1);
+            // outward-ish normals (radial from the canopy centre)
+            let c = Vec3::new(0.0, rim_y, 0.0);
+            let n = (0.25 * (v00 + v01 + v10 + v11) - c).normalize_or_zero();
+            m.tri(v00, v01, v11, n, col);
+            m.tri(v00, v11, v10, n, col);
+        }
+    }
+    // suspension lines from the rim down to the attach point
+    let att = Vec3::new(0.0, attach_y, 0.0);
+    for i in 0..12 {
+        let a = i as f32 / 12.0 * TAU;
+        let rim = Vec3::new(r * a.cos(), rim_y, r * a.sin());
+        m.strut(rim, att, 0.03, line);
+    }
+    m
+}
+
 /// A fairing-packed cargo module (index matches the `module` field in the
 /// payload catalog: 0 refinery, 1 reactor, 2 generator, 3 habitat, 4 drill,
 /// 5 crew capsule, 6 service module).

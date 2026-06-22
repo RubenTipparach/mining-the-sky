@@ -981,6 +981,83 @@ impl World {
         self.rocket_dist = 95.0;
     }
 
+    /// Test scene: a light crew capsule descending under a deployed parachute in
+    /// the lower atmosphere. Builds a throwaway light vehicle without disturbing
+    /// the player's VAB design.
+    fn setup_parachute(&mut self) {
+        self.view = View::Rocket;
+        let saved = self.vab.clone();
+        self.vab.stages = vec![crate::build::StageCfg::new(0, 0)]; // Sparrow + Small
+        self.vab.payload = 10; // Crew Capsule
+        self.ignite_launch();
+        self.vab = saved; // restore the player's design (rocket_body already built)
+        let radius = self.body.radius;
+        let up = self.launch_up;
+        if let Some(rk) = self.launch.as_mut() {
+            rk.throttle = 0.0;
+            for s in rk.stages.iter_mut() {
+                s.prop = 0.0; // spent: only dry structure + capsule (light)
+            }
+            rk.r = up * (radius + 3500.0);
+            rk.v = -up * 130.0; // falling
+            rk.pitch = 0.0;
+            rk.pitch_act = 0.0;
+            rk.deploy_chute();
+        }
+        for _ in 0..45 {
+            self.advance(0.1); // ~4.5 s: the canopy inflates and the fall slows
+        }
+        self.rocket_az = 4.2;
+        self.rocket_el = 0.16;
+        self.rocket_dist = 80.0;
+        self.rocket_focus_y = 8.0;
+    }
+
+    /// Test scene: a compact stage doing a powered (suicide-burn) descent to a
+    /// soft landing under the auto-descent autopilot.
+    fn setup_powered_descent(&mut self) {
+        self.view = View::Rocket;
+        let saved = self.vab.clone();
+        self.vab.stages = vec![crate::build::StageCfg::new(1, 0)]; // Merlin + Small
+        self.vab.payload = 10; // Crew Capsule
+        self.ignite_launch();
+        self.vab = saved;
+        let radius = self.body.radius;
+        let up = self.launch_up;
+        if let Some(rk) = self.launch.as_mut() {
+            rk.r = up * (radius + 1800.0);
+            rk.v = -up * 160.0; // falling
+            rk.pitch = 0.0;
+            rk.pitch_act = 0.0;
+            rk.auto_land = true; // engage the powered-descent autopilot
+        }
+        for _ in 0..30 {
+            self.advance(0.1); // ~3 s into the retro-burn
+        }
+        self.rocket_az = 4.2;
+        self.rocket_el = 0.10;
+        self.rocket_dist = 90.0;
+        self.rocket_focus_y = 12.0;
+    }
+
+    /// Test scene: stand a rocket on the pad carrying `payload`, fairing cracked
+    /// open so the payload module is visible. Used to inspect crew/service builds.
+    fn setup_payload_preview(&mut self, payload: usize) {
+        self.view = View::Rocket;
+        self.vab.payload = payload;
+        self.rebuild_vehicle();
+        self.vab_mode = false;
+        self.rolling_out = false;
+        self.rollout = 1.0;
+        self.launch = None; // resting on the pad, not flying
+        self.fairing_open = 0.6;
+        let top = self.rocket_body.height;
+        self.rocket_az = 5.05;
+        self.rocket_el = 0.06;
+        self.rocket_focus_y = top - 7.0;
+        self.rocket_dist = 16.0;
+    }
+
     /// Live LOD-debug stats for the HUD: the active planet LOD (patch counts per
     /// depth) selected from the current camera, plus the camera altitude (m) and
     /// the current rebuild-grid cell size (m). Planet rocket view only.
@@ -2580,6 +2657,18 @@ impl World {
             }
             for r in rb.stage_ranges.iter().skip(active) {
                 self.xform_into(&mut out, r.clone(), quat, base_local);
+            }
+            // recovery parachute: a separate canopy mesh posed above the nose,
+            // inflating with the rocket's chute fraction.
+            if let Some(rk) = self.launch.as_ref() {
+                if rk.chute > 0.02 {
+                    let canopy = rocket::parachute_canopy(rb.height, rk.chute as f32);
+                    for v in &canopy.verts {
+                        let local = base_local + (quat * Vec3::from(v.pos)).as_dvec3();
+                        let n = quat * Vec3::from(v.normal);
+                        out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: n.into(), color: v.color });
+                    }
+                }
             }
         }
 
@@ -5127,6 +5216,16 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.setup_reentry(2);
             0.0
         }
+        "parachute" => {
+            // a crew capsule descending under a deployed recovery parachute.
+            world.setup_parachute();
+            0.0
+        }
+        "poweredland" => {
+            // a compact stage doing a powered (suicide-burn) descent to landing.
+            world.setup_powered_descent();
+            0.0
+        }
         "sepfloat" => {
             // a couple of seconds after staging, zoomed in, so the spent booster
             // is visibly floating clear just below the climbing upper stage as the
@@ -6519,6 +6618,10 @@ fn main() {
                 "reentry_side"
             } else if args.iter().any(|a| a == "reentry") {
                 "reentry"
+            } else if args.iter().any(|a| a == "parachute") {
+                "parachute"
+            } else if args.iter().any(|a| a == "poweredland") {
+                "poweredland"
             } else if args.iter().any(|a| a == "sepfloat") {
                 "sepfloat"
             } else if args.iter().any(|a| a == "staging") {

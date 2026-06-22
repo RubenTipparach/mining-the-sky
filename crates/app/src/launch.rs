@@ -13,6 +13,12 @@ use sim::vehicle::{Vehicle, G0};
 const CDA: f64 = 6.0; // Cd * frontal area (m^2), matches the ascent model
 const CRASH_SPEED: f64 = 18.0; // m/s surface-relative impact tolerance
 
+// Recovery parachute. A deployed main canopy adds a large Cd*area so the vehicle
+// settles to a survivable terminal velocity in the lower atmosphere; it opens
+// over a couple of seconds (the canopy inflating) rather than instantly.
+const CDA_CHUTE: f64 = 600.0; // Cd*area of a fully open main canopy (m^2)
+const CHUTE_OPEN_RATE: f64 = 0.5; // open fraction per second (~2 s to full)
+
 // Attitude (pitch) response: the airframe steers toward the commanded pitch
 // like a thruster-controlled rigid body instead of snapping. `STEER_GAIN` turns
 // the angle error into a target rate (so it eases in near the command);
@@ -104,6 +110,17 @@ pub struct Rocket {
     /// Index of the active stage within the original stack (0 = first booster).
     pub stage_base: usize,
     pub stage_total: usize,
+    /// Recovery parachute open fraction, 0 (stowed) .. 1 (fully inflated). Adds a
+    /// large drag area when open and drives the drawn canopy.
+    pub chute: f64,
+    /// The parachute has been armed/deployed (it then inflates over a couple of
+    /// seconds toward `chute = 1`).
+    pub chute_armed: bool,
+    /// Set once a soft touchdown (impact under the crash tolerance) is achieved.
+    pub landed: bool,
+    /// Engage the powered-descent autopilot: point retrograde-up and throttle to
+    /// arrest the fall for a soft (suicide-burn) touchdown.
+    pub auto_land: bool,
     /// Flown ascent path (home-centred world metres), sampled as the rocket
     /// climbs. Drawn on the orbital map so the trajectory is visible during the
     /// sub-orbital ascent, before a predicted conic exists.
@@ -149,7 +166,47 @@ impl Rocket {
             just_staged: None,
             stage_base: 0,
             stage_total: veh.stages.len(),
+            chute: 0.0,
+            chute_armed: false,
+            landed: false,
+            auto_land: false,
             trail: vec![r],
+        }
+    }
+
+    /// Arm the recovery parachute; it then inflates over a couple of seconds.
+    pub fn deploy_chute(&mut self) {
+        self.chute_armed = true;
+    }
+
+    /// Powered-descent autopilot. Points the airframe up (so thrust opposes the
+    /// fall) and feathers the throttle on a suicide-burn law: the deceleration
+    /// needed to null the descent within the remaining altitude, plus gravity.
+    /// Runs only when descending in the lower atmosphere / near the ground.
+    fn auto_descent_control(&mut self, body: &CentralBody) {
+        let up = self.r.normalize_or_zero();
+        let alt = self.altitude(body).max(0.0);
+        let vspeed = -self.v.dot(up); // +ve = descending
+        // hold the airframe vertical so thrust fights gravity + the fall
+        self.pitch = 0.0;
+        let g = body.mu / self.r.length_squared();
+        let mass = self.mass();
+        let tmax = self
+            .active()
+            .map(|s| if s.prop > 0.0 { s.thrust } else { 0.0 })
+            .unwrap_or(0.0);
+        let tacc = if mass > 0.0 { tmax / mass } else { 0.0 };
+        if vspeed > 0.6 && tacc > 0.0 {
+            // decelerate to a stop ~6 m above the surface, then hold a soft sink
+            let stop_alt = (alt - 6.0).max(1.0);
+            let need = vspeed * vspeed / (2.0 * stop_alt);
+            self.throttle = ((need + g) / tacc).clamp(0.0, 1.0);
+        } else {
+            // settled / climbing: cut to a gentle hover-down
+            self.throttle = (g / tacc.max(1e-6) * 0.9).clamp(0.0, 1.0);
+            if alt < 2.0 {
+                self.throttle = 0.0;
+            }
         }
     }
 
@@ -235,7 +292,9 @@ impl Rocket {
         let vr = v_rel.length();
         let rho = body.density(rmag - body.radius);
         if vr > 1e-3 {
-            a += -0.5 * rho * vr * CDA / mass * v_rel;
+            // base airframe drag plus the deployed canopy's much larger area.
+            let cda = CDA + self.chute * CDA_CHUTE;
+            a += -0.5 * rho * vr * cda / mass * v_rel;
         }
         if thrust_n > 0.0 {
             a += tdir * (thrust_n / mass);
@@ -256,6 +315,15 @@ impl Rocket {
             // rotate the airframe toward the commanded pitch before reading the
             // thrust direction, so thrust follows the actual (lagging) attitude.
             self.slew_attitude(h);
+            // inflate the parachute once armed (the canopy fills over ~2 s).
+            if self.chute_armed && self.chute < 1.0 {
+                self.chute = (self.chute + CHUTE_OPEN_RATE * h).min(1.0);
+            }
+            // powered-descent autopilot drives throttle + attitude toward a soft
+            // landing (before the per-step attitude slew + thrust are read).
+            if self.auto_land && !self.landed {
+                self.auto_descent_control(body);
+            }
             let mass = self.mass();
             let thrust_n = self.live_thrust();
             let tdir = self.point_dir();
@@ -287,7 +355,10 @@ impl Rocket {
                     self.v = DVec3::ZERO;
                     return;
                 }
-                self.v = DVec3::ZERO; // pinned to the pad before liftoff
+                if self.met > 1.0 {
+                    self.landed = true; // a touchdown under the crash tolerance
+                }
+                self.v = DVec3::ZERO; // pinned to the pad / resting on the ground
             }
 
             // aerodynamic heating: glow tracks the flux; burn-through past the
@@ -558,5 +629,54 @@ mod tests {
             rk.pitch_act.to_degrees(),
             rk.pitch.to_degrees()
         );
+    }
+
+    #[test]
+    fn parachute_gives_a_survivable_descent() {
+        // A heavy capsule dropped without a chute slams in; with the canopy it
+        // settles to a soft touchdown (impact under the crash tolerance).
+        let body = CentralBody::home();
+        let veh = sim::vehicle::Vehicle {
+            name: "capsule",
+            stages: vec![sim::vehicle::Stage { name: "c", dry: 2000.0, prop: 0.0, thrust: 0.0, isp: 1.0 }],
+            payload: 3200.0,
+        };
+        let up = DVec3::new(1.0, 0.0, 0.0);
+        let heading = DVec3::Y.cross(up).normalize();
+        let mut rk = Rocket::on_pad(&veh, up * (body.radius + 1500.0), -up * 120.0, up, heading);
+        rk.met = 5.0; // past the pad-abort guard
+        rk.deploy_chute();
+        // terminal velocity under the canopy is ~12 m/s, so the descent is slow.
+        for _ in 0..3000 {
+            rk.integrate(&body, 0.1);
+            if rk.landed || rk.crashed {
+                break;
+            }
+        }
+        assert!(rk.landed && !rk.crashed, "capsule did not land softly under chute");
+        assert!(rk.chute > 0.9, "canopy did not fully inflate: {:.2}", rk.chute);
+    }
+
+    #[test]
+    fn powered_descent_lands_softly() {
+        // The auto-descent autopilot brings a falling stage down without crashing.
+        let body = CentralBody::home();
+        let veh = sim::vehicle::Vehicle {
+            name: "lander",
+            stages: vec![sim::vehicle::Stage { name: "m", dry: 6000.0, prop: 12000.0, thrust: 3.8e6, isp: 300.0 }],
+            payload: 3200.0,
+        };
+        let up = DVec3::new(1.0, 0.0, 0.0);
+        let heading = DVec3::Y.cross(up).normalize();
+        let mut rk = Rocket::on_pad(&veh, up * (body.radius + 2500.0), -up * 140.0, up, heading);
+        rk.met = 5.0;
+        rk.auto_land = true;
+        for _ in 0..1500 {
+            rk.integrate(&body, 0.1);
+            if rk.landed || rk.crashed {
+                break;
+            }
+        }
+        assert!(rk.landed && !rk.crashed, "powered descent did not land softly");
     }
 }

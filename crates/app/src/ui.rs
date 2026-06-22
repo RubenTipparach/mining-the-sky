@@ -54,6 +54,9 @@ fn test_menu(ctx: &egui::Context, world: &mut World) {
     enum T {
         Renderer(bool),
         Reentry(u8),
+        Parachute,
+        Powered,
+        Payload(usize),
     }
     let mut act: Option<T> = None;
     let mesh = world.plasma_mesh_mode;
@@ -61,11 +64,10 @@ fn test_menu(ctx: &egui::Context, world: &mut World) {
     egui::Window::new("TEST SCENES")
         .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 12.0))
         .default_open(false)
-        .default_width(210.0)
+        .default_width(220.0)
         .resizable(false)
         .show(ctx, |ui| {
-            ui.label(egui::RichText::new("RE-ENTRY PLASMA").color(DIM));
-            ui.label("Enter a re-entry test:");
+            ui.label(egui::RichText::new("RE-ENTRY").color(DIM));
             ui.horizontal(|ui| {
                 if ui.button("Axial").clicked() {
                     act = Some(T::Reentry(0));
@@ -78,7 +80,27 @@ fn test_menu(ctx: &egui::Context, world: &mut World) {
                 }
             });
             ui.separator();
-            ui.label("Plasma renderer:");
+            ui.label(egui::RichText::new("DESCENT").color(DIM));
+            ui.horizontal(|ui| {
+                if ui.button("Parachute").clicked() {
+                    act = Some(T::Parachute);
+                }
+                if ui.button("Powered").clicked() {
+                    act = Some(T::Powered);
+                }
+            });
+            ui.separator();
+            ui.label(egui::RichText::new("PAYLOAD PREVIEW").color(DIM));
+            ui.horizontal(|ui| {
+                if ui.button("Crew Capsule").clicked() {
+                    act = Some(T::Payload(10));
+                }
+                if ui.button("Service Module").clicked() {
+                    act = Some(T::Payload(11));
+                }
+            });
+            ui.separator();
+            ui.label(egui::RichText::new("RE-ENTRY PLASMA RENDERER").color(DIM));
             ui.horizontal(|ui| {
                 if ui.selectable_label(!mesh, "Raymarch").clicked() {
                     act = Some(T::Renderer(false));
@@ -92,6 +114,9 @@ fn test_menu(ctx: &egui::Context, world: &mut World) {
     match act {
         Some(T::Renderer(m)) => world.plasma_mesh_mode = m,
         Some(T::Reentry(k)) => world.setup_reentry(k),
+        Some(T::Parachute) => world.setup_parachute(),
+        Some(T::Powered) => world.setup_powered_descent(),
+        Some(T::Payload(p)) => world.setup_payload_preview(p),
         None => {}
     }
 }
