@@ -90,6 +90,7 @@ pub struct Tel {
     pub heat: f32,
 }
 
+#[derive(Clone)]
 pub struct Rocket {
     pub r: DVec3,
     pub v: DVec3,

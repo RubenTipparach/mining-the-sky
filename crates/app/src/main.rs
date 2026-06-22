@@ -28,6 +28,7 @@ mod flight;
 mod launch;
 mod mission;
 mod rocket;
+mod sim_thread;
 mod terrain_job;
 mod ui;
 mod universe;
@@ -644,6 +645,19 @@ struct World {
     focus_rocket: bool,
     /// egui body-browser search text.
     ui_search: String,
+
+    /// Dedicated physics thread that owns and integrates the player launch on its
+    /// own wall-clock, separate from rendering (live native game only). When set,
+    /// `launch` is a render-side snapshot mirror: control inputs are forwarded to
+    /// the thread and the authoritative state is read back each frame. `None` in
+    /// tests / headless `shot` / `ascentcsv` and on wasm, where the launch is
+    /// integrated inline and synchronously so those paths stay deterministic.
+    sim: Option<sim_thread::SimThread>,
+    /// True while the dedicated thread is actively flying the player launch. The
+    /// frozen / hand-placed test scenes (re-entry, parachute, powered descent)
+    /// hand-place state and integrate synchronously, so they detach the thread
+    /// (clear this) and run inline; a normal ignition re-arms it.
+    sim_drives_launch: bool,
 }
 
 impl World {
@@ -765,6 +779,8 @@ impl World {
             focus: 0,
             focus_rocket: false,
             ui_search: String::new(),
+            sim: None,
+            sim_drives_launch: false,
         };
         // Generate the full Kepler-47 system; the landable moon is injected as
         // home's first moon so the map and the flight sim agree.
@@ -783,6 +799,45 @@ impl World {
         w.focus_rocket = true;
         w.apply_focus();
         w
+    }
+
+    /// Spin up the dedicated physics thread and route the player launch through
+    /// it. Called only for the live native game (the windowed run): tests,
+    /// headless `shot` / `ascentcsv` and wasm leave `sim` as `None` and integrate
+    /// the launch inline + synchronously so they stay deterministic.
+    fn enable_threaded_sim(&mut self) {
+        self.sim = Some(sim_thread::SimThread::spawn());
+    }
+
+    /// Release the dedicated thread from the current launch and integrate inline
+    /// instead. Used by the hand-placed / frozen test scenes, which set state
+    /// directly and step synchronously.
+    fn detach_sim_launch(&mut self) {
+        if let Some(sim) = self.sim.as_ref() {
+            sim.stop();
+        }
+        self.sim_drives_launch = false;
+    }
+
+    /// Whether the dedicated thread should be driving the launch this frame.
+    fn sim_thread_active(&self) -> bool {
+        self.sim.is_some() && self.sim_drives_launch
+    }
+
+    /// Snapshot the render-side control inputs to hand to the sim thread.
+    fn launch_controls(&self, rk: &launch::Rocket) -> sim_thread::Controls {
+        sim_thread::Controls {
+            throttle: rk.throttle,
+            pitch: rk.pitch,
+            yaw: rk.yaw,
+            roll: rk.roll,
+            attitude_hold: rk.attitude_hold,
+            auto_land: rk.auto_land,
+            chute_armed: rk.chute_armed,
+            frozen: self.reentry_test,
+            test_heat: (self.test_friction * 1.4) as f64,
+            warp: self.warp,
+        }
     }
 
     /// The currently focused body.
@@ -912,6 +967,8 @@ impl World {
     fn setup_reentry(&mut self, kind: u8) {
         self.view = View::Rocket;
         self.ignite_launch();
+        // Hand-placed, frozen scene: integrate inline, not on the thread.
+        self.detach_sim_launch();
         let radius = self.body.radius;
         let up = self.launch_up;
         let east = self.launch_east;
@@ -969,6 +1026,8 @@ impl World {
         self.vab.payload = 10; // Crew Capsule
         self.ignite_launch();
         self.vab = saved; // restore the player's design (rocket_body already built)
+        // Hand-placed descent scene: integrate inline, not on the thread.
+        self.detach_sim_launch();
         let radius = self.body.radius;
         let up = self.launch_up;
         if let Some(rk) = self.launch.as_mut() {
@@ -1001,6 +1060,8 @@ impl World {
         self.vab.payload = 10; // Crew Capsule
         self.ignite_launch();
         self.vab = saved;
+        // Hand-placed descent scene: integrate inline, not on the thread.
+        self.detach_sim_launch();
         let radius = self.body.radius;
         let up = self.launch_up;
         if let Some(rk) = self.launch.as_mut() {
@@ -1663,7 +1724,33 @@ impl World {
         // player-controlled launch + any tumbling spent booster
         let frozen = self.reentry_test;
         let test_heat = (self.test_friction * 1.4) as f64; // slider -> glow level
-        if let Some(rk) = self.launch.as_mut() {
+        if self.sim_thread_active() {
+            // Threaded: the dedicated physics thread owns and integrates the
+            // rocket on its own wall-clock. Forward the current control inputs,
+            // then adopt the latest authoritative snapshot as our render-side
+            // mirror - keeping the player-owned control fields so an input made
+            // this frame is not clobbered by a slightly older snapshot.
+            let sim = self.sim.as_ref().unwrap();
+            if let Some(rk) = self.launch.as_ref() {
+                sim.set_controls(self.launch_controls(rk));
+            }
+            if let Some(snap) = sim.try_snapshot() {
+                if let Some(old) = self.launch.as_ref() {
+                    let mut s = snap;
+                    s.throttle = old.throttle;
+                    s.pitch = old.pitch;
+                    s.yaw = old.yaw;
+                    s.roll = old.roll;
+                    s.attitude_hold = old.attitude_hold;
+                    s.auto_land = old.auto_land;
+                    s.chute_armed = old.chute_armed;
+                    self.launch = Some(s);
+                }
+                // launch == None means we just reset; ignore stale snapshots.
+            }
+        } else if let Some(rk) = self.launch.as_mut() {
+            // Inline (tests / headless / wasm): integrate synchronously so these
+            // paths stay deterministic.
             rk.just_staged = None;
             if frozen {
                 // Frozen plasma test: hold the vehicle in place so the FX play
@@ -2300,6 +2387,12 @@ impl World {
         let v = DVec3::ZERO;
         let mut rk = launch::Rocket::on_pad(&veh, r, v, self.launch_up, self.launch_east);
         rk.throttle = 1.0;
+        // Hand the authoritative rocket to the dedicated physics thread (live
+        // game); the inline path keeps integrating `self.launch` directly.
+        if let Some(sim) = self.sim.as_ref() {
+            sim.start(&rk, self.body);
+            self.sim_drives_launch = true;
+        }
         self.launch = Some(rk);
         self.sep = None;
         self.debris.clear();
@@ -2344,7 +2437,13 @@ impl World {
         // A small, lateral nudge so the spent stage clears the climbing upper
         // stage's nozzle instead of overlapping it.
         let side = pd_local.cross(Vec3::Y).normalize_or_zero();
-        self.launch.as_mut().unwrap().jettison();
+        // Jettison on the authoritative side: the sim thread when it is flying
+        // the launch (the snapshot brings the staged state back), else inline.
+        if self.sim_thread_active() {
+            self.sim.as_ref().unwrap().stage();
+        } else {
+            self.launch.as_mut().unwrap().jettison();
+        }
         self.sep = Some(SepBooster {
             pos: base_local,
             // Springs/retro-rockets give just a few m/s of separation: a soft
@@ -2369,6 +2468,7 @@ impl World {
     }
 
     fn reset_launch(&mut self) {
+        self.detach_sim_launch();
         self.launch = None;
         self.sep = None;
         self.debris.clear();
@@ -4243,7 +4343,13 @@ impl State {
             config,
             depth_view,
             gpu,
-            world: World::new(),
+            world: {
+                // Live game: run the launch physics on its own dedicated thread,
+                // decoupled from the render frame rate.
+                let mut w = World::new();
+                w.enable_threaded_sim();
+                w
+            },
             start: instant_now::Instant::now(),
             last_t: 0.0,
             dragging: false,

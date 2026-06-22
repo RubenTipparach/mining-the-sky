@@ -2,6 +2,7 @@
 
 use std::f64::consts::PI;
 
+#[derive(Clone, Copy)]
 pub struct CentralBody {
     /// Standard gravitational parameter GM (m^3/s^2).
     pub mu: f64,
