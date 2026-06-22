@@ -32,19 +32,29 @@ pub struct Payload {
     pub module: i32,
 }
 
+// Thrust / Isp / mass are modelled on real engines (sea-level thrust for the
+// boosters, vacuum for the upper-stage engines). A single slot is treated as one
+// engine, so cluster with radial boosters for more liftoff thrust the way real
+// vehicles do.
 pub const ENGINES: &[Engine] = &[
-    Engine { name: "Sparrow", thrust: 0.95e6, isp: 315.0, mass: 1200.0, vac: false },
-    Engine { name: "Merlin", thrust: 3.8e6, isp: 300.0, mass: 6000.0, vac: false },
-    Engine { name: "Titan-9", thrust: 6.0e6, isp: 295.0, mass: 16000.0, vac: false },
-    Engine { name: "Vac-1", thrust: 1.1e6, isp: 345.0, mass: 2500.0, vac: true },
-    Engine { name: "Vac-3", thrust: 2.6e6, isp: 350.0, mass: 4200.0, vac: true },
+    // Merlin 1D class - small sea-level kerolox.
+    Engine { name: "Merlin-1D", thrust: 0.845e6, isp: 282.0, mass: 490.0, vac: false },
+    // Aerojet LR-87 (Titan core), dual-chamber hypergolic - medium sea-level.
+    Engine { name: "LR-87", thrust: 2.31e6, isp: 300.0, mass: 1_520.0, vac: false },
+    // Rocketdyne F-1 (Saturn V) - the most powerful single-chamber engine flown.
+    Engine { name: "F-1", thrust: 6.77e6, isp: 265.0, mass: 8_440.0, vac: false },
+    // RL-10 class - small high-Isp vacuum upper stage (hydrolox).
+    Engine { name: "RL-10", thrust: 0.11e6, isp: 450.0, mass: 280.0, vac: true },
+    // Merlin Vacuum class - medium vacuum upper stage.
+    Engine { name: "Merlin-Vac", thrust: 0.981e6, isp: 348.0, mass: 490.0, vac: true },
 ];
 
+// Propellant tanks, ~6% dry-mass fraction (realistic for kerolox stages).
 pub const TANKS: &[Tank] = &[
-    Tank { name: "Small", prop: 18_000.0, dry: 1_400.0 },
-    Tank { name: "Medium", prop: 70_000.0, dry: 4_800.0 },
-    Tank { name: "Large", prop: 200_000.0, dry: 13_000.0 },
-    Tank { name: "X-Large", prop: 380_000.0, dry: 24_000.0 },
+    Tank { name: "Small", prop: 18_000.0, dry: 1_200.0 },
+    Tank { name: "Medium", prop: 70_000.0, dry: 4_200.0 },
+    Tank { name: "Large", prop: 200_000.0, dry: 12_000.0 },
+    Tank { name: "X-Large", prop: 400_000.0, dry: 24_000.0 },
 ];
 
 /// A radial strap-on booster: a self-contained motor + propellant clustered
@@ -63,9 +73,12 @@ pub struct Booster {
 }
 
 pub const BOOSTERS: &[Booster] = &[
-    Booster { name: "SRB-Lite", thrust: 3.6e6, prop: 70_000.0, dry: 6_000.0, isp: 250.0, solid: true },
-    Booster { name: "SRB-Heavy", thrust: 8.5e6, prop: 200_000.0, dry: 16_000.0, isp: 262.0, solid: true },
-    Booster { name: "LqStrap", thrust: 4.2e6, prop: 120_000.0, dry: 7_000.0, isp: 295.0, solid: false },
+    // GEM-63 class small solid.
+    Booster { name: "GEM-63", thrust: 1.9e6, prop: 44_000.0, dry: 5_000.0, isp: 245.0, solid: true },
+    // Shuttle-SRB class large solid.
+    Booster { name: "SRB", thrust: 6.0e6, prop: 290_000.0, dry: 30_000.0, isp: 268.0, solid: true },
+    // Liquid strap-on (Atlas-booster class).
+    Booster { name: "Liquid Strap-on", thrust: 1.0e6, prop: 40_000.0, dry: 3_500.0, isp: 300.0, solid: false },
 ];
 
 /// Max radial boosters per stage (kept even-ish around the core).
@@ -116,17 +129,16 @@ pub struct Vab {
 }
 
 impl Vab {
-    /// A sensible default two-stage launcher, tuned to a realistic ascent: it
-    /// lifts off at TWR ~1.3 (a gentle ~1.2 g, like a Saturn V's ~1.2) and the
-    /// first stage burns for ~180 s, the felt acceleration ramping up through the
-    /// burn as propellant drains - rather than leaping off the pad.
+    /// A sensible default two-stage launcher with realistic parts: an F-1 first
+    /// stage on a big tank (lifts off at ~1.35 g, like a real booster) and a
+    /// Merlin-Vac upper stage, carrying a 5 t station module.
     pub fn default_build() -> Vab {
         Vab {
             stages: vec![
-                StageCfg::new(2, 3), // Titan-9 + X-Large tank (heavy, gentle liftoff)
-                StageCfg::new(3, 1), // Vac-1 + Medium upper
+                StageCfg::new(2, 3), // F-1 + X-Large tank (Saturn-V-class first stage)
+                StageCfg::new(4, 1), // Merlin-Vac + Medium upper
             ],
-            payload: 1, // ComSat
+            payload: 2, // Station Module (5 t)
         }
     }
 

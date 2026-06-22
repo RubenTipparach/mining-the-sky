@@ -6232,7 +6232,7 @@ fn main() {
             let mut t = 0.0f64;
             for _ in 0..4000 {
                 // open-loop gravity turn: hold vertical ~12 s then ease over.
-                rk.pitch = (((rk.met - 12.0) / 150.0).clamp(0.0, 1.0) * 80f64.to_radians()).min(1.45);
+                rk.pitch = (((rk.met - 11.0) / 145.0).clamp(0.0, 1.0) * 80f64.to_radians()).min(1.45);
                 if rk.prop_frac() <= 0.0 && rk.stages.len() > 1 {
                     rk.jettison();
                 }

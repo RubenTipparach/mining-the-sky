@@ -322,6 +322,64 @@ fn vehicle_panel(ctx: &egui::Context, world: &mut World) {
             if ui.button("+ stage").clicked() {
                 act = Some(Act::Add);
             }
+            ui.separator();
+            let veh = vab.to_vehicle();
+            let mass_t = veh.liftoff_mass() / 1000.0;
+            let twr = veh.stages[0].thrust / (veh.liftoff_mass() * g);
+            let total_dv: f64 =
+                (0..veh.stages.len()).map(|i| veh.stages[i].dv(veh.mass_above(i))).sum();
+            egui::Grid::new("vab_stats").num_columns(2).show(ui, |ui| {
+                kv(ui, "Liftoff mass", &format!("{mass_t:.0} t"));
+                kv(ui, "Total delta-v", &format!("{total_dv:.0} m/s"));
+                kv(ui, "Payload", &format!("{:.0} kg", vab.payload().mass));
+            });
+            // Liftoff thrust-to-weight gauge - the headline "will it fly" number.
+            // Green ~1.15-2.2 (real launchers sit ~1.2-1.5); red < 1 won't lift.
+            let twr_col = if twr < 1.0 {
+                WARN
+            } else if twr < 1.15 || twr > 2.2 {
+                AMBER
+            } else {
+                GOOD
+            };
+            ui.label(egui::RichText::new("Liftoff thrust-to-weight").color(DIM));
+            ui.add(
+                egui::ProgressBar::new((twr as f32 / 2.5).clamp(0.0, 1.0))
+                    .fill(twr_col)
+                    .desired_height(16.0)
+                    .text(format!("{twr:.2}  (need > 1.0)")),
+            );
+            if twr < 1.0 {
+                ui.label(egui::RichText::new("won't lift off - add boosters or drop tankage").color(WARN));
+            } else if twr > 2.5 {
+                ui.label(egui::RichText::new("very punchy liftoff (high g)").color(AMBER));
+            }
+            // Per-stage TWR: ignition vs burnout. Burnout TWR ~ the peak g that
+            // stage pulls at full throttle (thrust stays put as the tank empties),
+            // so it flags where you'll need to throttle back for the crew.
+            egui::CollapsingHeader::new("Per-stage TWR / peak g").default_open(true).show(ui, |ui| {
+                egui::Grid::new("stage_twr").num_columns(3).striped(true).show(ui, |ui| {
+                    ui.label(egui::RichText::new("stage").color(DIM));
+                    ui.label(egui::RichText::new("ignition").color(DIM));
+                    ui.label(egui::RichText::new("burnout (peak g)").color(DIM));
+                    ui.end_row();
+                    let ns = veh.stages.len();
+                    for i in 0..ns {
+                        let st = &veh.stages[i];
+                        let above = veh.mass_above(i); // everything stacked above this stage
+                        let m0 = (st.dry + st.prop + above).max(1.0); // ignition (full)
+                        let mb = (st.dry + above).max(1.0); // burnout (tank empty)
+                        let ti = st.thrust / (m0 * g);
+                        let tb = st.thrust / (mb * g);
+                        let cb = if tb > 4.0 { AMBER } else { GOOD };
+                        ui.label(format!("S{}", i + 1));
+                        ui.label(format!("{ti:.2}"));
+                        ui.label(egui::RichText::new(format!("{tb:.1} g")).color(cb));
+                        ui.end_row();
+                    }
+                });
+                ui.label(egui::RichText::new("upper stages fire in vacuum (TWR < 1 is fine)").color(DIM));
+            });
 
             ui.separator();
             // ---- parts palette: draggable chips ----
@@ -344,23 +402,6 @@ fn vehicle_panel(ctx: &egui::Context, world: &mut World) {
                 drag_chip(ui, egui::Id::new(("pl", k)), Drag::Payload(k), build::PAYLOADS[k].name, AMBER);
             });
 
-            ui.separator();
-            let veh = vab.to_vehicle();
-            let mass_t = veh.liftoff_mass() / 1000.0;
-            let twr = veh.stages[0].thrust / (veh.liftoff_mass() * g);
-            let total_dv: f64 =
-                (0..veh.stages.len()).map(|i| veh.stages[i].dv(veh.mass_above(i))).sum();
-            egui::Grid::new("vab_stats").num_columns(2).show(ui, |ui| {
-                kv(ui, "Liftoff mass", &format!("{mass_t:.0} t"));
-                ui.label(egui::RichText::new("Liftoff TWR").color(DIM));
-                ui.label(egui::RichText::new(format!("{twr:.2}")).color(if twr < 1.0 { WARN } else { GOOD }));
-                ui.end_row();
-                kv(ui, "Total delta-v", &format!("{total_dv:.0} m/s"));
-                kv(ui, "Payload", &format!("{:.0} kg", vab.payload().mass));
-            });
-            if twr < 1.0 {
-                ui.label(egui::RichText::new("TWR < 1: add engines or drop tankage").color(WARN));
-            }
 
             ui.separator();
             let btn = egui::Button::new(

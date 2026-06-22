@@ -18,16 +18,16 @@ pub struct CentralBody {
 }
 
 impl CentralBody {
-    /// Fictionalized home world: ~Earth radius, surface gravity ~9.2 m/s^2.
+    /// Fictionalized home world: ~Earth radius and Earth-standard gravity.
     pub fn home() -> Self {
         let radius = 6.2e6;
-        let surface_g = 9.2;
+        let surface_g = 9.81; // Earth-standard surface gravity
         CentralBody {
             mu: surface_g * radius * radius,
             radius,
             day_seconds: 24.0 * 3600.0,
             scale_height: 8500.0,
-            sea_density: 1.2,
+            sea_density: 1.225, // Earth sea-level air density (kg/m^3)
             atmo_top: 100_000.0,
         }
     }
