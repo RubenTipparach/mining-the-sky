@@ -505,9 +505,20 @@ impl Rocket {
         if self.crashed || dt_sim <= 0.0 {
             return;
         }
-        let h = 0.05f64;
-        let steps = ((dt_sim / h).ceil() as i64).clamp(1, 2000);
-        for _ in 0..steps {
+        // Sub-step at a fixed cap (0.05 s) for integration accuracy, but advance
+        // EXACTLY `dt_sim` total (the last sub-step is partial) so mission time
+        // tracks wall-clock regardless of frame rate. (Rounding sub-steps up to a
+        // fixed 0.05 s made MET run fast at high frame rates.)
+        let h_max = 0.05f64;
+        let mut remaining = dt_sim;
+        let mut guard = 0i32;
+        while remaining > 1e-9 {
+            guard += 1;
+            if guard > 4000 {
+                break;
+            }
+            let h = remaining.min(h_max);
+            remaining -= h;
             self.met += h;
             // step the rigid-body attitude (control torque + aero + roll damping)
             // before reading the thrust direction, so thrust follows the nose.
