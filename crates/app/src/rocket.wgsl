@@ -218,6 +218,14 @@ fn fs(in: VsOut) -> FsOut {
         lit = lit + in.color * u.light_col[i].rgb * (max(dot(n, ld), 0.0) * atten);
     }
 
+    // Emissive surfaces: a colour pushed well above 1.0 (lit windows, street
+    // lamps, work lights) reads as self-illuminated, so it glows at dusk and on
+    // shadowed faces instead of being darkened by the lighting. Keyed on summed
+    // brightness so ordinary albedo (which stays under ~1 each) is untouched.
+    let lum = in.color.r + in.color.g + in.color.b;
+    let emis = smoothstep(2.3, 3.1, lum);
+    lit = mix(lit, in.color, emis * 0.9);
+
     // aerial perspective: fade toward horizon haze with view distance.
     let dist = in.flogz - 1.0; // = view-space distance (clip.w)
     let fog = 1.0 - exp(-dist * u.fog.w);

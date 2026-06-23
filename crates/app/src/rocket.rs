@@ -1178,22 +1178,26 @@ fn road_seg(m: &mut Mesh, a: Vec3, b: Vec3, half_w: f32, curbs: bool) {
     }
 }
 
-/// An L-shaped access road from `a` to `b` (along X first, then Z), so a road
-/// visibly runs from the launch complex out to the city.
-pub fn road_l(a: Vec3, b: Vec3, half_w: f32) -> Mesh {
+/// An L-shaped road from `a` to `b` (along X first, then Z), so a road visibly
+/// runs between two points. `curbs` adds light shoulders (kept off for the long
+/// inter-city links to keep their vertex count down).
+pub fn road_l(a: Vec3, b: Vec3, half_w: f32, curbs: bool) -> Mesh {
     let mut m = Mesh::default();
     let corner = Vec3::new(b.x, 0.0, a.z);
-    road_seg(&mut m, Vec3::new(a.x, 0.0, a.z), corner, half_w, true);
-    road_seg(&mut m, corner, Vec3::new(b.x, 0.0, b.z), half_w, true);
+    road_seg(&mut m, Vec3::new(a.x, 0.0, a.z), corner, half_w, curbs);
+    road_seg(&mut m, corner, Vec3::new(b.x, 0.0, b.z), half_w, curbs);
     m
 }
 
 /// A procedural downtown: a street grid of blocks, each packed with a few
-/// buildings of varying height and colour, taller toward the centre, on a paved
-/// ground plane. Centred at `center` (local metres, ground at y=0). Fully
-/// deterministic so it meshes the same every frame.
-pub fn city(center: Vec3) -> Mesh {
+/// buildings of varying height and colour, taller toward the centre, with lit
+/// windows that glow, on a paved ground plane. Centred at `center` (local metres,
+/// ground at y=0). `variant` reseeds the layout so different cities look
+/// distinct. Fully deterministic so it meshes the same every frame.
+pub fn city(center: Vec3, variant: u32) -> Mesh {
     let mut m = Mesh::default();
+    let seed = variant as i32 * 1009;
+    let h = |a: i32, b: i32| hash01(a + seed, b - seed);
     let nx = 7i32;
     let nz = 7i32;
     let block = 46.0f32; // block footprint (X and Z)
@@ -1234,6 +1238,10 @@ pub fn city(center: Vec3) -> Mesh {
         [0.66, 0.62, 0.55],
     ];
     let roof = [0.30, 0.30, 0.33];
+    // emissive window glow (warm office light / cool fluorescent): summed > ~3.1
+    // so the surface shader reads it as self-illuminated and it glows.
+    let warm = [1.8, 1.45, 0.85];
+    let cool = [0.95, 1.15, 1.7];
 
     for ix in 0..nx {
         for iz in 0..nz {
@@ -1244,17 +1252,17 @@ pub fn city(center: Vec3) -> Mesh {
             let dz = (iz as f32 - (nz as f32 - 1.0) * 0.5) / (nz as f32 * 0.5);
             let central = (1.0 - (dx * dx + dz * dz).sqrt()).clamp(0.0, 1.0);
             // 1..4 buildings per block, laid in a 2x2 sub-grid.
-            let count = 1 + (hash01(ix, iz) * 3.99) as i32;
+            let count = 1 + (h(ix, iz) * 3.99) as i32;
             for k in 0..count {
                 let sx = if k % 2 == 0 { -1.0 } else { 1.0 };
                 let sz = if k < 2 { -1.0 } else { 1.0 };
-                let h1 = hash01(ix * 31 + k, iz * 17 + 7);
-                let h2 = hash01(ix * 13 + 5, iz * 29 + k);
+                let h1 = h(ix * 31 + k, iz * 17 + 7);
+                let h2 = h(ix * 13 + 5, iz * 29 + k);
                 let fw = block * 0.21 * (0.7 + 0.3 * h1);
                 let fd = block * 0.21 * (0.7 + 0.3 * h2);
                 // height: low at the rim (8 m) climbing to ~70 m downtown.
                 let height = 8.0 + central * (16.0 + 60.0 * h1) + (1.0 - central) * 10.0 * h2;
-                let col = pal[((hash01(ix + k, iz) * pal.len() as f32) as usize).min(pal.len() - 1)];
+                let col = pal[((h(ix + k, iz) * pal.len() as f32) as usize).min(pal.len() - 1)];
                 let cx = bx0 + sx * block * 0.25;
                 let cz = bz0 + sz * block * 0.25;
                 m.bx(Vec3::new(cx, height * 0.5, cz), Vec3::new(fw, height * 0.5, fd), col);
@@ -1262,6 +1270,29 @@ pub fn city(center: Vec3) -> Mesh {
                 m.bx(Vec3::new(cx, height + 0.5, cz), Vec3::new(fw * 0.96, 0.5, fd * 0.96), roof);
                 if h2 > 0.5 {
                     m.bx(Vec3::new(cx + fw * 0.3, height + 1.6, cz - fd * 0.3), Vec3::new(fw * 0.25, 1.1, fd * 0.25), roof);
+                }
+
+                // lit windows: most (not all) buildings glow, as thin emissive
+                // bands scattered up the four faces, so the city reads as an
+                // occupied, lit skyline. Each band is a slim bright box proud of a
+                // face. Kept lean (capped bands, gated buildings) for the vertex
+                // budget since several blocks of these add up fast.
+                if h(ix * 3 + k, iz * 9 + 1) > 0.32 {
+                    let win = if h(ix * 7 + k, iz * 5 + 3) > 0.5 { warm } else { cool };
+                    let bands = ((height / 7.0) as i32).clamp(1, 6);
+                    for bnd in 0..bands {
+                        if h(ix * 53 + k * 7 + bnd, iz * 37 + bnd * 3) < 0.45 {
+                            continue; // scatter: skip ~45% of bands
+                        }
+                        let wy = 3.0 + bnd as f32 * 7.0;
+                        if wy > height - 1.5 {
+                            break;
+                        }
+                        m.bx(Vec3::new(cx + fw, wy, cz), Vec3::new(0.06, 0.9, fd * 0.82), win);
+                        m.bx(Vec3::new(cx - fw, wy, cz), Vec3::new(0.06, 0.9, fd * 0.82), win);
+                        m.bx(Vec3::new(cx, wy, cz + fd), Vec3::new(fw * 0.82, 0.9, 0.06), win);
+                        m.bx(Vec3::new(cx, wy, cz - fd), Vec3::new(fw * 0.82, 0.9, 0.06), win);
+                    }
                 }
             }
         }

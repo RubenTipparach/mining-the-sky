@@ -138,7 +138,7 @@ const HUD_CAP: u64 = 40000;
 const FX_CAP: u64 = 60000;
 /// Dynamic rocket-view geometry (pad + rocket + spent booster, or a surface
 /// mesh: moon base / cargo module / a full procedural asteroid ~66k verts).
-const DYN_MESH_CAP: u64 = 200_000;
+const DYN_MESH_CAP: u64 = 320_000;
 /// Procedural re-entry plasma glow mesh (prototype mesh approach): an isosurface
 /// shell hugging the vehicle SDF (surface nets), so it can run to tens of
 /// thousands of verts on a boostered stack.
@@ -181,8 +181,41 @@ const HANGAR_POS: Vec3 = Vec3::new(-5000.0, 0.0, 0.0);
 const RACK_POS: Vec3 = Vec3::new(-5000.0, 0.0, 42.0);
 
 /// A small city out past the launch complex (local metres, east + north of the
-/// pad), with an access road running to it; you can drive the car over.
+/// pad), with an access road running to it; you can drive the car over. This is
+/// the main downtown, city 0 of `CITIES`.
 const CITY_CENTER: Vec3 = Vec3::new(1600.0, 0.0, 1800.0);
+
+/// The drivable cities (local launch-tangent metres, ground at y=0) and their
+/// layout variant. City 0 is the main downtown by the pad; the others are spread
+/// across the flats, all linked by the road network. Spaced several km apart so
+/// only the one you are in renders / simulates at a time.
+const CITIES: [(Vec3, u32); 4] = [
+    (CITY_CENTER, 0),
+    (Vec3::new(-2100.0, 0.0, 2500.0), 1),
+    (Vec3::new(3000.0, 0.0, -1500.0), 2),
+    (Vec3::new(-2600.0, 0.0, -2400.0), 3),
+];
+
+/// Render a city when the camera focus is within this range of it (so the next
+/// city comes into view as you drive toward it, and an aerial shot can frame two).
+const CITY_RENDER_R: f64 = 2300.0;
+
+/// The road network: a curbed access road from the pad to the main downtown, plus
+/// lean (curb-less) inter-city links wiring all the cities into one loop. Each
+/// entry is (a, b, mesh) so the renderer can distance-cull a link the player is
+/// nowhere near.
+fn build_city_roads() -> Vec<(Vec3, Vec3, rocket::Mesh)> {
+    let pad = Vec3::new(40.0, 0.0, 0.0);
+    let mut roads = Vec::new();
+    // access road from the launch complex to the main city (with curbs).
+    roads.push((pad, CITIES[0].0, rocket::road_l(pad, CITIES[0].0, 10.0, true)));
+    // link the cities into a loop so you can drive between all of them.
+    for &(a, b) in &[(0usize, 1usize), (1, 3), (3, 2), (2, 0)] {
+        let (ca, cb) = (CITIES[a].0, CITIES[b].0);
+        roads.push((ca, cb, rocket::road_l(ca, cb, 9.0, false)));
+    }
+    roads
+}
 
 /// Interior work lights of the assembly building: (offset from HANGAR_POS,
 /// colour*intensity, range metres). Mounted high on the wall corners (cool) and
@@ -532,10 +565,11 @@ struct World {
     /// the rocket along it (drawn at the rocket's resting base while not flown).
     road_mesh: rocket::Mesh,
     platform_mesh: rocket::Mesh,
-    /// A procedural downtown out past the launch complex, and the L-shaped access
-    /// road that runs out to it (both static, in launch-tangent local metres).
-    city_mesh: rocket::Mesh,
-    access_road_mesh: rocket::Mesh,
+    /// The drivable cities (centre + building mesh) and the road network linking
+    /// them to each other and the launch complex (each road is (a, b, mesh) so it
+    /// can be distance-culled). All static, in launch-tangent local metres.
+    city_meshes: Vec<(Vec3, rocket::Mesh)>,
+    roads: Vec<(Vec3, Vec3, rocket::Mesh)>,
     car_mesh: rocket::Mesh,
     lander_mesh: rocket::Mesh,
     /// Show the lunar lander standing on the ground (instead of the rocket).
@@ -688,9 +722,9 @@ struct World {
     /// Held walk keys: [forward, back, left, right].
     walk_in: [bool; 4],
 
-    /// NPC cars + pedestrians that bring the city to life. Spawned only while the
-    /// player is near the city and frozen/despawned when far away.
-    traffic: traffic::Traffic,
+    /// NPC cars + pedestrians that bring each city to life. One crowd per city,
+    /// each spawned only while the player is near it and despawned when far away.
+    traffic: Vec<traffic::Traffic>,
 }
 
 impl World {
@@ -749,9 +783,8 @@ impl World {
             // crawls the rocket along it.
             road_mesh: rocket::crawlerway(HANGAR_POS.x, 12.0, 14.0),
             platform_mesh: rocket::crawler_platform(),
-            city_mesh: rocket::city(CITY_CENTER),
-            // L-shaped access road from just east of the pad out to the city.
-            access_road_mesh: rocket::road_l(Vec3::new(40.0, 0.0, 0.0), CITY_CENTER, 10.0),
+            city_meshes: CITIES.iter().map(|&(c, v)| (c, rocket::city(c, v))).collect(),
+            roads: build_city_roads(),
             car_mesh: rocket::car([0.80, 0.18, 0.16]),
             lander_mesh: rocket::lander(),
             show_lander: false,
@@ -829,7 +862,7 @@ impl World {
             ped_speed: 0.0,
             walk_phase: 0.0,
             walk_in: [false; 4],
-            traffic: traffic::Traffic::new(CITY_CENTER.as_dvec3()),
+            traffic: CITIES.iter().map(|&(c, _)| traffic::Traffic::new(c.as_dvec3())).collect(),
         };
         // Generate the full Kepler-47 system; the landable moon is injected as
         // home's first moon so the map and the flight sim agree.
@@ -1820,11 +1853,14 @@ impl World {
         // drive the car / walk the character (real time, independent of warp).
         self.advance_car(frame_dt);
         self.advance_ped(frame_dt);
-        // city life: spawn/sim NPCs near the city, freeze + despawn when far.
-        // When driving, hand the NPCs the player's car so they brake for it.
+        // city life: each city's crowd spawns/sims when the player is near it and
+        // despawns when far. When driving, hand the NPCs the player's car so they
+        // brake for it.
         let pp = self.player_pos();
         let pc = if self.driving { Some(self.car_pos) } else { None };
-        self.traffic.update(pp, pc, frame_dt);
+        for t in self.traffic.iter_mut() {
+            t.update(pp, pc, frame_dt);
+        }
 
         // break-up: a destroyed vehicle (burn-through or crash) explodes once.
         if self.launch.as_ref().map(|rk| rk.destroyed).unwrap_or(false) && !self.exploded {
@@ -2884,11 +2920,29 @@ impl World {
         }
 
         push_static(&mut out, &self.road_mesh);
-        push_static(&mut out, &self.access_road_mesh);
-        push_static(&mut out, &self.city_mesh);
         push_static(&mut out, &self.pad_mesh);
         push_static(&mut out, &self.hangar_mesh);
         push_static(&mut out, &self.rack_mesh);
+
+        // The cities + their road network are spread across kilometres; only draw
+        // the ones near the camera focus (each city is several km from the next,
+        // so usually just the one you are in is built into the frame).
+        let focus = self.camera_look_local();
+        let near = |p: Vec3| {
+            let d = p.as_dvec3() - focus;
+            d.x * d.x + d.z * d.z < CITY_RENDER_R * CITY_RENDER_R
+        };
+        for (center, mesh) in &self.city_meshes {
+            if near(*center) {
+                push_static(&mut out, mesh);
+            }
+        }
+        for (a, b, mesh) in &self.roads {
+            let mid = (*a + *b) * 0.5;
+            if near(*a) || near(*b) || near(mid) {
+                push_static(&mut out, mesh);
+            }
+        }
 
         // the car, parked or being driven: rotate its local mesh by the heading
         // about +Y and place it at the car position (mesh forward is +X).
@@ -2920,27 +2974,30 @@ impl World {
             }
         }
 
-        // city traffic: NPC cars + pedestrians, only while the crowd is active
-        // (the player is near the city). A small helper poses a local mesh by a
-        // heading about +Y and drops it at a local position.
-        if self.traffic.active {
-            let center = self.traffic.center();
-            let mut posed = |out: &mut Vec<rocket::MeshVertex>, verts: &[rocket::MeshVertex], yaw: f32, at: DVec3| {
-                let (s, c) = yaw.sin_cos();
-                for v in verts {
-                    let p = Vec3::from(v.pos);
-                    let rp = Vec3::new(c * p.x - s * p.z, p.y, s * p.x + c * p.z);
-                    let n = Vec3::from(v.normal);
-                    let rn = Vec3::new(c * n.x - s * n.z, n.y, s * n.x + c * n.z);
-                    let local = at + rp.as_dvec3();
-                    out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: rn.into(), color: v.color });
-                }
-            };
-            for car in &self.traffic.cars {
-                let mesh = &self.traffic.car_meshes[car.color];
+        // city traffic: NPC cars + pedestrians, for each active city crowd (the
+        // player is near it). A small helper poses a local mesh by a heading about
+        // +Y and drops it at a local position.
+        let mut posed = |out: &mut Vec<rocket::MeshVertex>, verts: &[rocket::MeshVertex], yaw: f32, at: DVec3| {
+            let (s, c) = yaw.sin_cos();
+            for v in verts {
+                let p = Vec3::from(v.pos);
+                let rp = Vec3::new(c * p.x - s * p.z, p.y, s * p.x + c * p.z);
+                let n = Vec3::from(v.normal);
+                let rn = Vec3::new(c * n.x - s * n.z, n.y, s * n.x + c * n.z);
+                let local = at + rp.as_dvec3();
+                out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: rn.into(), color: v.color });
+            }
+        };
+        for t in &self.traffic {
+            if !t.active {
+                continue;
+            }
+            let center = t.center();
+            for car in &t.cars {
+                let mesh = &t.car_meshes[car.color];
                 posed(&mut out, &mesh.verts, car.yaw(), car.pos(center));
             }
-            for ped in &self.traffic.peds {
+            for ped in &t.peds {
                 let mesh = rocket::character(ped.phase, 1.0, traffic::Traffic::ped_shirt(ped.shirt));
                 posed(&mut out, &mesh.verts, ped.yaw, ped.pos);
             }
@@ -5109,6 +5166,24 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
         w.sys_el = 0.32;
     };
     let time = match scenario {
+        "cities" => {
+            // out on the inter-city road, approaching the next downtown (lit
+            // windows ahead) with the road running into it across the flats.
+            world.view = View::Rocket;
+            world.enter_drive();
+            // on the city0 -> city2 link (the arm at x = city2.x), 1.5 km north of
+            // city2, facing south toward it.
+            world.car_pos = DVec3::new(CITIES[2].0.x as f64, 0.0, 0.0);
+            world.car_yaw = -std::f32::consts::FRAC_PI_2; // face -Z (toward city2)
+            for _ in 0..20 {
+                world.advance(0.1);
+            }
+            world.car_yaw = -std::f32::consts::FRAC_PI_2;
+            world.rocket_az = world.car_yaw + std::f32::consts::PI;
+            world.rocket_el = 0.20;
+            world.rocket_dist = 42.0;
+            0.0
+        }
         "citylife" => {
             // the city brought to life: drive in, step the sim so NPC cars and
             // pedestrians spawn and disperse, then frame the street.
@@ -6791,7 +6866,9 @@ fn main() {
                 screenshot_all(1280, 800);
                 return;
             }
-            let scenario = if args.iter().any(|a| a == "citylife") {
+            let scenario = if args.iter().any(|a| a == "cities") {
+                "cities"
+            } else if args.iter().any(|a| a == "citylife") {
                 "citylife"
             } else if args.iter().any(|a| a == "cityview") {
                 "cityview"
