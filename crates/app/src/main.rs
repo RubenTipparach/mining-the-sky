@@ -138,7 +138,7 @@ const HUD_CAP: u64 = 40000;
 const FX_CAP: u64 = 60000;
 /// Dynamic rocket-view geometry (pad + rocket + spent booster, or a surface
 /// mesh: moon base / cargo module / a full procedural asteroid ~66k verts).
-const DYN_MESH_CAP: u64 = 320_000;
+const DYN_MESH_CAP: u64 = 400_000;
 /// Procedural re-entry plasma glow mesh (prototype mesh approach): an isosurface
 /// shell hugging the vehicle SDF (surface nets), so it can run to tens of
 /// thousands of verts on a boostered stack.
@@ -1267,13 +1267,44 @@ impl World {
         let vp = proj * view;
         let fcoef = 1.0 / (LOG_DEPTH_FAR + 1.0).log2();
 
-        // Interior work lights, brightest in the building and fading out as the
-        // rocket rolls onto the pad (so the pad stays sunlit).
+        // Realtime point lights (max 8). At night, the nearest streetlights of
+        // the city the camera is in carry the scene so moving NPCs (and the road
+        // around the camera) are lit dynamically; the static streets/buildings
+        // already glow from their baked emissive pools/windows. Otherwise, the
+        // interior work lights pool inside the assembly building.
         let mut lights = [[0.0f32; 4]; MAX_LIGHTS];
         let mut light_col = [[0.0f32; 4]; MAX_LIGHTS];
         let scale = (1.0 - self.rollout).clamp(0.0, 1.0);
         let mut nlights = 0usize;
-        if scale > 0.01 {
+
+        let focus = self.cam_target_local();
+        let mut city_night: Option<Vec3> = None;
+        if self.night {
+            let mut best = 700.0f64 * 700.0;
+            for (c, _) in all_cities() {
+                let d = (c.x as f64 - focus.x).powi(2) + (c.z as f64 - focus.z).powi(2);
+                if d < best {
+                    best = d;
+                    city_night = Some(c);
+                }
+            }
+        }
+
+        if let Some(c) = city_night {
+            // warm sodium streetlights: the nearest lamps to the camera focus.
+            let mut lamps = rocket::city_lamps(c);
+            lamps.sort_by(|a, b| {
+                let da = (a.x as f64 - focus.x).powi(2) + (a.z as f64 - focus.z).powi(2);
+                let db = (b.x as f64 - focus.x).powi(2) + (b.z as f64 - focus.z).powi(2);
+                da.partial_cmp(&db).unwrap()
+            });
+            for lp in lamps.iter().take(MAX_LIGHTS) {
+                let p = self.rel(lp.as_dvec3());
+                lights[nlights] = [p.x, p.y, p.z, 38.0];
+                light_col[nlights] = [1.7, 1.32, 0.78, 0.0];
+                nlights += 1;
+            }
+        } else if scale > 0.01 {
             // a subtle flicker so the lighting reads as live
             let flick = 0.92 + 0.08 * (self.anim * 9.0).sin();
             for (off, col, range) in HANGAR_LIGHTS {
@@ -5258,16 +5289,18 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.view = View::Rocket;
             world.night = true;
             world.enter_drive();
+            // sit the car at a street intersection (a lamp + pool right there) on
+            // a north-south avenue, facing north up the street.
             let lane_x = (CITY_CENTER.x - 210.0 + 3.0 * 60.0) as f64;
-            world.car_pos = DVec3::new(lane_x, 0.0, (CITY_CENTER.z - 175.0) as f64);
+            world.car_pos = DVec3::new(lane_x, 0.0, (CITY_CENTER.z - 210.0 + 2.0 * 60.0) as f64);
             world.car_yaw = std::f32::consts::FRAC_PI_2;
             for _ in 0..45 {
                 world.advance(0.1);
             }
             world.car_yaw = std::f32::consts::FRAC_PI_2;
             world.rocket_az = world.car_yaw + std::f32::consts::PI;
-            world.rocket_el = 0.20;
-            world.rocket_dist = 46.0;
+            world.rocket_el = 0.13;
+            world.rocket_dist = 26.0;
             0.0
         }
         "citylife" => {

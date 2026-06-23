@@ -232,7 +232,7 @@ fn fs(in: VsOut) -> FsOut {
     // day but glow after dark.
     let lum = in.color.r + in.color.g + in.color.b;
     let emis = smoothstep(2.3, 3.1, lum);
-    lit = mix(lit, in.color, emis * (0.4 + 0.6 * (1.0 - day)));
+    lit = mix(lit, in.color, emis * (0.22 + 0.78 * (1.0 - day)));
 
     // aerial perspective: fade toward horizon haze with view distance.
     let dist = in.flogz - 1.0; // = view-space distance (clip.w)

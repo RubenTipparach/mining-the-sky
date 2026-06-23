@@ -1193,6 +1193,26 @@ pub fn road_l(a: Vec3, b: Vec3, half_w: f32, curbs: bool) -> Mesh {
 /// buildings of varying height and colour, taller toward the centre, on a paved
 /// ground plane. Centred at `center` (local metres, ground at y=0). `variant`
 /// reseeds the layout so different cities look distinct, which is what makes a
+/// Streetlight head positions (local metres, head at ~5 m) for a city centred at
+/// `center`: one at every street-grid intersection. Shared by the mesh builder
+/// (to place the lamp + baked road pool) and the renderer (to drive a few of
+/// them as realtime point lights for moving NPCs).
+pub fn city_lamps(center: Vec3) -> Vec<Vec3> {
+    let (nx, nz) = (7i32, 7i32);
+    let span = 60.0f32; // block (46) + street (14)
+    let half_x = nx as f32 * span * 0.5;
+    let half_z = nz as f32 * span * 0.5;
+    let mut v = Vec::with_capacity(((nx + 1) * (nz + 1)) as usize);
+    for ix in 0..=nx {
+        for iz in 0..=nz {
+            let x = center.x - half_x + ix as f32 * span;
+            let z = center.z - half_z + iz as f32 * span;
+            v.push(Vec3::new(x, 5.0, z));
+        }
+    }
+    v
+}
+
 /// cluster of these read as one big sprawl of separate downtowns. Fully
 /// deterministic so it meshes the same every frame.
 pub fn city(center: Vec3, variant: u32) -> Mesh {
@@ -1296,6 +1316,22 @@ pub fn city(center: Vec3, variant: u32) -> Mesh {
                 }
             }
         }
+    }
+
+    // Streetlights at the grid intersections: a dark pole, an emissive lamp head,
+    // and a warm light pool baked onto the road - so the streets read as lit at
+    // night (these glow via the night-boosted emissive term). The lamps also
+    // double as realtime point lights for moving NPCs (chosen in the renderer).
+    let pole = [0.20, 0.20, 0.23];
+    let head = [1.85, 1.45, 0.85]; // emissive warm sodium head
+    let pool_in = [1.75, 1.32, 0.78]; // bright pool centre
+    let pool_out = [1.25, 0.97, 0.6]; // softer pool skirt
+    for lp in city_lamps(center) {
+        m.bx(Vec3::new(lp.x, 2.5, lp.z), Vec3::new(0.16, 2.5, 0.16), pole);
+        m.bx(Vec3::new(lp.x, lp.y, lp.z), Vec3::new(0.5, 0.28, 0.5), head);
+        // stacked flat quads on the road for a soft pool of cast light.
+        m.bx(Vec3::new(lp.x, 0.05, lp.z), Vec3::new(9.0, 0.03, 9.0), pool_out);
+        m.bx(Vec3::new(lp.x, 0.08, lp.z), Vec3::new(5.0, 0.03, 5.0), pool_in);
     }
     m
 }
