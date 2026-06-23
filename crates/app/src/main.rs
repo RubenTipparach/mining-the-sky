@@ -5622,6 +5622,15 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.sys_el = 0.12;
             6.0
         }
+        "homeworld" => {
+            // the home planet from orbit on its day side: drifting cloud shells,
+            // ocean sun-glint, and a terminator sliver showing the city lights.
+            frame_map(&mut world);
+            world.sys_dist = 17.0;
+            world.sys_az = 1.05;
+            world.sys_el = 0.26;
+            6.0
+        }
         "moons" => {
             // focus a moon up close so it ray-marches as a real sphere, with its
             // gas giant looming behind.
@@ -6970,6 +6979,8 @@ fn main() {
                 "moons"
             } else if args.iter().any(|a| a == "citylights") {
                 "citylights"
+            } else if args.iter().any(|a| a == "homeworld") {
+                "homeworld"
             } else if args.iter().any(|a| a == "moon") {
                 "moon"
             } else if args.iter().any(|a| a == "rocket") {
@@ -7076,6 +7087,7 @@ fn main() {
                 "moons" => "out/moons.png",
                 "moon" => "out/moon.png",
                 "citylights" => "out/citylights.png",
+                "homeworld" => "out/homeworld.png",
                 "rocket" => "out/rocket.png",
                 "system" => "out/system.png",
                 "pad" => "out/pad.png",

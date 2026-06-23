@@ -195,12 +195,22 @@ fn shade_home(p: vec3<f32>, rd: vec3<f32>) -> vec3<f32> {
     let diffuse = day * (0.12 + 0.88 * max(ndl, 0.0));
     var col = albedo * vec3<f32>(1.05, 1.02, 0.95) * diffuse;
 
+    // ocean sun-glint: oceans read as blue-dominant, darker albedo in the baked
+    // map; give them a tight specular highlight where the sun mirrors to the
+    // camera, the classic bright glint of water seen from orbit.
+    let lum = dot(albedo, vec3<f32>(0.33, 0.34, 0.33));
+    let oceanness = clamp((albedo.b - albedo.r * 0.85) * 7.0, 0.0, 1.0)
+        * (1.0 - smoothstep(0.20, 0.42, lum));
+    let viewdir = -rd;
+    let halfv = normalize(sun + viewdir);
+    let glint = pow(max(dot(n, halfv), 0.0), 220.0) * day * oceanness;
+    col = col + vec3<f32>(1.0, 0.97, 0.88) * glint * 1.4;
+
     // detailed city lights on the dark side (fade in through the terminator)
     let night = 1.0 - day;
     col = col + city_lights(n, emission, s.params.z) * night * 2.6;
 
     // atmospheric limb (rim toward the camera)
-    let viewdir = -rd;
     let rim = pow(1.0 - max(dot(n, viewdir), 0.0), 3.0);
     col = col + vec3<f32>(0.3, 0.5, 1.0) * rim * (0.7 * day + 0.05);
     return col;
@@ -215,6 +225,36 @@ fn shade_moon_at(p: vec3<f32>, center: vec3<f32>) -> vec3<f32> {
     let ndl = max(dot(n, sun), 0.0);
     let amb = 0.04;
     return vec3<f32>(base) * (amb + ndl);
+}
+
+// A thin cloud shell around the home planet at `radius`. Returns lit cloud
+// colour + coverage alpha for the near intersection of the shell, or zero if the
+// shell is missed or sits behind the nearest body hit (`best`). Coverage is an
+// animated fbm so the layers drift slowly; clouds are bright white on the day
+// side and dim at night.
+fn cloud_shell(
+    ro: vec3<f32>, rd: vec3<f32>, radius: f32, best: f32,
+    freq: f32, seedv: vec3<f32>, cover: f32, time: f32,
+) -> vec4<f32> {
+    let t = hit_sphere(ro, rd, s.home.xyz, radius);
+    if (t <= 0.0 || t >= best) {
+        return vec4<f32>(0.0);
+    }
+    let p = ro + rd * t;
+    let nc = normalize(p - s.home.xyz);
+    let drift = vec3<f32>(time * 0.004, 0.0, time * 0.0025);
+    let q = nc * freq + seedv + drift;
+    let f = 0.55 * vnoise(q) + 0.30 * vnoise(q * 2.4 + 3.1) + 0.15 * vnoise(q * 5.3 + 7.7);
+    let c = smoothstep(cover, cover + 0.22, f);
+    if (c <= 0.001) {
+        return vec4<f32>(0.0);
+    }
+    let sun = normalize(s.sun.xyz - p);
+    let ndl = dot(nc, sun);
+    let day = smoothstep(-0.1, 0.2, ndl);
+    let lit = 0.06 + 1.05 * max(ndl, 0.0);
+    let rgb = vec3<f32>(1.0, 0.99, 0.97) * lit;
+    return vec4<f32>(rgb, c * (0.3 + 0.7 * day));
 }
 
 @fragment
@@ -289,6 +329,14 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
             col = col + vec3<f32>(0.3, 0.5, 1.0) * halo * lit * 0.9;
         }
     }
+
+    // Two thin cloud shells drifting above the home planet (composited inner
+    // then outer, so the nearer outer layer sits on top), over the surface and
+    // out across the limb.
+    let cl1 = cloud_shell(ro, rd, s.home.w * 1.010, best, 4.0, vec3<f32>(0.0), 0.46, s.params.z);
+    col = mix(col, cl1.rgb, cl1.a);
+    let cl2 = cloud_shell(ro, rd, s.home.w * 1.020, best, 6.5, vec3<f32>(13.1, 5.7, 2.3), 0.55, s.params.z);
+    col = mix(col, cl2.rgb, cl2.a);
 
     col = vec3<f32>(1.0) - exp(-col * 1.2);
     return vec4<f32>(col, 1.0);
