@@ -25,6 +25,22 @@ const DEACTIVATE: f64 = HALF + 360.0;
 const N_CARS: usize = 24;
 const N_PEDS: usize = 46;
 
+/// Half-street lane offset: cars drive on the right of the centreline, so the two
+/// directions occupy separate lanes within the ~14 m street instead of overlapping.
+const LANE_OFF: f64 = 3.4;
+
+// Collision avoidance. A car eases off when something is close ahead in its lane:
+// it slows from SLOW_GAP and is stopped by STOP_GAP. Intersections are handled by
+// yielding to whichever car is already closer to the crossing (deadlock-free).
+const LOOKAHEAD: f64 = 13.0; // how far ahead a leader / the player is noticed
+const SLOW_GAP: f64 = 11.0; // start braking
+const STOP_GAP: f64 = 4.6; // fully stopped by here
+const LANE_HALF: f64 = 2.6; // lateral half-width that counts as "in my lane"
+const INT_BOX: f64 = 7.0; // a car this close to an intersection is "in" it
+const INT_ENTER: f64 = 17.0; // start checking the intersection from here
+const ACCEL: f64 = 7.0; // m/s^2 speeding back up
+const BRAKE: f64 = 16.0; // m/s^2 slowing down
+
 const CAR_COLORS: [[f32; 3]; 6] = [
     [0.85, 0.85, 0.88], // white
     [0.12, 0.13, 0.15], // black
@@ -50,19 +66,38 @@ pub struct Car {
     pub line: i32,
     pub along: f64,
     pub sign: f64,
-    pub speed: f64,
+    pub speed: f64,      // current speed (modulated by traffic ahead)
+    pub cruise: f64,     // free-flowing target speed
     pub color: usize,
 }
 
 impl Car {
-    /// World position (local launch-tangent metres, ground at y=0).
+    /// World position (local launch-tangent metres, ground at y=0). Cars keep to
+    /// the right of the centreline so the two directions form separate lanes.
     pub fn pos(&self, center: DVec3) -> DVec3 {
         let fixed = line_coord(if self.axis == 0 { center.z } else { center.x }, self.line);
+        // right-hand offset: travel +X -> right is -Z; travel +Z -> right is +X.
         if self.axis == 0 {
-            DVec3::new(self.along, 0.0, fixed)
+            DVec3::new(self.along, 0.0, fixed - self.sign * LANE_OFF)
         } else {
-            DVec3::new(fixed, 0.0, self.along)
+            DVec3::new(fixed + self.sign * LANE_OFF, 0.0, self.along)
         }
+    }
+    /// The next intersection centre ahead and the forward distance to it.
+    fn next_intersection(&self, center: DVec3) -> (DVec3, f64) {
+        let travel_c = if self.axis == 0 { center.x } else { center.z };
+        let base = travel_c - HALF;
+        let u = (self.along - base) / SPAN;
+        let k = if self.sign > 0.0 { u.floor() + 1.0 } else { u.ceil() - 1.0 };
+        let next = base + k * SPAN;
+        let di = (next - self.along) * self.sign;
+        let perp = line_coord(if self.axis == 0 { center.z } else { center.x }, self.line);
+        let p = if self.axis == 0 {
+            DVec3::new(next, 0.0, perp)
+        } else {
+            DVec3::new(perp, 0.0, next)
+        };
+        (p, di)
     }
     /// Heading angle (0 = +X), matching the mesh's +X forward axis.
     pub fn yaw(&self) -> f32 {
@@ -121,9 +156,10 @@ impl Traffic {
         (self.next() % n.max(1) as u64) as i32
     }
 
-    /// Update the crowd. `player` is the player's local position; the system
-    /// activates near the city and freezes/despawns when far away.
-    pub fn update(&mut self, player: DVec3, dt: f32) {
+    /// Update the crowd. `player` is the player's local position (drives the
+    /// near/far gating); `player_car` is the player's car position when driving,
+    /// so NPCs brake for it. The system activates near the city and despawns far.
+    pub fn update(&mut self, player: DVec3, player_car: Option<DVec3>, dt: f32) {
         let dx = player.x - self.center.x;
         let dz = player.z - self.center.z;
         let dist = (dx * dx + dz * dz).sqrt();
@@ -141,7 +177,7 @@ impl Traffic {
             self.active = false;
             return;
         }
-        self.sim(dt);
+        self.sim(dt, player_car);
     }
 
     fn spawn(&mut self) {
@@ -153,9 +189,9 @@ impl Traffic {
             let sign = if self.randf() < 0.5 { 1.0 } else { -1.0 };
             let travel_center = if axis == 0 { self.center.x } else { self.center.z };
             let along = travel_center - HALF + self.randf() * (NX as f64 * SPAN);
-            let speed = 9.0 + self.randf() * 9.0;
+            let cruise = 9.0 + self.randf() * 9.0;
             let color = self.randi(CAR_COLORS.len() as i32) as usize;
-            self.cars.push(Car { axis, line, along, sign, speed, color });
+            self.cars.push(Car { axis, line, along, sign, speed: cruise, cruise, color });
         }
         for _ in 0..N_PEDS {
             let px = self.center.x - HALF + self.randf() * (2.0 * HALF);
@@ -169,20 +205,89 @@ impl Traffic {
         }
     }
 
-    fn sim(&mut self, dt: f32) {
+    fn sim(&mut self, dt: f32, player_car: Option<DVec3>) {
         let dtf = dt as f64;
         let center = self.center;
-        // cars: advance along the lane, turn at intersections.
         let n = self.cars.len();
+        // Snapshot every car's lane state for this frame's obstacle queries.
+        let snap: Vec<(DVec3, u8, f64, f64)> =
+            self.cars.iter().map(|c| (c.pos(center), c.axis, c.along, c.sign)).collect();
+
+        // cars: pick a speed from the traffic ahead, then advance + turn.
         for i in 0..n {
-            let (axis, sign, speed, line) = {
+            let (axis, sign, line) = {
                 let c = &self.cars[i];
-                (c.axis, c.sign, c.speed, c.line)
+                (c.axis, c.sign, c.line)
             };
+            let alongi = self.cars[i].along;
+            let pi = snap[i].0;
+            let peri = if axis == 0 { pi.z } else { pi.x }; // my lane's cross coord
+
+            // nearest blocking distance ahead (free road = LOOKAHEAD).
+            let mut gap = LOOKAHEAD;
+            // same-street, same-lane leader (rear-end avoidance). Opposing traffic
+            // sits in the other lane (offset), so its lateral gap excludes it.
+            for j in 0..n {
+                if j == i || snap[j].1 != axis {
+                    continue;
+                }
+                let pj = snap[j].0;
+                let o_along = if axis == 0 { pj.x } else { pj.z };
+                let o_perp = if axis == 0 { pj.z } else { pj.x };
+                let fwd = (o_along - alongi) * sign;
+                if fwd > 0.0 && fwd < gap && (o_perp - peri).abs() < LANE_HALF {
+                    gap = fwd;
+                }
+            }
+            // the player's car: brake if it is ahead in my lane, and hard-stop if
+            // it is right on top of me from any direction.
+            if let Some(pc) = player_car {
+                let o_along = if axis == 0 { pc.x } else { pc.z };
+                let o_perp = if axis == 0 { pc.z } else { pc.x };
+                let fwd = (o_along - alongi) * sign;
+                if fwd > 0.0 && fwd < gap && (o_perp - peri).abs() < LANE_HALF + 1.2 {
+                    gap = fwd;
+                }
+                if (pc - pi).length() < 5.5 {
+                    gap = gap.min(STOP_GAP * 0.7);
+                }
+            }
+            // intersection yield: approaching a crossing, give way to any cross car
+            // already closer to it (closer car has priority -> deadlock-free).
+            let (xc, di) = self.cars[i].next_intersection(center);
+            if di < INT_ENTER {
+                for j in 0..n {
+                    if j == i || snap[j].1 == axis {
+                        continue;
+                    }
+                    let dj = (snap[j].0 - xc).length();
+                    if dj < INT_BOX && dj < di {
+                        gap = gap.min(di);
+                    }
+                }
+            }
+
+            // ease the speed toward what the gap allows.
+            let cruise = self.cars[i].cruise;
+            let target = if gap <= STOP_GAP {
+                0.0
+            } else if gap < SLOW_GAP {
+                cruise * (gap - STOP_GAP) / (SLOW_GAP - STOP_GAP)
+            } else {
+                cruise
+            };
+            let cur = self.cars[i].speed;
+            let speed = if target > cur {
+                (cur + ACCEL * dtf).min(target)
+            } else {
+                (cur - BRAKE * dtf).max(target).max(0.0)
+            };
+            self.cars[i].speed = speed;
+
             let travel_center = if axis == 0 { center.x } else { center.z };
             let fixed_center = if axis == 0 { center.z } else { center.x };
             let base = travel_center - HALF;
-            let prev = self.cars[i].along;
+            let prev = alongi;
             let along = prev + sign * speed * dtf;
             let kprev = ((prev - base) / SPAN).floor() as i32;
             let knew = ((along - base) / SPAN).floor() as i32;
@@ -263,23 +368,27 @@ mod tests {
         let far = DVec3::ZERO; // ~2.4 km from the city centre
         let mut t = Traffic::new(center);
 
-        t.update(far, 0.1);
+        t.update(far, None, 0.1);
         assert!(!t.active && t.cars.is_empty() && t.peds.is_empty(), "should stay asleep when far");
 
-        t.update(center, 0.1);
+        t.update(center, None, 0.1);
         assert!(t.active && !t.cars.is_empty() && !t.peds.is_empty(), "should wake near the city");
 
         // Simulate a while near the city: cars stay on the grid (finite coords).
         for _ in 0..400 {
-            t.update(center, 0.05);
+            t.update(center, None, 0.05);
         }
         assert!(t.cars.iter().all(|c| c.along.is_finite()), "cars must stay finite/on-grid");
         let in_box = t.peds.iter().all(|p| {
             (p.pos.x - center.x).abs() < HALF + 40.0 && (p.pos.z - center.z).abs() < HALF + 40.0
         });
         assert!(in_box, "pedestrians must stay within the city bounds");
+        // traffic must keep flowing: collision avoidance must not gridlock the
+        // whole grid into a permanent standstill.
+        let moving = t.cars.iter().filter(|c| c.speed > 2.0).count();
+        assert!(moving >= t.cars.len() / 3, "traffic gridlocked: only {moving} of {} moving", t.cars.len());
 
-        t.update(far, 0.1);
+        t.update(far, None, 0.1);
         assert!(!t.active && t.cars.is_empty() && t.peds.is_empty(), "should despawn when far again");
     }
 }

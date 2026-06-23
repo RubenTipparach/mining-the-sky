@@ -1821,8 +1821,10 @@ impl World {
         self.advance_car(frame_dt);
         self.advance_ped(frame_dt);
         // city life: spawn/sim NPCs near the city, freeze + despawn when far.
+        // When driving, hand the NPCs the player's car so they brake for it.
         let pp = self.player_pos();
-        self.traffic.update(pp, frame_dt);
+        let pc = if self.driving { Some(self.car_pos) } else { None };
+        self.traffic.update(pp, pc, frame_dt);
 
         // break-up: a destroyed vehicle (burn-through or crash) explodes once.
         if self.launch.as_ref().map(|rk| rk.destroyed).unwrap_or(false) && !self.exploded {
