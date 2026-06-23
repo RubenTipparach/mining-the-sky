@@ -84,30 +84,38 @@ fn hash33(p: vec3<f32>) -> vec3<f32> {
     return fract(sin(q) * 43758.5453);
 }
 
-// Worley / Voronoi F1: distance to the nearest jittered feature point (cells of
-// size 1). Each feature point is a "settlement"; 1 - F1 lights them up as a
-// field of discrete points rather than a smooth blob.
-fn worley(p: vec3<f32>) -> f32 {
+// Brightness of a single light point at squared distance `d2` (cell units),
+// reaching zero past `radius` so points stay small and separated.
+fn dot_bright(d2: f32, radius: f32) -> f32 {
+    let d = sqrt(d2);
+    return pow(clamp(1.0 - d / radius, 0.0, 1.0), 1.4);
+}
+
+// Gated Voronoi point field. Each cell holds one feature point ("a town"), but it
+// is only lit if the cell's random rank falls below the local `density`. So a
+// dense core (density >= 1) lights every point and reads as a packed cluster,
+// while a low-density fringe lights only a scattered few - isolated dots with
+// dark gaps between them, like real city lights from orbit. Returns the
+// brightness of the nearest lit point to `p`.
+fn scatter_points(p: vec3<f32>, density: f32, radius: f32) -> f32 {
     let ip = floor(p);
     let fp = fract(p);
-    var d = 1.0e9;
+    var best = 1.0e9;
     for (var z = -1; z <= 1; z = z + 1) {
         for (var y = -1; y <= 1; y = y + 1) {
             for (var x = -1; x <= 1; x = x + 1) {
                 let g = vec3<f32>(f32(x), f32(y), f32(z));
-                let o = hash33(ip + g);
-                let r = g + o - fp;
-                d = min(d, dot(r, r));
+                let cell = ip + g;
+                let rank = hash3(cell + vec3<f32>(0.7, 2.3, 4.1));
+                if (rank < density) {
+                    let o = hash33(cell);
+                    let r = g + o - fp;
+                    best = min(best, dot(r, r));
+                }
             }
         }
     }
-    return sqrt(d);
-}
-
-// Brightness of the Voronoi point field at F1 distance `f`: a bright dot at each
-// feature point, falling off with `sharp` (higher = tighter points).
-fn point_dot(f: f32, sharp: f32) -> f32 {
-    return pow(clamp(1.0 - f, 0.0, 1.0), sharp);
+    return dot_bright(best, radius);
 }
 
 // Nearest positive root of the ray/sphere intersection, or -1.0 on a miss.
@@ -140,31 +148,34 @@ fn shade_planet(p: vec3<f32>, center: vec3<f32>, color: vec3<f32>) -> vec3<f32> 
     return color * band * (0.05 + 0.95 * ndl);
 }
 
-// Detailed night-side city lights. The baked emission map (texel.a) gives the
-// regional glow (where cities and highways are); on top of it we add Voronoi
-// point fields so a metro reads as lots of discrete settlement points rather
-// than a smooth blob. A flat base term keeps the highways continuously lit.
+// Night-side city lights. The baked emission map (texel.a) is treated as a
+// POPULATION DENSITY, not a glow: it gates a gated Voronoi point field so the
+// surface lights up as discrete settlements - packed clusters in the dense
+// cores fading to scattered isolated dots toward the fringes, with dark country
+// between - rather than a blurry blob. Two scales give big-city dots plus a
+// finer scatter of small towns. Highways (their own faint density) read as
+// dotted strings of light between the cities.
 fn city_lights(n: vec3<f32>, emission: f32, time: f32) -> vec3<f32> {
-    if (emission < 0.0015) {
+    if (emission < 0.004) {
         return vec3<f32>(0.0);
     }
-    // Voronoi point fields: coarse district cores + a dense field of small
-    // neighbourhood points. Each feature point is a lit settlement.
-    let big = point_dot(worley(n * 230.0), 1.6);
-    let fine = point_dot(worley(n * 720.0 + vec3<f32>(11.3, 4.1, 7.7)), 2.6);
-    let dots = max(big, 0.6 * fine) + 0.4 * big * fine;
-    // mid-scale clustering: bright downtown cores out to sparse outskirts
-    let cluster = 0.25 + 0.75 * smoothstep(0.28, 0.85, vnoise(n * 90.0));
-    // warm/cool district variation, and a subtle twinkle on the points
-    let warmcool = vnoise(n * 240.0 + vec3<f32>(7.3, 1.1, 4.2));
-    let tw = 0.85 + 0.15 * sin(time * 2.5 + warmcool * 130.0);
-    // base term = continuous glow (keeps highways lit); the dots ride on top.
-    let inten = emission * (0.32 + cluster * (0.22 + 2.4 * dots)) * tw;
-    let cool = smoothstep(0.72, 0.92, warmcool);
+    // local density drives how many feature points light up (cores >= 1 fill in;
+    // fringes light only a scattered few).
+    let density = clamp(emission * 1.4, 0.0, 1.45);
+    let coarse = scatter_points(n * 125.0, density, 0.58);
+    let fine = scatter_points(n * 350.0 + vec3<f32>(11.3, 4.1, 7.7), density, 0.5);
+    let dots = max(coarse, 0.8 * fine);
+    // a faint connective bloom only in the brightest cores (kept small so the
+    // outskirts stay dotty, not smeared).
+    let glow = 0.10 * emission * emission;
+    // warm/cool district variation + a gentle twinkle on the points.
+    let wc = vnoise(n * 200.0 + vec3<f32>(7.3, 1.1, 4.2));
+    let tw = 0.82 + 0.18 * sin(time * 2.2 + wc * 120.0);
+    let inten = (glow + dots * (0.45 + 0.95 * emission)) * tw;
+    let cool = smoothstep(0.72, 0.94, wc);
     let warm = vec3<f32>(1.0, 0.72, 0.38);
     let white = vec3<f32>(0.85, 0.90, 1.0);
-    let lcol = mix(warm, white, cool * 0.6);
-    return lcol * inten;
+    return mix(warm, white, cool * 0.6) * inten;
 }
 
 fn shade_home(p: vec3<f32>, rd: vec3<f32>) -> vec3<f32> {
