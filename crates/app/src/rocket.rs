@@ -1294,6 +1294,48 @@ pub fn car() -> Mesh {
     m
 }
 
+/// A third-person character, modelled facing +X and standing on the ground at
+/// y=0, posed for a walk cycle. `phase` advances the stride; `moving` (0..1)
+/// scales the limb swing so the figure is still when idle and strides when
+/// walking. The drive/walk code positions + yaws it each frame.
+pub fn character(phase: f32, moving: f32) -> Mesh {
+    use std::f32::consts::PI;
+    let mut m = Mesh::default();
+    let skin = [0.86, 0.66, 0.52];
+    let shirt = [0.20, 0.46, 0.78];
+    let pants = [0.24, 0.26, 0.32];
+    let shoe = [0.10, 0.10, 0.11];
+    let hair = [0.18, 0.12, 0.08];
+
+    // torso + hips + head + neck (the trunk stays upright)
+    m.bx(Vec3::new(0.0, 1.18, 0.0), Vec3::new(0.17, 0.28, 0.11), shirt);
+    m.bx(Vec3::new(0.0, 0.86, 0.0), Vec3::new(0.17, 0.10, 0.11), pants);
+    m.bx(Vec3::new(0.0, 1.50, 0.0), Vec3::new(0.07, 0.06, 0.07), skin); // neck
+    m.bx(Vec3::new(0.03, 1.66, 0.0), Vec3::new(0.12, 0.13, 0.12), skin); // head
+    m.bx(Vec3::new(-0.02, 1.74, 0.0), Vec3::new(0.13, 0.06, 0.13), hair); // hair cap
+
+    // legs: swing the foot fore/aft along X; right leg is half a cycle behind.
+    for (sz, ph) in [(-1.0f32, 0.0f32), (1.0, PI)] {
+        let sw = (phase + ph).sin() * 0.32 * moving;
+        let hip = Vec3::new(0.0, 0.80, sz * 0.09);
+        let knee = Vec3::new(sw * 0.5, 0.42, sz * 0.09);
+        let foot = Vec3::new(sw, 0.07, sz * 0.09);
+        m.strut(hip, knee, 0.085, pants);
+        m.strut(knee, foot, 0.075, pants);
+        m.bx(foot + Vec3::new(0.05, -0.02, 0.0), Vec3::new(0.15, 0.05, 0.09), shoe);
+    }
+    // arms: swing opposite to the legs (left arm forward with the right leg).
+    for (sz, ph) in [(-1.0f32, PI), (1.0, 0.0)] {
+        let sw = (phase + ph).sin() * 0.30 * moving;
+        let sh = Vec3::new(0.0, 1.42, sz * 0.24);
+        let elbow = Vec3::new(sw * 0.5, 1.16, sz * 0.26);
+        let hand = Vec3::new(sw, 0.92, sz * 0.27);
+        m.strut(sh, elbow, 0.065, shirt);
+        m.strut(elbow, hand, 0.06, skin);
+    }
+    m
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum PartKind {
     Engine,

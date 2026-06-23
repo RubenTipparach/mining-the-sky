@@ -18,6 +18,8 @@ pub fn build(ctx: &egui::Context, world: &mut World) {
         View::Rocket => {
             if world.driving {
                 drive_panel(ctx, world); // out driving the car
+            } else if world.walking {
+                walk_panel(ctx, world); // on foot
             } else if world.space {
                 asteroid_panel(ctx, world); // inspecting an asteroid
             } else if world.base_mesh.is_some() && world.base_panel {
@@ -112,6 +114,7 @@ fn test_menu(ctx: &egui::Context, world: &mut World) {
         Powered,
         Payload(usize),
         Drive,
+        Walk,
     }
     let mut act: Option<T> = None;
     let mut friction = world.test_friction;
@@ -167,13 +170,22 @@ fn test_menu(ctx: &egui::Context, world: &mut World) {
             });
             ui.separator();
             ui.label(egui::RichText::new("CITY").color(DIM));
-            if ui
-                .button("Drive car to the city")
-                .on_hover_text("Take the car out of the launch complex and drive into town")
-                .clicked()
-            {
-                act = Some(T::Drive);
-            }
+            ui.horizontal(|ui| {
+                if ui
+                    .button("Walk around")
+                    .on_hover_text("Explore the launch complex on foot")
+                    .clicked()
+                {
+                    act = Some(T::Walk);
+                }
+                if ui
+                    .button("Drive car")
+                    .on_hover_text("Take the car out and drive into town")
+                    .clicked()
+                {
+                    act = Some(T::Drive);
+                }
+            });
         });
 
     world.test_friction = friction;
@@ -183,6 +195,7 @@ fn test_menu(ctx: &egui::Context, world: &mut World) {
         Some(T::Powered) => world.setup_powered_descent(),
         Some(T::Payload(p)) => world.setup_payload_preview(p),
         Some(T::Drive) => world.enter_drive(),
+        Some(T::Walk) => world.enter_walk(),
         None => {}
     }
 }
@@ -482,6 +495,7 @@ fn pad_panel(ctx: &egui::Context, world: &mut World) {
     let mut launch = false;
     let mut back = false;
     let mut drive = false;
+    let mut walk = false;
 
     egui::Window::new("LAUNCH PAD")
         .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 12.0))
@@ -513,6 +527,9 @@ fn pad_panel(ctx: &egui::Context, world: &mut World) {
                     if ui.button("Back to VAB").clicked() {
                         back = true;
                     }
+                    if ui.button("Walk around").on_hover_text("Get out and explore on foot").clicked() {
+                        walk = true;
+                    }
                     if ui.button("Drive car").on_hover_text("Hop in the car and drive out to the city").clicked() {
                         drive = true;
                     }
@@ -529,12 +546,16 @@ fn pad_panel(ctx: &egui::Context, world: &mut World) {
     if drive {
         world.enter_drive();
     }
+    if walk {
+        world.enter_walk();
+    }
 }
 
 /// Shown while driving the car (rocket view): a speed readout, the controls, and
-/// a button to park and return to the launch complex.
+/// buttons to get out on foot or park back at the complex.
 fn drive_panel(ctx: &egui::Context, world: &mut World) {
     let speed_kph = world.car_speed.abs() * 3.6;
+    let mut get_out = false;
     let mut park = false;
     egui::Window::new("DRIVING")
         .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 12.0))
@@ -549,14 +570,56 @@ fn drive_panel(ctx: &egui::Context, world: &mut World) {
             });
             ui.separator();
             ui.label(egui::RichText::new("W/S drive  A/D steer  -  drag to look").color(DIM));
-            let btn = egui::Button::new(egui::RichText::new("PARK / EXIT CAR").strong())
-                .min_size(egui::vec2(140.0, 24.0));
-            if ui.add(btn).clicked() {
-                park = true;
-            }
+            ui.horizontal(|ui| {
+                let btn = egui::Button::new(egui::RichText::new("GET OUT").strong())
+                    .min_size(egui::vec2(96.0, 24.0));
+                if ui.add(btn).clicked() {
+                    get_out = true;
+                }
+                if ui.button("Park / exit").clicked() {
+                    park = true;
+                }
+            });
         });
+    if get_out {
+        world.get_out_car();
+    }
     if park {
         world.exit_drive();
+    }
+}
+
+/// Shown while on foot (rocket view): the controls, a "get in car" action when
+/// standing by the car, and a button to return to the launch complex.
+fn walk_panel(ctx: &egui::Context, world: &mut World) {
+    let near = world.near_car();
+    let mut get_in = false;
+    let mut leave = false;
+    egui::Window::new("ON FOOT")
+        .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 12.0))
+        .default_width(220.0)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.label(egui::RichText::new("ON FOOT").heading().color(AMBER));
+            ui.label(egui::RichText::new("W/S walk  A/D turn  -  drag to look").color(DIM));
+            ui.separator();
+            let btn = egui::Button::new(egui::RichText::new("GET IN CAR").strong())
+                .min_size(egui::vec2(140.0, 24.0));
+            if ui.add_enabled(near, btn).clicked() {
+                get_in = true;
+            }
+            if !near {
+                ui.label(egui::RichText::new("walk up to the car to get in").color(DIM).small());
+            }
+            if ui.button("Back to complex").clicked() {
+                leave = true;
+            }
+        });
+    if get_in {
+        world.get_in_car();
+    }
+    if leave {
+        world.exit_walk();
     }
 }
 

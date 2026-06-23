@@ -676,6 +676,16 @@ struct World {
     car_speed: f32, // signed m/s along the heading
     /// Held drive keys: [forward, back, left, right].
     drive_in: [bool; 4],
+
+    /// On foot: a third-person character you can walk around (and use to get in
+    /// and out of the car). When `walking`, WASD moves it and the camera follows.
+    walking: bool,
+    ped_pos: DVec3, // local metres
+    ped_yaw: f32,   // heading, 0 = +X
+    ped_speed: f32, // m/s along the heading
+    walk_phase: f32, // stride cycle phase (for the walk animation)
+    /// Held walk keys: [forward, back, left, right].
+    walk_in: [bool; 4],
 }
 
 impl World {
@@ -808,6 +818,12 @@ impl World {
             car_yaw: 0.0,
             car_speed: 0.0,
             drive_in: [false; 4],
+            walking: false,
+            ped_pos: DVec3::new(34.0, 0.0, 4.0),
+            ped_yaw: 0.0,
+            ped_speed: 0.0,
+            walk_phase: 0.0,
+            walk_in: [false; 4],
         };
         // Generate the full Kepler-47 system; the landable moon is injected as
         // home's first moon so the map and the flight sim agree.
@@ -1795,8 +1811,9 @@ impl World {
                 rk.integrate(&self.body, dt as f64);
             }
         }
-        // drive the car (real time, independent of the launch / warp).
+        // drive the car / walk the character (real time, independent of warp).
         self.advance_car(frame_dt);
+        self.advance_ped(frame_dt);
 
         // break-up: a destroyed vehicle (burn-through or crash) explodes once.
         if self.launch.as_ref().map(|rk| rk.destroyed).unwrap_or(false) && !self.exploded {
@@ -1977,9 +1994,13 @@ impl World {
 
     /// The point the rocket-view camera looks at (launch-tangent metres, f64).
     fn camera_look_local(&self) -> DVec3 {
-        // Driving: frame the car (camera orbits/zooms around it as usual).
+        // Driving / on foot: frame the car or the character (the camera orbits
+        // and zooms around it as usual).
         if self.driving {
             return self.car_pos + DVec3::new(0.0, 1.4, 0.0);
+        }
+        if self.walking {
+            return self.ped_pos + DVec3::new(0.0, 1.5, 0.0);
         }
         let target = self.cam_target_local();
         match self.launch.as_ref() {
@@ -2137,10 +2158,16 @@ impl World {
         self.car_pos = DVec3::new(40.0, 0.0, 0.0);
         let to_city = CITY_CENTER.as_dvec3() - self.car_pos;
         self.car_yaw = (to_city.z as f32).atan2(to_city.x as f32); // face the city
+        self.start_driving();
+    }
+
+    /// Begin driving the car wherever it currently sits (used both by the direct
+    /// "Drive car" entry and by getting in on foot), with the camera trailing.
+    fn start_driving(&mut self) {
         self.car_speed = 0.0;
         self.drive_in = [false; 4];
         self.driving = true;
-        // trail the car: camera behind, slightly raised, close in.
+        self.walking = false;
         self.rocket_az = self.car_yaw + std::f32::consts::PI;
         self.rocket_el = 0.22;
         self.rocket_dist = 18.0;
@@ -2151,6 +2178,91 @@ impl World {
         self.driving = false;
         self.car_speed = 0.0;
         self.drive_in = [false; 4];
+    }
+
+    /// Get out on foot beside the car: switch from driving to walking, dropping
+    /// the character next to the driver's door.
+    fn get_out_car(&mut self) {
+        self.driving = false;
+        self.car_speed = 0.0;
+        self.drive_in = [false; 4];
+        // step out to the left of the car's heading.
+        let side = DVec3::new(-(self.car_yaw.sin() as f64), 0.0, self.car_yaw.cos() as f64);
+        self.ped_pos = self.car_pos + side * 3.0;
+        self.ped_pos.y = 0.0;
+        self.ped_yaw = self.car_yaw;
+        self.start_walking();
+    }
+
+    /// Set out on foot from the launch complex: spawn the character by the parked
+    /// car so it's easy to find and get into.
+    fn enter_walk(&mut self) {
+        self.view = View::Rocket;
+        self.reset_launch();
+        self.vab_mode = false;
+        self.show_lander = false;
+        // park the car near the pad and stand the character beside it.
+        self.car_pos = DVec3::new(34.0, 0.0, 0.0);
+        let to_city = CITY_CENTER.as_dvec3() - self.car_pos;
+        self.car_yaw = (to_city.z as f32).atan2(to_city.x as f32);
+        self.ped_pos = DVec3::new(30.0, 0.0, 4.0);
+        self.ped_yaw = self.car_yaw;
+        self.start_walking();
+    }
+
+    fn start_walking(&mut self) {
+        self.walking = true;
+        self.driving = false;
+        self.ped_speed = 0.0;
+        self.walk_in = [false; 4];
+        self.rocket_az = self.ped_yaw + std::f32::consts::PI;
+        self.rocket_el = 0.20;
+        self.rocket_dist = 7.0;
+    }
+
+    /// Stop walking and return to the standard launch-complex view.
+    fn exit_walk(&mut self) {
+        self.walking = false;
+        self.ped_speed = 0.0;
+        self.walk_in = [false; 4];
+    }
+
+    /// Whether the character is standing close enough to the car to get in.
+    fn near_car(&self) -> bool {
+        let d = self.ped_pos - self.car_pos;
+        (d.x * d.x + d.z * d.z) < 5.0 * 5.0
+    }
+
+    /// Get into the car from on foot (only when standing next to it): keeps the
+    /// car where it is and starts driving.
+    fn get_in_car(&mut self) {
+        if self.near_car() {
+            self.start_driving();
+        }
+    }
+
+    /// Walking dynamics: held WASD move the character (forward/back along its
+    /// facing, A/D turn), with a quick ramp and a walk-cycle phase that advances
+    /// with distance travelled. Real time (independent of warp).
+    fn advance_ped(&mut self, dt: f32) {
+        if !self.walking || dt <= 0.0 {
+            return;
+        }
+        let walk_speed = 4.2; // m/s
+        let target = ((self.walk_in[0] as i32 - self.walk_in[1] as i32) as f32) * walk_speed;
+        // brisk accel/decel toward the target speed.
+        let k = (1.0 - (-dt / 0.12).exp()).clamp(0.0, 1.0);
+        self.ped_speed += (target - self.ped_speed) * k;
+        let turn = (self.walk_in[2] as i32 - self.walk_in[3] as i32) as f32;
+        self.ped_yaw += turn * 2.4 * dt;
+        let heading = DVec3::new(self.ped_yaw.cos() as f64, 0.0, self.ped_yaw.sin() as f64);
+        self.ped_pos += heading * (self.ped_speed * dt) as f64;
+        self.ped_pos.y = 0.0;
+        // advance the stride with distance so the gait matches the pace.
+        self.walk_phase += self.ped_speed.abs() * 1.7 * dt;
+        if self.walk_phase > std::f32::consts::TAU {
+            self.walk_phase -= std::f32::consts::TAU;
+        }
     }
 
     /// Arcade car dynamics: held WASD give throttle/reverse + steering, with
@@ -2765,6 +2877,22 @@ impl World {
                 let n = Vec3::from(v.normal);
                 let rn = Vec3::new(c * n.x - s * n.z, n.y, s * n.x + c * n.z);
                 let local = self.car_pos + rp.as_dvec3();
+                out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: rn.into(), color: v.color });
+            }
+        }
+
+        // the third-person character (on foot only), posed for the walk cycle and
+        // yawed to its heading.
+        if self.walking {
+            let moving = (self.ped_speed.abs() / 1.5).clamp(0.0, 1.0);
+            let ped = rocket::character(self.walk_phase, moving);
+            let (s, c) = self.ped_yaw.sin_cos();
+            for v in &ped.verts {
+                let p = Vec3::from(v.pos);
+                let rp = Vec3::new(c * p.x - s * p.z, p.y, s * p.x + c * p.z);
+                let n = Vec3::from(v.normal);
+                let rn = Vec3::new(c * n.x - s * n.z, n.y, s * n.x + c * n.z);
+                let local = self.ped_pos + rp.as_dvec3();
                 out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: rn.into(), color: v.color });
             }
         }
@@ -4932,6 +5060,19 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
         w.sys_el = 0.32;
     };
     let time = match scenario {
+        "walk" => {
+            // the third-person character on foot by the car, mid-stride.
+            world.view = View::Rocket;
+            world.enter_walk();
+            world.ped_pos = DVec3::new(28.0, 0.0, 6.0);
+            world.ped_yaw = 0.5;
+            world.ped_speed = 3.5; // pose the walk cycle (idle would stand still)
+            world.walk_phase = 1.2;
+            world.rocket_az = world.ped_yaw + std::f32::consts::PI + 0.5;
+            world.rocket_el = 0.12;
+            world.rocket_dist = 6.5;
+            0.0
+        }
         "drive" => {
             // the car on the road just south of the city, third-person chase
             // camera trailing it as it faces into the downtown grid.
@@ -6287,19 +6428,25 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::KeyboardInput { event: key_event, .. } => {
-                // Car driving: held WASD/arrows steer the car. Handle press AND
-                // release here (so keys can be held) and skip the other controls.
-                if state.world.driving {
+                // Car driving / on foot: held WASD/arrows steer the car or move the
+                // character. Handle press AND release here (so keys can be held)
+                // and skip the other controls.
+                if state.world.driving || state.world.walking {
                     let kc = match key_event.physical_key {
                         PhysicalKey::Code(c) => c,
                         _ => return,
                     };
                     let down = key_event.state == ElementState::Pressed;
+                    let inp = if state.world.driving {
+                        &mut state.world.drive_in
+                    } else {
+                        &mut state.world.walk_in
+                    };
                     match kc {
-                        KeyCode::KeyW | KeyCode::ArrowUp => state.world.drive_in[0] = down,
-                        KeyCode::KeyS | KeyCode::ArrowDown => state.world.drive_in[1] = down,
-                        KeyCode::KeyA | KeyCode::ArrowLeft => state.world.drive_in[2] = down,
-                        KeyCode::KeyD | KeyCode::ArrowRight => state.world.drive_in[3] = down,
+                        KeyCode::KeyW | KeyCode::ArrowUp => inp[0] = down,
+                        KeyCode::KeyS | KeyCode::ArrowDown => inp[1] = down,
+                        KeyCode::KeyA | KeyCode::ArrowLeft => inp[2] = down,
+                        KeyCode::KeyD | KeyCode::ArrowRight => inp[3] = down,
                         _ => {}
                     }
                     state.window.request_redraw();
@@ -6576,6 +6723,8 @@ fn main() {
             }
             let scenario = if args.iter().any(|a| a == "cityview") {
                 "cityview"
+            } else if args.iter().any(|a| a == "walk") {
+                "walk"
             } else if args.iter().any(|a| a == "drive") {
                 "drive"
             } else if args.iter().any(|a| a == "m1_vab") {
