@@ -73,6 +73,43 @@ fn vnoise(p: vec3<f32>) -> f32 {
     return mix(y0, y1, w.z);
 }
 
+// Scattered jitter vector in 0..1 for a Voronoi cell, so feature points sit at
+// irregular positions inside their integer cells.
+fn hash33(p: vec3<f32>) -> vec3<f32> {
+    let q = vec3<f32>(
+        dot(p, vec3<f32>(127.1, 311.7, 74.7)),
+        dot(p, vec3<f32>(269.5, 183.3, 246.1)),
+        dot(p, vec3<f32>(113.5, 271.9, 124.6)),
+    );
+    return fract(sin(q) * 43758.5453);
+}
+
+// Worley / Voronoi F1: distance to the nearest jittered feature point (cells of
+// size 1). Each feature point is a "settlement"; 1 - F1 lights them up as a
+// field of discrete points rather than a smooth blob.
+fn worley(p: vec3<f32>) -> f32 {
+    let ip = floor(p);
+    let fp = fract(p);
+    var d = 1.0e9;
+    for (var z = -1; z <= 1; z = z + 1) {
+        for (var y = -1; y <= 1; y = y + 1) {
+            for (var x = -1; x <= 1; x = x + 1) {
+                let g = vec3<f32>(f32(x), f32(y), f32(z));
+                let o = hash33(ip + g);
+                let r = g + o - fp;
+                d = min(d, dot(r, r));
+            }
+        }
+    }
+    return sqrt(d);
+}
+
+// Brightness of the Voronoi point field at F1 distance `f`: a bright dot at each
+// feature point, falling off with `sharp` (higher = tighter points).
+fn point_dot(f: f32, sharp: f32) -> f32 {
+    return pow(clamp(1.0 - f, 0.0, 1.0), sharp);
+}
+
 // Nearest positive root of the ray/sphere intersection, or -1.0 on a miss.
 fn hit_sphere(ro: vec3<f32>, rd: vec3<f32>, center: vec3<f32>, radius: f32) -> f32 {
     let oc = center - ro;
@@ -104,28 +141,26 @@ fn shade_planet(p: vec3<f32>, center: vec3<f32>, color: vec3<f32>) -> vec3<f32> 
 }
 
 // Detailed night-side city lights. The baked emission map (texel.a) gives the
-// regional glow (where cities are, sized by population); on top of it we add
-// procedural structure - discrete lit districts, dense cores fading to
-// scattered suburbs, a few twinkling points, and warm/cool colour variation -
-// so the lights read as a granular sprawl from space rather than a smooth blob.
+// regional glow (where cities and highways are); on top of it we add Voronoi
+// point fields so a metro reads as lots of discrete settlement points rather
+// than a smooth blob. A flat base term keeps the highways continuously lit.
 fn city_lights(n: vec3<f32>, emission: f32, time: f32) -> vec3<f32> {
     if (emission < 0.0015) {
         return vec3<f32>(0.0);
     }
-    // fine grain: individual neighbourhoods/streets within the glow
-    let fine = vnoise(n * 520.0);
-    let fine2 = vnoise(n * 240.0 + vec3<f32>(7.3, 1.1, 4.2));
-    // sharpen into bright pockets sitting on a connected glow (not pure dots)
-    let cells = pow(max(fine * fine2, 0.0), 2.2);
+    // Voronoi point fields: coarse district cores + a dense field of small
+    // neighbourhood points. Each feature point is a lit settlement.
+    let big = point_dot(worley(n * 230.0), 1.6);
+    let fine = point_dot(worley(n * 720.0 + vec3<f32>(11.3, 4.1, 7.7)), 2.6);
+    let dots = max(big, 0.6 * fine) + 0.4 * big * fine;
     // mid-scale clustering: bright downtown cores out to sparse outskirts
-    let cluster = 0.22 + 0.78 * smoothstep(0.30, 0.82, vnoise(n * 95.0));
-    // a faint road-grid shimmer between the pockets
-    let grid = 0.10 * smoothstep(0.6, 1.0, vnoise(n * 1100.0));
-    // subtle twinkle on the brightest points
-    let tw = 0.85 + 0.15 * sin(time * 2.5 + fine * 130.0);
-    let inten = emission * cluster * (0.38 + 2.3 * cells + grid) * tw;
-    // warm sodium glow, with a few cooler (whiter) modern districts
-    let cool = smoothstep(0.74, 0.92, fine2);
+    let cluster = 0.25 + 0.75 * smoothstep(0.28, 0.85, vnoise(n * 90.0));
+    // warm/cool district variation, and a subtle twinkle on the points
+    let warmcool = vnoise(n * 240.0 + vec3<f32>(7.3, 1.1, 4.2));
+    let tw = 0.85 + 0.15 * sin(time * 2.5 + warmcool * 130.0);
+    // base term = continuous glow (keeps highways lit); the dots ride on top.
+    let inten = emission * (0.32 + cluster * (0.22 + 2.4 * dots)) * tw;
+    let cool = smoothstep(0.72, 0.92, warmcool);
     let warm = vec3<f32>(1.0, 0.72, 0.38);
     let white = vec3<f32>(0.85, 0.90, 1.0);
     let lcol = mix(warm, white, cool * 0.6);
