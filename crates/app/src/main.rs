@@ -180,39 +180,79 @@ const MM: f32 = 1.0e6;
 const HANGAR_POS: Vec3 = Vec3::new(-5000.0, 0.0, 0.0);
 const RACK_POS: Vec3 = Vec3::new(-5000.0, 0.0, 42.0);
 
-/// A small city out past the launch complex (local metres, east + north of the
-/// pad), with an access road running to it; you can drive the car over. This is
-/// the main downtown, city 0 of `CITIES`.
+/// Centre of the main metro (local metres, east + north of the pad): the middle
+/// downtown of cluster 0, reached by the access road, where you spawn the car.
 const CITY_CENTER: Vec3 = Vec3::new(1600.0, 0.0, 1800.0);
 
-/// The drivable cities (local launch-tangent metres, ground at y=0) and their
-/// layout variant. City 0 is the main downtown by the pad; the others are spread
-/// across the flats, all linked by the road network. Spaced several km apart so
-/// only the one you are in renders / simulates at a time.
-const CITIES: [(Vec3, u32); 4] = [
-    (CITY_CENTER, 0),
-    (Vec3::new(-2100.0, 0.0, 2500.0), 1),
-    (Vec3::new(3000.0, 0.0, -1500.0), 2),
-    (Vec3::new(-2600.0, 0.0, -2400.0), 3),
+/// Spacing between neighbouring downtowns inside a metro cluster (metres). A touch
+/// wider than a single 420 m city grid, so the grids nearly meet and read as one
+/// continuous sprawl while only one or two NPC crowds wake at a time.
+const CITY_SPACING: f32 = 460.0;
+
+/// The metro clusters: (centre, cols, rows, variant base). Each is a dense block
+/// of `cols * rows` downtowns packed together into one big sprawl; the clusters
+/// sit kilometres apart so only the metro you are in renders / simulates. Cluster
+/// 0 is the main metro by the launch pad.
+const CLUSTERS: [(Vec3, i32, i32, u32); 3] = [
+    (CITY_CENTER, 3, 3, 0),
+    (Vec3::new(-2900.0, 0.0, 2700.0), 3, 2, 20),
+    (Vec3::new(3200.0, 0.0, -2600.0), 2, 3, 40),
 ];
 
-/// Render a city when the camera focus is within this range of it (so the next
-/// city comes into view as you drive toward it, and an aerial shot can frame two).
+/// Render a city when the camera focus is within this range (catches a whole
+/// metro at once, so a cluster reads as one continuous sprawl with no pop-in).
 const CITY_RENDER_R: f64 = 2300.0;
 
-/// The road network: a curbed access road from the pad to the main downtown, plus
-/// lean (curb-less) inter-city links wiring all the cities into one loop. Each
-/// entry is (a, b, mesh) so the renderer can distance-cull a link the player is
-/// nowhere near.
+/// The downtown grid of one metro cluster, centred on `center` (each entry is the
+/// city centre + its layout variant, so neighbouring downtowns look distinct).
+fn cluster_cities(center: Vec3, cols: i32, rows: i32, vbase: u32) -> Vec<(Vec3, u32)> {
+    let mut v = Vec::new();
+    let ox = (cols as f32 - 1.0) * 0.5;
+    let oz = (rows as f32 - 1.0) * 0.5;
+    for c in 0..cols {
+        for r in 0..rows {
+            let p = center + Vec3::new((c as f32 - ox) * CITY_SPACING, 0.0, (r as f32 - oz) * CITY_SPACING);
+            v.push((p, vbase + (c * rows + r) as u32));
+        }
+    }
+    v
+}
+
+/// Every drivable downtown across all metro clusters (centre + layout variant).
+fn all_cities() -> Vec<(Vec3, u32)> {
+    let mut v = Vec::new();
+    for &(center, cols, rows, vbase) in &CLUSTERS {
+        v.extend(cluster_cities(center, cols, rows, vbase));
+    }
+    v
+}
+
+/// The road network: a curbed access road from the pad to the main metro, lean
+/// inter-metro highways wiring the cluster centres into a loop, and avenues
+/// linking neighbouring downtowns inside each metro. Each entry is (a, b, mesh)
+/// so the renderer can distance-cull a link the player is nowhere near.
 fn build_city_roads() -> Vec<(Vec3, Vec3, rocket::Mesh)> {
     let pad = Vec3::new(40.0, 0.0, 0.0);
     let mut roads = Vec::new();
-    // access road from the launch complex to the main city (with curbs).
-    roads.push((pad, CITIES[0].0, rocket::road_l(pad, CITIES[0].0, 10.0, true)));
-    // link the cities into a loop so you can drive between all of them.
-    for &(a, b) in &[(0usize, 1usize), (1, 3), (3, 2), (2, 0)] {
-        let (ca, cb) = (CITIES[a].0, CITIES[b].0);
-        roads.push((ca, cb, rocket::road_l(ca, cb, 9.0, false)));
+    // access road from the launch complex to the main metro (with curbs).
+    roads.push((pad, CITY_CENTER, rocket::road_l(pad, CITY_CENTER, 10.0, true)));
+    // inter-metro highways: link the cluster centres into a loop.
+    let n = CLUSTERS.len();
+    for i in 0..n {
+        let (a, b) = (CLUSTERS[i].0, CLUSTERS[(i + 1) % n].0);
+        roads.push((a, b, rocket::road_l(a, b, 9.0, false)));
+    }
+    // avenues between neighbouring (axis-adjacent) downtowns within each metro.
+    let max = (CITY_SPACING * 1.3) as f64;
+    for &(center, cols, rows, vbase) in &CLUSTERS {
+        let cs = cluster_cities(center, cols, rows, vbase);
+        for i in 0..cs.len() {
+            for j in (i + 1)..cs.len() {
+                if (cs[i].0 - cs[j].0).length() as f64 <= max {
+                    roads.push((cs[i].0, cs[j].0, rocket::road_l(cs[i].0, cs[j].0, 9.0, false)));
+                }
+            }
+        }
     }
     roads
 }
@@ -783,7 +823,7 @@ impl World {
             // crawls the rocket along it.
             road_mesh: rocket::crawlerway(HANGAR_POS.x, 12.0, 14.0),
             platform_mesh: rocket::crawler_platform(),
-            city_meshes: CITIES.iter().map(|&(c, v)| (c, rocket::city(c, v))).collect(),
+            city_meshes: all_cities().iter().map(|&(c, v)| (c, rocket::city(c, v))).collect(),
             roads: build_city_roads(),
             car_mesh: rocket::car([0.80, 0.18, 0.16]),
             lander_mesh: rocket::lander(),
@@ -862,7 +902,7 @@ impl World {
             ped_speed: 0.0,
             walk_phase: 0.0,
             walk_in: [false; 4],
-            traffic: CITIES.iter().map(|&(c, _)| traffic::Traffic::new(c.as_dvec3())).collect(),
+            traffic: all_cities().iter().map(|&(c, _)| traffic::Traffic::new(c.as_dvec3())).collect(),
         };
         // Generate the full Kepler-47 system; the landable moon is injected as
         // home's first moon so the map and the flight sim agree.
@@ -5167,21 +5207,17 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
     };
     let time = match scenario {
         "cities" => {
-            // out on the inter-city road, approaching the next downtown (lit
-            // windows ahead) with the road running into it across the flats.
+            // an elevated look across the main metro: a dense cluster of downtowns
+            // packed into one big sprawl, linked by avenues.
             world.view = View::Rocket;
             world.enter_drive();
-            // on the city0 -> city2 link (the arm at x = city2.x), 1.5 km north of
-            // city2, facing south toward it.
-            world.car_pos = DVec3::new(CITIES[2].0.x as f64, 0.0, 0.0);
-            world.car_yaw = -std::f32::consts::FRAC_PI_2; // face -Z (toward city2)
+            world.car_pos = CITY_CENTER.as_dvec3();
             for _ in 0..20 {
                 world.advance(0.1);
             }
-            world.car_yaw = -std::f32::consts::FRAC_PI_2;
-            world.rocket_az = world.car_yaw + std::f32::consts::PI;
-            world.rocket_el = 0.20;
-            world.rocket_dist = 42.0;
+            world.rocket_az = 2.3;
+            world.rocket_el = 0.42;
+            world.rocket_dist = 1500.0;
             0.0
         }
         "citylife" => {

@@ -1190,10 +1190,11 @@ pub fn road_l(a: Vec3, b: Vec3, half_w: f32, curbs: bool) -> Mesh {
 }
 
 /// A procedural downtown: a street grid of blocks, each packed with a few
-/// buildings of varying height and colour, taller toward the centre, with lit
-/// windows that glow, on a paved ground plane. Centred at `center` (local metres,
-/// ground at y=0). `variant` reseeds the layout so different cities look
-/// distinct. Fully deterministic so it meshes the same every frame.
+/// buildings of varying height and colour, taller toward the centre, on a paved
+/// ground plane. Centred at `center` (local metres, ground at y=0). `variant`
+/// reseeds the layout so different cities look distinct, which is what makes a
+/// cluster of these read as one big sprawl of separate downtowns. Fully
+/// deterministic so it meshes the same every frame.
 pub fn city(center: Vec3, variant: u32) -> Mesh {
     let mut m = Mesh::default();
     let seed = variant as i32 * 1009;
@@ -1238,10 +1239,6 @@ pub fn city(center: Vec3, variant: u32) -> Mesh {
         [0.66, 0.62, 0.55],
     ];
     let roof = [0.30, 0.30, 0.33];
-    // emissive window glow (warm office light / cool fluorescent): summed > ~3.1
-    // so the surface shader reads it as self-illuminated and it glows.
-    let warm = [1.8, 1.45, 0.85];
-    let cool = [0.95, 1.15, 1.7];
 
     for ix in 0..nx {
         for iz in 0..nz {
@@ -1270,29 +1267,6 @@ pub fn city(center: Vec3, variant: u32) -> Mesh {
                 m.bx(Vec3::new(cx, height + 0.5, cz), Vec3::new(fw * 0.96, 0.5, fd * 0.96), roof);
                 if h2 > 0.5 {
                     m.bx(Vec3::new(cx + fw * 0.3, height + 1.6, cz - fd * 0.3), Vec3::new(fw * 0.25, 1.1, fd * 0.25), roof);
-                }
-
-                // lit windows: most (not all) buildings glow, as thin emissive
-                // bands scattered up the four faces, so the city reads as an
-                // occupied, lit skyline. Each band is a slim bright box proud of a
-                // face. Kept lean (capped bands, gated buildings) for the vertex
-                // budget since several blocks of these add up fast.
-                if h(ix * 3 + k, iz * 9 + 1) > 0.32 {
-                    let win = if h(ix * 7 + k, iz * 5 + 3) > 0.5 { warm } else { cool };
-                    let bands = ((height / 7.0) as i32).clamp(1, 6);
-                    for bnd in 0..bands {
-                        if h(ix * 53 + k * 7 + bnd, iz * 37 + bnd * 3) < 0.45 {
-                            continue; // scatter: skip ~45% of bands
-                        }
-                        let wy = 3.0 + bnd as f32 * 7.0;
-                        if wy > height - 1.5 {
-                            break;
-                        }
-                        m.bx(Vec3::new(cx + fw, wy, cz), Vec3::new(0.06, 0.9, fd * 0.82), win);
-                        m.bx(Vec3::new(cx - fw, wy, cz), Vec3::new(0.06, 0.9, fd * 0.82), win);
-                        m.bx(Vec3::new(cx, wy, cz + fd), Vec3::new(fw * 0.82, 0.9, 0.06), win);
-                        m.bx(Vec3::new(cx, wy, cz - fd), Vec3::new(fw * 0.82, 0.9, 0.06), win);
-                    }
                 }
             }
         }
