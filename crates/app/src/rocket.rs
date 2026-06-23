@@ -1318,20 +1318,53 @@ pub fn city(center: Vec3, variant: u32) -> Mesh {
         }
     }
 
-    // Streetlights at the grid intersections: a dark pole, an emissive lamp head,
-    // and a warm light pool baked onto the road - so the streets read as lit at
-    // night (these glow via the night-boosted emissive term). The lamps also
-    // double as realtime point lights for moving NPCs (chosen in the renderer).
+    // Warm sodium street lighting baked onto the roads so the WHOLE street glows
+    // amber at night (brightest under the lamps), like a real lit street rather
+    // than isolated pools. A continuous amber wash runs the length of every
+    // street; brighter pools, poles and emissive heads sit at the intersections.
+    // All of this glows via the night-boosted emissive term and stays subtle by
+    // day; the lamps also drive realtime point lights for moving NPCs.
+    // Streetlight poles + emissive heads (these read fine by day; the warm ground
+    // wash and pools that actually light the streets at night live in the
+    // separate `city_night_glow` mesh, drawn only at night - their bright amber
+    // albedo would otherwise tint the streets tan in daylight).
     let pole = [0.20, 0.20, 0.23];
-    let head = [1.85, 1.45, 0.85]; // emissive warm sodium head
-    let pool_in = [1.75, 1.32, 0.78]; // bright pool centre
-    let pool_out = [1.25, 0.97, 0.6]; // softer pool skirt
+    let head = [2.0, 1.5, 0.85]; // emissive warm sodium head
     for lp in city_lamps(center) {
         m.bx(Vec3::new(lp.x, 2.5, lp.z), Vec3::new(0.16, 2.5, 0.16), pole);
         m.bx(Vec3::new(lp.x, lp.y, lp.z), Vec3::new(0.5, 0.28, 0.5), head);
-        // stacked flat quads on the road for a soft pool of cast light.
-        m.bx(Vec3::new(lp.x, 0.05, lp.z), Vec3::new(9.0, 0.03, 9.0), pool_out);
-        m.bx(Vec3::new(lp.x, 0.08, lp.z), Vec3::new(5.0, 0.03, 5.0), pool_in);
+    }
+    m
+}
+
+/// The night-only warm ground lighting for a city: a broad amber wash over the
+/// whole floor (so the streets glow amber end to end, like a real lit street)
+/// plus brighter pools under each lamp. Kept separate from the day city mesh
+/// because its bright amber albedo would tint the streets tan in daylight; the
+/// renderer draws it only at night, where the night-boosted emissive term makes
+/// it glow. The wash is tessellated on a 30 m grid (streets land on cell centres,
+/// not seams) and lifted clear of the paved ground so the logarithmic depth
+/// resolves - a single giant quad fails the depth test against the ground.
+pub fn city_night_glow(center: Vec3) -> Mesh {
+    let mut m = Mesh::default();
+    let (nx, nz) = (7i32, 7i32);
+    let span = 60.0f32;
+    let half_x = nx as f32 * span * 0.5;
+    let half_z = nz as f32 * span * 0.5;
+    let amber = [1.34, 0.94, 0.53];
+    let pool_in = [1.9, 1.4, 0.8];
+    let pool_out = [1.55, 1.12, 0.64];
+    let cell = span * 0.5;
+    for jx in -1..=(2 * nx + 1) {
+        for jz in -1..=(2 * nz + 1) {
+            let cx = center.x - half_x + jx as f32 * cell;
+            let cz = center.z - half_z + jz as f32 * cell;
+            m.bx(Vec3::new(cx, 0.35, cz), Vec3::new(cell * 0.5, 0.02, cell * 0.5), amber);
+        }
+    }
+    for lp in city_lamps(center) {
+        m.bx(Vec3::new(lp.x, 0.42, lp.z), Vec3::new(10.0, 0.03, 10.0), pool_out);
+        m.bx(Vec3::new(lp.x, 0.46, lp.z), Vec3::new(5.5, 0.03, 5.5), pool_in);
     }
     m
 }

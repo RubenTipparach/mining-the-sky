@@ -138,7 +138,7 @@ const HUD_CAP: u64 = 40000;
 const FX_CAP: u64 = 60000;
 /// Dynamic rocket-view geometry (pad + rocket + spent booster, or a surface
 /// mesh: moon base / cargo module / a full procedural asteroid ~66k verts).
-const DYN_MESH_CAP: u64 = 400_000;
+const DYN_MESH_CAP: u64 = 480_000;
 /// Procedural re-entry plasma glow mesh (prototype mesh approach): an isosurface
 /// shell hugging the vehicle SDF (surface nets), so it can run to tens of
 /// thousands of verts on a boostered stack.
@@ -612,6 +612,9 @@ struct World {
     /// them to each other and the launch complex (each road is (a, b, mesh) so it
     /// can be distance-culled). All static, in launch-tangent local metres.
     city_meshes: Vec<(Vec3, rocket::Mesh)>,
+    /// Night-only warm ground lighting per city (amber street wash + lamp pools),
+    /// drawn only when `night` so its amber albedo does not tint the day streets.
+    city_glow: Vec<(Vec3, rocket::Mesh)>,
     roads: Vec<(Vec3, Vec3, rocket::Mesh)>,
     car_mesh: rocket::Mesh,
     lander_mesh: rocket::Mesh,
@@ -830,6 +833,7 @@ impl World {
             road_mesh: rocket::crawlerway(HANGAR_POS.x, 12.0, 14.0),
             platform_mesh: rocket::crawler_platform(),
             city_meshes: all_cities().iter().map(|&(c, v)| (c, rocket::city(c, v))).collect(),
+            city_glow: all_cities().iter().map(|&(c, _)| (c, rocket::city_night_glow(c))).collect(),
             roads: build_city_roads(),
             car_mesh: rocket::car([0.80, 0.18, 0.16]),
             lander_mesh: rocket::lander(),
@@ -3017,6 +3021,15 @@ impl World {
         for (center, mesh) in &self.city_meshes {
             if near(*center) {
                 push_static(&mut out, mesh);
+            }
+        }
+        // The warm street/ground lighting is drawn only at night (its amber albedo
+        // would tint the day streets), tracking the same per-city culling.
+        if self.night {
+            for (center, mesh) in &self.city_glow {
+                if near(*center) {
+                    push_static(&mut out, mesh);
+                }
             }
         }
         for (a, b, mesh) in &self.roads {
