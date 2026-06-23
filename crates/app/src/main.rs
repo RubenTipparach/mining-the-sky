@@ -391,6 +391,9 @@ const HORIZON: [f32; 3] = [0.74, 0.82, 0.93];
 /// Sun direction in the launch tangent frame (east, up, north). The home world
 /// uses a fairly high sun; the moon uses a low, grazing sun for long shadows.
 const SUN_LOCAL: Vec3 = Vec3::new(0.40, 0.72, 0.55);
+/// Night sun: well below the horizon, so the atmosphere shader renders a dark
+/// sky and the mesh shader's day/night factor collapses the sky-fill ambient.
+const SUN_LOCAL_NIGHT: Vec3 = Vec3::new(0.42, -0.40, 0.50);
 const SUN_LOCAL_MOON: Vec3 = Vec3::new(0.62, 0.17, 0.77);
 /// Deep-space (asteroid) sun: higher than the lunar grazing sun so a body
 /// viewed from the sun side reads as a solid lit rock.
@@ -634,6 +637,9 @@ struct World {
     ast_radius: f64,
     /// Render the surface as the moon: grey regolith + black airless sky.
     lunar: bool,
+    /// Night on the home world: a below-horizon sun, so the sky goes dark and
+    /// the emissive city lights carry the scene.
+    night: bool,
     /// Height (m) the lander floats above the surface (0 = landed).
     lander_alt: f32,
     /// Fire the lander's descent engine (plume under the bell).
@@ -836,6 +842,7 @@ impl World {
             ast_elev: None,
             ast_radius: 0.0,
             lunar: false,
+            night: false,
             lander_alt: 0.0,
             lander_firing: false,
             lander_rcs: 0.0,
@@ -1300,6 +1307,8 @@ impl World {
             SUN_LOCAL_SPACE
         } else if self.lunar {
             SUN_LOCAL_MOON
+        } else if self.night {
+            SUN_LOCAL_NIGHT
         } else {
             SUN_LOCAL
         };
@@ -1346,6 +1355,8 @@ impl World {
             SUN_LOCAL_SPACE
         } else if self.lunar {
             SUN_LOCAL_MOON
+        } else if self.night {
+            SUN_LOCAL_NIGHT
         } else {
             SUN_LOCAL
         };
@@ -5206,6 +5217,18 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
         w.sys_el = 0.32;
     };
     let time = match scenario {
+        "overlook" => {
+            // a high vantage west of the pad looking east over the coast to the
+            // ocean, to evaluate the landscape and water surface.
+            world.view = View::Rocket;
+            world.rocket_az = std::f32::consts::PI;
+            world.rocket_el = 0.16;
+            world.rocket_dist = 6000.0;
+            for _ in 0..40 {
+                world.advance(0.1);
+            }
+            0.0
+        }
         "cities" => {
             // an elevated look across the main metro: a dense cluster of downtowns
             // packed into one big sprawl, linked by avenues.
@@ -5218,6 +5241,33 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.rocket_az = 2.3;
             world.rocket_el = 0.42;
             world.rocket_dist = 1500.0;
+            0.0
+        }
+        "descent" => {
+            // mid descent: a closer pass over the night side, the city-light
+            // clusters filling more of the frame on the way down.
+            frame_map(&mut world);
+            world.sys_dist = 9.5;
+            world.sys_az = 4.3;
+            world.sys_el = 0.14;
+            6.0
+        }
+        "nightcity" => {
+            // street level in the metro at night: the sky is dark and the
+            // emissive windows + traffic carry the scene.
+            world.view = View::Rocket;
+            world.night = true;
+            world.enter_drive();
+            let lane_x = (CITY_CENTER.x - 210.0 + 3.0 * 60.0) as f64;
+            world.car_pos = DVec3::new(lane_x, 0.0, (CITY_CENTER.z - 175.0) as f64);
+            world.car_yaw = std::f32::consts::FRAC_PI_2;
+            for _ in 0..45 {
+                world.advance(0.1);
+            }
+            world.car_yaw = std::f32::consts::FRAC_PI_2;
+            world.rocket_az = world.car_yaw + std::f32::consts::PI;
+            world.rocket_el = 0.20;
+            world.rocket_dist = 46.0;
             0.0
         }
         "citylife" => {
@@ -6981,6 +7031,12 @@ fn main() {
                 "citylights"
             } else if args.iter().any(|a| a == "homeworld") {
                 "homeworld"
+            } else if args.iter().any(|a| a == "overlook") {
+                "overlook"
+            } else if args.iter().any(|a| a == "descent") {
+                "descent"
+            } else if args.iter().any(|a| a == "nightcity") {
+                "nightcity"
             } else if args.iter().any(|a| a == "moon") {
                 "moon"
             } else if args.iter().any(|a| a == "rocket") {
@@ -7088,6 +7144,9 @@ fn main() {
                 "moon" => "out/moon.png",
                 "citylights" => "out/citylights.png",
                 "homeworld" => "out/homeworld.png",
+                "overlook" => "out/overlook.png",
+                "descent" => "out/descent.png",
+                "nightcity" => "out/nightcity.png",
                 "rocket" => "out/rocket.png",
                 "system" => "out/system.png",
                 "pad" => "out/pad.png",

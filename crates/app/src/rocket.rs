@@ -1239,6 +1239,11 @@ pub fn city(center: Vec3, variant: u32) -> Mesh {
         [0.66, 0.62, 0.55],
     ];
     let roof = [0.30, 0.30, 0.33];
+    // Emissive window colours (summed > ~3.1 so the shader treats them as lit).
+    // The shader boosts emission at night, so these stay subtle by day and glow
+    // after dark.
+    let warm = [1.7, 1.42, 0.85];
+    let cool = [0.92, 1.12, 1.7];
 
     for ix in 0..nx {
         for iz in 0..nz {
@@ -1267,6 +1272,27 @@ pub fn city(center: Vec3, variant: u32) -> Mesh {
                 m.bx(Vec3::new(cx, height + 0.5, cz), Vec3::new(fw * 0.96, 0.5, fd * 0.96), roof);
                 if h2 > 0.5 {
                     m.bx(Vec3::new(cx + fw * 0.3, height + 1.6, cz - fd * 0.3), Vec3::new(fw * 0.25, 1.1, fd * 0.25), roof);
+                }
+
+                // Lit windows: thin emissive bands up the four faces of most (not
+                // all) buildings, so the city glows like an occupied skyline at
+                // night. Gated and capped to keep the vertex count down.
+                if h(ix * 3 + k, iz * 9 + 1) > 0.32 {
+                    let win = if h(ix * 7 + k, iz * 5 + 3) > 0.5 { warm } else { cool };
+                    let bands = ((height / 7.0) as i32).clamp(1, 6);
+                    for bnd in 0..bands {
+                        if h(ix * 53 + k * 7 + bnd, iz * 37 + bnd * 3) < 0.45 {
+                            continue;
+                        }
+                        let wy = 3.0 + bnd as f32 * 7.0;
+                        if wy > height - 1.5 {
+                            break;
+                        }
+                        m.bx(Vec3::new(cx + fw, wy, cz), Vec3::new(0.06, 0.9, fd * 0.82), win);
+                        m.bx(Vec3::new(cx - fw, wy, cz), Vec3::new(0.06, 0.9, fd * 0.82), win);
+                        m.bx(Vec3::new(cx, wy, cz + fd), Vec3::new(fw * 0.82, 0.9, 0.06), win);
+                        m.bx(Vec3::new(cx, wy, cz - fd), Vec3::new(fw * 0.82, 0.9, 0.06), win);
+                    }
                 }
             }
         }

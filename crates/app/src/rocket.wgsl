@@ -182,10 +182,16 @@ fn fs(in: VsOut) -> FsOut {
     // light is the direct sun, giving stark crater shadows. On worlds with air,
     // use a richer bluish hemispheric sky/ground ambient.
     let airless = u.sun.w;
-    let amb_air = mix(vec3<f32>(0.22, 0.20, 0.17), vec3<f32>(0.48, 0.54, 0.64), clamp(n.y * 0.5 + 0.5, 0.0, 1.0));
+    // Day/night from the sun's elevation (local-up component). At night the
+    // bluish sky-fill collapses to faint cool moonlight and the direct sun fades
+    // out, so only emissive city lights and the moon carry the scene.
+    let day = smoothstep(-0.18, 0.06, u.sun.y);
+    let amb_air_day = mix(vec3<f32>(0.22, 0.20, 0.17), vec3<f32>(0.48, 0.54, 0.64), clamp(n.y * 0.5 + 0.5, 0.0, 1.0));
+    let amb_night = vec3<f32>(0.040, 0.050, 0.078);
+    let amb_air = mix(amb_night, amb_air_day, day);
     let amb_moon = vec3<f32>(0.09, 0.09, 0.10);
     let amb = mix(amb_air, amb_moon, airless);
-    let sun_col = mix(vec3<f32>(1.05, 1.0, 0.92), vec3<f32>(1.25, 1.22, 1.15), airless);
+    let sun_col = mix(vec3<f32>(1.05, 1.0, 0.92), vec3<f32>(1.25, 1.22, 1.15), airless) * max(day, airless);
 
     // Soft sun specular (Blinn-Phong): a sheen on the car, buildings and metal so
     // surfaces catch the light instead of reading as flat matte blocks.
@@ -203,7 +209,7 @@ fn fs(in: VsOut) -> FsOut {
     // A subtle sky reflection on grazing faces (worlds with air only): lifts the
     // edges of buildings/vehicles with a hint of sky colour for some depth.
     let fres = pow(1.0 - max(dot(n, vdir), 0.0), 4.0);
-    lit = lit + vec3<f32>(0.45, 0.52, 0.64) * fres * 0.08 * (1.0 - airless);
+    lit = lit + vec3<f32>(0.45, 0.52, 0.64) * fres * 0.08 * (1.0 - airless) * day;
 
     // interior point lights (work lights in the assembly building): per-fragment
     // diffuse with inverse-square-ish falloff, so they pool light on nearby
@@ -222,9 +228,11 @@ fn fs(in: VsOut) -> FsOut {
     // lamps, work lights) reads as self-illuminated, so it glows at dusk and on
     // shadowed faces instead of being darkened by the lighting. Keyed on summed
     // brightness so ordinary albedo (which stays under ~1 each) is untouched.
+    // Emission boosts at night (lights come on), so windows/lamps stay subtle by
+    // day but glow after dark.
     let lum = in.color.r + in.color.g + in.color.b;
     let emis = smoothstep(2.3, 3.1, lum);
-    lit = mix(lit, in.color, emis * 0.9);
+    lit = mix(lit, in.color, emis * (0.4 + 0.6 * (1.0 - day)));
 
     // aerial perspective: fade toward horizon haze with view distance.
     let dist = in.flogz - 1.0; // = view-space distance (clip.w)
