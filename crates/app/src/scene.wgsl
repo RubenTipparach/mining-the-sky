@@ -88,7 +88,7 @@ fn hash33(p: vec3<f32>) -> vec3<f32> {
 // reaching zero past `radius` so points stay small and separated.
 fn dot_bright(d2: f32, radius: f32) -> f32 {
     let d = sqrt(d2);
-    return pow(clamp(1.0 - d / radius, 0.0, 1.0), 1.4);
+    return pow(clamp(1.0 - d / radius, 0.0, 1.0), 1.8);
 }
 
 // Gated Voronoi point field. Each cell holds one feature point ("a town"), but it
@@ -162,16 +162,17 @@ fn city_lights(n: vec3<f32>, emission: f32, time: f32) -> vec3<f32> {
     // local density drives how many feature points light up (cores >= 1 fill in;
     // fringes light only a scattered few).
     let density = clamp(emission * 1.4, 0.0, 1.45);
-    let coarse = scatter_points(n * 125.0, density, 0.58);
-    let fine = scatter_points(n * 350.0 + vec3<f32>(11.3, 4.1, 7.7), density, 0.5);
-    let dots = max(coarse, 0.8 * fine);
-    // a faint connective bloom only in the brightest cores (kept small so the
-    // outskirts stay dotty, not smeared).
-    let glow = 0.10 * emission * emission;
+    // small, separated points at two scales so even dense cores read as many
+    // distinct dots rather than a solid cloud.
+    let coarse = scatter_points(n * 170.0, density, 0.42);
+    let fine = scatter_points(n * 470.0 + vec3<f32>(11.3, 4.1, 7.7), density, 0.32);
+    let dots = max(coarse, 0.85 * fine);
     // warm/cool district variation + a gentle twinkle on the points.
     let wc = vnoise(n * 200.0 + vec3<f32>(7.3, 1.1, 4.2));
     let tw = 0.82 + 0.18 * sin(time * 2.2 + wc * 120.0);
-    let inten = (glow + dots * (0.45 + 0.95 * emission)) * tw;
+    // no connective bloom: brightness is purely the discrete points, so the
+    // field stays point-like instead of smearing into a cloudy shape.
+    let inten = dots * (0.55 + 0.95 * emission) * tw;
     let cool = smoothstep(0.72, 0.94, wc);
     let warm = vec3<f32>(1.0, 0.72, 0.38);
     let white = vec3<f32>(0.85, 0.90, 1.0);
