@@ -38,8 +38,8 @@ impl Default for GenConfig {
             height: 1024,
             radius_km: 6200.0,
             land_fraction: 0.31,
-            n_major: 14,
-            n_minor: 40,
+            n_major: 24,
+            n_minor: 150,
         }
     }
 }
