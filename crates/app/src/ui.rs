@@ -16,7 +16,9 @@ pub fn build(ctx: &egui::Context, world: &mut World) {
     apply_theme(ctx);
     match world.view {
         View::Rocket => {
-            if world.space {
+            if world.driving {
+                drive_panel(ctx, world); // out driving the car
+            } else if world.space {
                 asteroid_panel(ctx, world); // inspecting an asteroid
             } else if world.base_mesh.is_some() && world.base_panel {
                 moonbase_panel(ctx, world); // surveying the colony
@@ -109,6 +111,7 @@ fn test_menu(ctx: &egui::Context, world: &mut World) {
         Parachute,
         Powered,
         Payload(usize),
+        Drive,
     }
     let mut act: Option<T> = None;
     let mut friction = world.test_friction;
@@ -162,6 +165,15 @@ fn test_menu(ctx: &egui::Context, world: &mut World) {
                     act = Some(T::Payload(11));
                 }
             });
+            ui.separator();
+            ui.label(egui::RichText::new("CITY").color(DIM));
+            if ui
+                .button("Drive car to the city")
+                .on_hover_text("Take the car out of the launch complex and drive into town")
+                .clicked()
+            {
+                act = Some(T::Drive);
+            }
         });
 
     world.test_friction = friction;
@@ -170,6 +182,7 @@ fn test_menu(ctx: &egui::Context, world: &mut World) {
         Some(T::Parachute) => world.setup_parachute(),
         Some(T::Powered) => world.setup_powered_descent(),
         Some(T::Payload(p)) => world.setup_payload_preview(p),
+        Some(T::Drive) => world.enter_drive(),
         None => {}
     }
 }
@@ -468,6 +481,7 @@ fn pad_panel(ctx: &egui::Context, world: &mut World) {
     let rolling = world.rolling_out;
     let mut launch = false;
     let mut back = false;
+    let mut drive = false;
 
     egui::Window::new("LAUNCH PAD")
         .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 12.0))
@@ -495,9 +509,14 @@ fn pad_panel(ctx: &egui::Context, world: &mut World) {
                     launch = true;
                 }
                 ui.label(egui::RichText::new("Space ignite  Shift/Ctrl throttle  W/S pitch").color(DIM));
-                if ui.button("Back to VAB").clicked() {
-                    back = true;
-                }
+                ui.horizontal(|ui| {
+                    if ui.button("Back to VAB").clicked() {
+                        back = true;
+                    }
+                    if ui.button("Drive car").on_hover_text("Hop in the car and drive out to the city").clicked() {
+                        drive = true;
+                    }
+                });
             }
         });
 
@@ -506,6 +525,38 @@ fn pad_panel(ctx: &egui::Context, world: &mut World) {
     }
     if back {
         world.back_to_vab();
+    }
+    if drive {
+        world.enter_drive();
+    }
+}
+
+/// Shown while driving the car (rocket view): a speed readout, the controls, and
+/// a button to park and return to the launch complex.
+fn drive_panel(ctx: &egui::Context, world: &mut World) {
+    let speed_kph = world.car_speed.abs() * 3.6;
+    let mut park = false;
+    egui::Window::new("DRIVING")
+        .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 12.0))
+        .default_width(220.0)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.label(egui::RichText::new("CAR").heading().color(AMBER));
+            egui::Grid::new("car_stats").num_columns(2).show(ui, |ui| {
+                kv(ui, "Speed", &format!("{speed_kph:.0} km/h"));
+                let gear = if world.car_speed < -0.3 { "R" } else { "D" };
+                kv(ui, "Gear", gear);
+            });
+            ui.separator();
+            ui.label(egui::RichText::new("W/S drive  A/D steer  -  drag to look").color(DIM));
+            let btn = egui::Button::new(egui::RichText::new("PARK / EXIT CAR").strong())
+                .min_size(egui::vec2(140.0, 24.0));
+            if ui.add(btn).clicked() {
+                park = true;
+            }
+        });
+    if park {
+        world.exit_drive();
     }
 }
 

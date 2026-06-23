@@ -179,6 +179,10 @@ const MM: f32 = 1.0e6;
 const HANGAR_POS: Vec3 = Vec3::new(-5000.0, 0.0, 0.0);
 const RACK_POS: Vec3 = Vec3::new(-5000.0, 0.0, 42.0);
 
+/// A small city out past the launch complex (local metres, east + north of the
+/// pad), with an access road running to it; you can drive the car over.
+const CITY_CENTER: Vec3 = Vec3::new(1600.0, 0.0, 1800.0);
+
 /// Interior work lights of the assembly building: (offset from HANGAR_POS,
 /// colour*intensity, range metres). Mounted high on the wall corners (cool) and
 /// under the roof (warm) - kept out near the structure, not beside the rocket.
@@ -527,6 +531,11 @@ struct World {
     /// the rocket along it (drawn at the rocket's resting base while not flown).
     road_mesh: rocket::Mesh,
     platform_mesh: rocket::Mesh,
+    /// A procedural downtown out past the launch complex, and the L-shaped access
+    /// road that runs out to it (both static, in launch-tangent local metres).
+    city_mesh: rocket::Mesh,
+    access_road_mesh: rocket::Mesh,
+    car_mesh: rocket::Mesh,
     lander_mesh: rocket::Mesh,
     /// Show the lunar lander standing on the ground (instead of the rocket).
     show_lander: bool,
@@ -658,6 +667,15 @@ struct World {
     /// hand-place state and integrate synchronously, so they detach the thread
     /// (clear this) and run inline; a normal ignition re-arms it.
     sim_drives_launch: bool,
+
+    /// A drivable car you can take from the launch complex out to the city. When
+    /// `driving`, WASD steers it and the rocket-view camera follows it.
+    driving: bool,
+    car_pos: DVec3, // local launch-tangent metres (x east, y up, z north)
+    car_yaw: f32,   // heading, 0 = +X (east)
+    car_speed: f32, // signed m/s along the heading
+    /// Held drive keys: [forward, back, left, right].
+    drive_in: [bool; 4],
 }
 
 impl World {
@@ -716,6 +734,10 @@ impl World {
             // crawls the rocket along it.
             road_mesh: rocket::crawlerway(HANGAR_POS.x, 12.0, 14.0),
             platform_mesh: rocket::crawler_platform(),
+            city_mesh: rocket::city(CITY_CENTER),
+            // L-shaped access road from just east of the pad out to the city.
+            access_road_mesh: rocket::road_l(Vec3::new(40.0, 0.0, 0.0), CITY_CENTER, 10.0),
+            car_mesh: rocket::car(),
             lander_mesh: rocket::lander(),
             show_lander: false,
             base_mesh: None,
@@ -781,6 +803,11 @@ impl World {
             ui_search: String::new(),
             sim: None,
             sim_drives_launch: false,
+            driving: false,
+            car_pos: DVec3::new(30.0, 0.0, 0.0),
+            car_yaw: 0.0,
+            car_speed: 0.0,
+            drive_in: [false; 4],
         };
         // Generate the full Kepler-47 system; the landable moon is injected as
         // home's first moon so the map and the flight sim agree.
@@ -1768,6 +1795,9 @@ impl World {
                 rk.integrate(&self.body, dt as f64);
             }
         }
+        // drive the car (real time, independent of the launch / warp).
+        self.advance_car(frame_dt);
+
         // break-up: a destroyed vehicle (burn-through or crash) explodes once.
         if self.launch.as_ref().map(|rk| rk.destroyed).unwrap_or(false) && !self.exploded {
             self.spawn_explosion();
@@ -1947,6 +1977,10 @@ impl World {
 
     /// The point the rocket-view camera looks at (launch-tangent metres, f64).
     fn camera_look_local(&self) -> DVec3 {
+        // Driving: frame the car (camera orbits/zooms around it as usual).
+        if self.driving {
+            return self.car_pos + DVec3::new(0.0, 1.4, 0.0);
+        }
         let target = self.cam_target_local();
         match self.launch.as_ref() {
             Some(rk) => {
@@ -2091,6 +2125,62 @@ impl World {
         self.vab_mode = true;
         self.rolling_out = false;
         self.rollout = 0.0;
+    }
+
+    /// Hop in the car and start driving (rocket view). Parks it just east of the
+    /// pad on the access road, pointing toward the city, with the camera trailing.
+    fn enter_drive(&mut self) {
+        self.view = View::Rocket;
+        self.reset_launch();
+        self.vab_mode = false;
+        self.show_lander = false;
+        self.car_pos = DVec3::new(40.0, 0.0, 0.0);
+        let to_city = CITY_CENTER.as_dvec3() - self.car_pos;
+        self.car_yaw = (to_city.z as f32).atan2(to_city.x as f32); // face the city
+        self.car_speed = 0.0;
+        self.drive_in = [false; 4];
+        self.driving = true;
+        // trail the car: camera behind, slightly raised, close in.
+        self.rocket_az = self.car_yaw + std::f32::consts::PI;
+        self.rocket_el = 0.22;
+        self.rocket_dist = 18.0;
+    }
+
+    /// Park the car and leave drive mode.
+    fn exit_drive(&mut self) {
+        self.driving = false;
+        self.car_speed = 0.0;
+        self.drive_in = [false; 4];
+    }
+
+    /// Arcade car dynamics: held WASD give throttle/reverse + steering, with
+    /// rolling friction and a top speed. Runs in real time (independent of warp).
+    fn advance_car(&mut self, dt: f32) {
+        if !self.driving || dt <= 0.0 {
+            return;
+        }
+        let accel = 18.0; // m/s^2 under power
+        let max_fwd = 75.0;
+        let max_rev = 24.0;
+        let mut a = 0.0;
+        if self.drive_in[0] {
+            a += accel;
+        }
+        if self.drive_in[1] {
+            a -= accel;
+        }
+        // steering: turn rate scales with speed and flips when reversing.
+        let steer = (self.drive_in[2] as i32 - self.drive_in[3] as i32) as f32;
+        let speed_frac = (self.car_speed / 22.0).clamp(-1.0, 1.0);
+        self.car_yaw += steer * 1.7 * speed_frac * dt;
+        // engine, then rolling friction always opposing motion.
+        self.car_speed += a * dt;
+        let f = 13.0 * dt;
+        self.car_speed -= self.car_speed.clamp(-f, f) * if a == 0.0 { 1.0 } else { 0.25 };
+        self.car_speed = self.car_speed.clamp(-max_rev, max_fwd);
+        let heading = DVec3::new(self.car_yaw.cos() as f64, 0.0, self.car_yaw.sin() as f64);
+        self.car_pos += heading * (self.car_speed * dt) as f64;
+        self.car_pos.y = 0.0;
     }
 
     /// Camera eye in launch-tangent metres (f64).
@@ -2659,9 +2749,25 @@ impl World {
         }
 
         push_static(&mut out, &self.road_mesh);
+        push_static(&mut out, &self.access_road_mesh);
+        push_static(&mut out, &self.city_mesh);
         push_static(&mut out, &self.pad_mesh);
         push_static(&mut out, &self.hangar_mesh);
         push_static(&mut out, &self.rack_mesh);
+
+        // the car, parked or being driven: rotate its local mesh by the heading
+        // about +Y and place it at the car position (mesh forward is +X).
+        {
+            let (s, c) = self.car_yaw.sin_cos();
+            for v in &self.car_mesh.verts {
+                let p = Vec3::from(v.pos);
+                let rp = Vec3::new(c * p.x - s * p.z, p.y, s * p.x + c * p.z);
+                let n = Vec3::from(v.normal);
+                let rn = Vec3::new(c * n.x - s * n.z, n.y, s * n.x + c * n.z);
+                let local = self.car_pos + rp.as_dvec3();
+                out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: rn.into(), color: v.color });
+            }
+        }
 
         // The mobile launch platform rides under the rocket from the hangar to
         // the pad. Drawn at the resting base (its X slides with rollout) only
@@ -4826,6 +4932,28 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
         w.sys_el = 0.32;
     };
     let time = match scenario {
+        "drive" => {
+            // the car on the road just south of the city, third-person chase
+            // camera trailing it as it faces into the downtown grid.
+            world.view = View::Rocket;
+            world.enter_drive();
+            world.car_pos = (CITY_CENTER + Vec3::new(0.0, 0.0, -250.0)).as_dvec3();
+            world.car_yaw = std::f32::consts::FRAC_PI_2; // face +Z (toward the city)
+            world.rocket_az = world.car_yaw + std::f32::consts::PI;
+            world.rocket_el = 0.20;
+            world.rocket_dist = 26.0;
+            0.0
+        }
+        "cityview" => {
+            // a high overview framing the whole downtown
+            world.view = View::Rocket;
+            world.enter_drive();
+            world.car_pos = CITY_CENTER.as_dvec3();
+            world.rocket_az = 0.9;
+            world.rocket_el = 0.55;
+            world.rocket_dist = 620.0;
+            0.0
+        }
         "rocket" | "pad" => {
             // rolled out, standing on the pad
             world.view = View::Rocket;
@@ -6159,6 +6287,24 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::KeyboardInput { event: key_event, .. } => {
+                // Car driving: held WASD/arrows steer the car. Handle press AND
+                // release here (so keys can be held) and skip the other controls.
+                if state.world.driving {
+                    let kc = match key_event.physical_key {
+                        PhysicalKey::Code(c) => c,
+                        _ => return,
+                    };
+                    let down = key_event.state == ElementState::Pressed;
+                    match kc {
+                        KeyCode::KeyW | KeyCode::ArrowUp => state.world.drive_in[0] = down,
+                        KeyCode::KeyS | KeyCode::ArrowDown => state.world.drive_in[1] = down,
+                        KeyCode::KeyA | KeyCode::ArrowLeft => state.world.drive_in[2] = down,
+                        KeyCode::KeyD | KeyCode::ArrowRight => state.world.drive_in[3] = down,
+                        _ => {}
+                    }
+                    state.window.request_redraw();
+                    return;
+                }
                 if key_event.state == ElementState::Pressed {
                     let code = match key_event.physical_key {
                         PhysicalKey::Code(c) => c,
@@ -6428,7 +6574,11 @@ fn main() {
                 screenshot_all(1280, 800);
                 return;
             }
-            let scenario = if args.iter().any(|a| a == "m1_vab") {
+            let scenario = if args.iter().any(|a| a == "cityview") {
+                "cityview"
+            } else if args.iter().any(|a| a == "drive") {
+                "drive"
+            } else if args.iter().any(|a| a == "m1_vab") {
                 "m1_vab"
             } else if args.iter().any(|a| a == "m2_liftoff") {
                 "m2_liftoff"

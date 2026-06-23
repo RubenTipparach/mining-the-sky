@@ -1124,6 +1124,176 @@ pub fn hangar(c: Vec3, light_offsets: &[Vec3]) -> Mesh {
     m
 }
 
+/// Small deterministic hash (0..1) from two integer cell coords, so the city
+/// meshes identically every time without storing a seed.
+fn hash01(i: i32, j: i32) -> f32 {
+    let mut h = (i as u32)
+        .wrapping_mul(0x1657_4d2b)
+        .wrapping_add((j as u32).wrapping_mul(0x9e37_79b1))
+        .wrapping_add(0x85eb_ca6b);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x2c1b_3c6d);
+    h ^= h >> 12;
+    h = h.wrapping_mul(0x297a_2d39);
+    h ^= h >> 15;
+    (h & 0x00ff_ffff) as f32 / 0x0100_0000 as f32
+}
+
+/// A flat, axis-aligned road slab (thin box, just proud of the ground) running
+/// between two ground points that share an X or a Z. Curbs optional.
+fn road_seg(m: &mut Mesh, a: Vec3, b: Vec3, half_w: f32, curbs: bool) {
+    let road = [0.27, 0.27, 0.30];
+    let curb = [0.40, 0.40, 0.36]; // light shoulder/centre tone
+    let cx = (a.x + b.x) * 0.5;
+    let cz = (a.z + b.z) * 0.5;
+    let along_x = (b.x - a.x).abs() >= (b.z - a.z).abs();
+    let (hx, hz) = if along_x {
+        ((b.x - a.x).abs() * 0.5 + half_w, half_w)
+    } else {
+        (half_w, (b.z - a.z).abs() * 0.5 + half_w)
+    };
+    // tile long segments so a single huge quad doesn't mis-rasterise on terrain
+    let len = if along_x { hx * 2.0 } else { hz * 2.0 };
+    let segs = (len / 40.0).ceil().max(1.0) as i32;
+    for s in 0..segs {
+        let t = (s as f32 + 0.5) / segs as f32 - 0.5;
+        let (sx, sz, shx, shz) = if along_x {
+            (cx + t * hx * 2.0, cz, hx / segs as f32, hz)
+        } else {
+            (cx, cz + t * hz * 2.0, hx, hz / segs as f32)
+        };
+        m.bx(Vec3::new(sx, 0.13, sz), Vec3::new(shx, 0.13, shz), road);
+    }
+    if curbs {
+        // dashed-looking light shoulders along both edges
+        if along_x {
+            for sz in [-1.0f32, 1.0] {
+                m.bx(Vec3::new(cx, 0.20, cz + sz * (hz - 0.4)), Vec3::new(hx, 0.20, 0.5), curb);
+            }
+        } else {
+            for sx in [-1.0f32, 1.0] {
+                m.bx(Vec3::new(cx + sx * (hx - 0.4), 0.20, cz), Vec3::new(0.5, 0.20, hz), curb);
+            }
+        }
+    }
+}
+
+/// An L-shaped access road from `a` to `b` (along X first, then Z), so a road
+/// visibly runs from the launch complex out to the city.
+pub fn road_l(a: Vec3, b: Vec3, half_w: f32) -> Mesh {
+    let mut m = Mesh::default();
+    let corner = Vec3::new(b.x, 0.0, a.z);
+    road_seg(&mut m, Vec3::new(a.x, 0.0, a.z), corner, half_w, true);
+    road_seg(&mut m, corner, Vec3::new(b.x, 0.0, b.z), half_w, true);
+    m
+}
+
+/// A procedural downtown: a street grid of blocks, each packed with a few
+/// buildings of varying height and colour, taller toward the centre, on a paved
+/// ground plane. Centred at `center` (local metres, ground at y=0). Fully
+/// deterministic so it meshes the same every frame.
+pub fn city(center: Vec3) -> Mesh {
+    let mut m = Mesh::default();
+    let nx = 7i32;
+    let nz = 7i32;
+    let block = 46.0f32; // block footprint (X and Z)
+    let street = 14.0f32; // street width between blocks
+    let span = block + street; // block-to-block spacing
+    let half_x = nx as f32 * span * 0.5;
+    let half_z = nz as f32 * span * 0.5;
+
+    // paved ground plane under the whole city (tiled, so no grass shows through).
+    // Thick and slightly sunk so it still covers the ground a couple of km out,
+    // where the curved terrain sits a little below the launch-site tangent plane.
+    let ground = [0.345, 0.35, 0.37];
+    for ix in 0..nx {
+        for iz in 0..nz {
+            let cx = center.x - half_x + (ix as f32 + 0.5) * span;
+            let cz = center.z - half_z + (iz as f32 + 0.5) * span;
+            m.bx(Vec3::new(cx, -0.95, cz), Vec3::new(span * 0.5, 1.0, span * 0.5), ground);
+        }
+    }
+
+    // street grid: roads running along every block boundary (X and Z lines)
+    for ix in 0..=nx {
+        let x = center.x - half_x + ix as f32 * span;
+        road_seg(&mut m, Vec3::new(x, 0.0, center.z - half_z), Vec3::new(x, 0.0, center.z + half_z), street * 0.5, false);
+    }
+    for iz in 0..=nz {
+        let z = center.z - half_z + iz as f32 * span;
+        road_seg(&mut m, Vec3::new(center.x - half_x, 0.0, z), Vec3::new(center.x + half_x, 0.0, z), street * 0.5, false);
+    }
+
+    // building palette: concrete, tan, glass-blue, light, dark, plus a warm roof.
+    let pal = [
+        [0.58, 0.58, 0.61],
+        [0.63, 0.58, 0.49],
+        [0.42, 0.53, 0.63],
+        [0.70, 0.71, 0.74],
+        [0.50, 0.52, 0.57],
+        [0.66, 0.62, 0.55],
+    ];
+    let roof = [0.30, 0.30, 0.33];
+
+    for ix in 0..nx {
+        for iz in 0..nz {
+            let bx0 = center.x - half_x + (ix as f32 + 0.5) * span;
+            let bz0 = center.z - half_z + (iz as f32 + 0.5) * span;
+            // downtown feel: taller toward the centre of the grid.
+            let dx = (ix as f32 - (nx as f32 - 1.0) * 0.5) / (nx as f32 * 0.5);
+            let dz = (iz as f32 - (nz as f32 - 1.0) * 0.5) / (nz as f32 * 0.5);
+            let central = (1.0 - (dx * dx + dz * dz).sqrt()).clamp(0.0, 1.0);
+            // 1..4 buildings per block, laid in a 2x2 sub-grid.
+            let count = 1 + (hash01(ix, iz) * 3.99) as i32;
+            for k in 0..count {
+                let sx = if k % 2 == 0 { -1.0 } else { 1.0 };
+                let sz = if k < 2 { -1.0 } else { 1.0 };
+                let h1 = hash01(ix * 31 + k, iz * 17 + 7);
+                let h2 = hash01(ix * 13 + 5, iz * 29 + k);
+                let fw = block * 0.21 * (0.7 + 0.3 * h1);
+                let fd = block * 0.21 * (0.7 + 0.3 * h2);
+                // height: low at the rim (8 m) climbing to ~70 m downtown.
+                let height = 8.0 + central * (16.0 + 60.0 * h1) + (1.0 - central) * 10.0 * h2;
+                let col = pal[((hash01(ix + k, iz) * pal.len() as f32) as usize).min(pal.len() - 1)];
+                let cx = bx0 + sx * block * 0.25;
+                let cz = bz0 + sz * block * 0.25;
+                m.bx(Vec3::new(cx, height * 0.5, cz), Vec3::new(fw, height * 0.5, fd), col);
+                // a flat roof cap + a small rooftop unit, for silhouette interest.
+                m.bx(Vec3::new(cx, height + 0.5, cz), Vec3::new(fw * 0.96, 0.5, fd * 0.96), roof);
+                if h2 > 0.5 {
+                    m.bx(Vec3::new(cx + fw * 0.3, height + 1.6, cz - fd * 0.3), Vec3::new(fw * 0.25, 1.1, fd * 0.25), roof);
+                }
+            }
+        }
+    }
+    m
+}
+
+/// A small drivable car: a low body with a cabin and four wheels, modelled in
+/// local metres facing +X (its forward axis), sitting on the ground at y=0. The
+/// drive code positions + yaws it each frame.
+pub fn car() -> Mesh {
+    let mut m = Mesh::default();
+    let body = [0.80, 0.18, 0.16]; // red
+    let cabin = [0.30, 0.33, 0.40]; // tinted glass
+    let trim = [0.10, 0.10, 0.11];
+    let wheel = [0.06, 0.06, 0.07];
+    // chassis: ~4.2 m long (X), 1.9 m wide (Z), sitting ~0.45 m off the ground
+    m.bx(Vec3::new(0.0, 0.65, 0.0), Vec3::new(2.1, 0.32, 0.95), body);
+    // cabin / greenhouse, set back a little
+    m.bx(Vec3::new(-0.15, 1.12, 0.0), Vec3::new(1.0, 0.32, 0.82), cabin);
+    // front + rear bumpers
+    m.bx(Vec3::new(2.05, 0.55, 0.0), Vec3::new(0.12, 0.22, 0.95), trim);
+    m.bx(Vec3::new(-2.05, 0.55, 0.0), Vec3::new(0.12, 0.22, 0.95), trim);
+    // four wheels (short cylinders about the Z axis, via boxes for simplicity)
+    for sx in [1.3f32, -1.3] {
+        for sz in [1.0f32, -1.0] {
+            m.bx(Vec3::new(sx, 0.4, sz * 0.92), Vec3::new(0.42, 0.4, 0.18), wheel);
+        }
+    }
+    m
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum PartKind {
     Engine,
