@@ -1304,8 +1304,8 @@ impl World {
             });
             for lp in lamps.iter().take(MAX_LIGHTS) {
                 let p = self.rel(lp.as_dvec3());
-                lights[nlights] = [p.x, p.y, p.z, 38.0];
-                light_col[nlights] = [1.7, 1.32, 0.78, 0.0];
+                lights[nlights] = [p.x, p.y, p.z, 30.0];
+                light_col[nlights] = [0.95, 0.74, 0.44, 0.0];
                 nlights += 1;
             }
         } else if scale > 0.01 {

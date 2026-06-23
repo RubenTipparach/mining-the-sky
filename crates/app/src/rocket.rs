@@ -1194,19 +1194,21 @@ pub fn road_l(a: Vec3, b: Vec3, half_w: f32, curbs: bool) -> Mesh {
 /// ground plane. Centred at `center` (local metres, ground at y=0). `variant`
 /// reseeds the layout so different cities look distinct, which is what makes a
 /// Streetlight head positions (local metres, head at ~5 m) for a city centred at
-/// `center`: one at every street-grid intersection. Shared by the mesh builder
-/// (to place the lamp + baked road pool) and the renderer (to drive a few of
-/// them as realtime point lights for moving NPCs).
+/// `center`: one near every street-grid intersection, but offset onto the block
+/// corner (off the road, on the sidewalk) rather than sitting in the middle of
+/// the crossing. Shared by the mesh builder (lamp + baked pool) and the renderer
+/// (to drive a few as realtime point lights for moving NPCs).
 pub fn city_lamps(center: Vec3) -> Vec<Vec3> {
     let (nx, nz) = (7i32, 7i32);
     let span = 60.0f32; // block (46) + street (14)
     let half_x = nx as f32 * span * 0.5;
     let half_z = nz as f32 * span * 0.5;
+    let curb = 9.0f32; // street half-width (7) + a little, so the pole is kerbside
     let mut v = Vec::with_capacity(((nx + 1) * (nz + 1)) as usize);
     for ix in 0..=nx {
         for iz in 0..=nz {
-            let x = center.x - half_x + ix as f32 * span;
-            let z = center.z - half_z + iz as f32 * span;
+            let x = center.x - half_x + ix as f32 * span + curb;
+            let z = center.z - half_z + iz as f32 * span + curb;
             v.push(Vec3::new(x, 5.0, z));
         }
     }
@@ -1351,9 +1353,9 @@ pub fn city_night_glow(center: Vec3) -> Mesh {
     let span = 60.0f32;
     let half_x = nx as f32 * span * 0.5;
     let half_z = nz as f32 * span * 0.5;
-    let amber = [1.34, 0.94, 0.53];
-    let pool_in = [1.9, 1.4, 0.8];
-    let pool_out = [1.55, 1.12, 0.64];
+    let amber = [1.12, 0.79, 0.46];
+    let pool_in = [1.48, 1.08, 0.62];
+    let pool_out = [1.26, 0.93, 0.54];
     let cell = span * 0.5;
     for jx in -1..=(2 * nx + 1) {
         for jz in -1..=(2 * nz + 1) {
