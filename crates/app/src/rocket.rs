@@ -1194,22 +1194,23 @@ pub fn road_l(a: Vec3, b: Vec3, half_w: f32, curbs: bool) -> Mesh {
 /// ground plane. Centred at `center` (local metres, ground at y=0). `variant`
 /// reseeds the layout so different cities look distinct, which is what makes a
 /// Streetlight head positions (local metres, head at ~5 m) for a city centred at
-/// `center`: one near every street-grid intersection, but offset onto the block
-/// corner (off the road, on the sidewalk) rather than sitting in the middle of
-/// the crossing. Shared by the mesh builder (lamp + baked pool) and the renderer
-/// (to drive a few as realtime point lights for moving NPCs).
+/// `center`: a pair at every street-grid intersection on opposite kerbs (the
+/// SW and NE corners), so every road is lit from both sides rather than down the
+/// middle. Shared by the mesh builder (lamp posts + baked gradient) and the
+/// renderer (to drive a few as realtime point lights for moving NPCs).
 pub fn city_lamps(center: Vec3) -> Vec<Vec3> {
     let (nx, nz) = (7i32, 7i32);
     let span = 60.0f32; // block (46) + street (14)
     let half_x = nx as f32 * span * 0.5;
     let half_z = nz as f32 * span * 0.5;
-    let curb = 9.0f32; // street half-width (7) + a little, so the pole is kerbside
-    let mut v = Vec::with_capacity(((nx + 1) * (nz + 1)) as usize);
+    let curb = 8.0f32; // street half-width (7) + a little, so the pole is kerbside
+    let mut v = Vec::with_capacity((2 * (nx + 1) * (nz + 1)) as usize);
     for ix in 0..=nx {
         for iz in 0..=nz {
-            let x = center.x - half_x + ix as f32 * span + curb;
-            let z = center.z - half_z + iz as f32 * span + curb;
-            v.push(Vec3::new(x, 5.0, z));
+            let x = center.x - half_x + ix as f32 * span;
+            let z = center.z - half_z + iz as f32 * span;
+            v.push(Vec3::new(x - curb, 5.0, z - curb)); // SW kerb
+            v.push(Vec3::new(x + curb, 5.0, z + curb)); // NE kerb (opposite side)
         }
     }
     v
@@ -1339,34 +1340,61 @@ pub fn city(center: Vec3, variant: u32) -> Mesh {
     m
 }
 
-/// The night-only warm ground lighting for a city: a broad amber wash over the
-/// whole floor (so the streets glow amber end to end, like a real lit street)
-/// plus brighter pools under each lamp. Kept separate from the day city mesh
-/// because its bright amber albedo would tint the streets tan in daylight; the
-/// renderer draws it only at night, where the night-boosted emissive term makes
-/// it glow. The wash is tessellated on a 30 m grid (streets land on cell centres,
-/// not seams) and lifted clear of the paved ground so the logarithmic depth
-/// resolves - a single giant quad fails the depth test against the ground.
+/// The night-only warm ground lighting for a city, as a smooth gradient: a
+/// tessellated ground mesh whose per-vertex warmth is the summed light falloff
+/// from every nearby streetlight, so the road glows brightest at the kerbs under
+/// the lamps and fades into the dark between them (rather than flat pools). Kept
+/// separate from the day city mesh because its warm albedo would tint the streets
+/// by day; the renderer draws it only at night, where the night-boosted emissive
+/// term makes it glow. Lifted clear of the paved ground so the logarithmic depth
+/// resolves against the cell-tessellated ground.
 pub fn city_night_glow(center: Vec3) -> Mesh {
     let mut m = Mesh::default();
-    let (nx, nz) = (7i32, 7i32);
-    let span = 60.0f32;
-    let half_x = nx as f32 * span * 0.5;
-    let half_z = nz as f32 * span * 0.5;
-    let amber = [1.12, 0.79, 0.46];
-    let pool_in = [1.48, 1.08, 0.62];
-    let pool_out = [1.26, 0.93, 0.54];
-    let cell = span * 0.5;
-    for jx in -1..=(2 * nx + 1) {
-        for jz in -1..=(2 * nz + 1) {
-            let cx = center.x - half_x + jx as f32 * cell;
-            let cz = center.z - half_z + jz as f32 * cell;
-            m.bx(Vec3::new(cx, 0.35, cz), Vec3::new(cell * 0.5, 0.02, cell * 0.5), amber);
+    let lamps = city_lamps(center);
+    let half = 7.0 * 60.0 * 0.5; // city half-extent (210 m)
+    let margin = 30.0f32; // spill a little onto the surrounding land
+    let lo_x = center.x - half - margin;
+    let lo_z = center.z - half - margin;
+    let extent = 2.0 * (half + margin);
+    let cellm = 11.0f32; // grid resolution (smaller = smoother gradient)
+    let n = (extent / cellm).ceil() as usize + 1;
+    let warm = [1.0f32, 0.72, 0.42];
+    let wsum = warm[0] + warm[1] + warm[2];
+    let r = 42.0f32; // lamp reach (m): a smoothstep falloff to zero so only nearby
+    let y = 0.30f32; // lamps contribute (no distant-lamp buildup across the city)
+
+    let mut pos: Vec<Vec3> = Vec::with_capacity(n * n);
+    let mut col: Vec<[f32; 3]> = Vec::with_capacity(n * n);
+    for j in 0..n {
+        let z = lo_z + j as f32 * cellm;
+        for i in 0..n {
+            let x = lo_x + i as f32 * cellm;
+            let mut inten = 0.0f32;
+            for lp in &lamps {
+                let dx = x - lp.x;
+                let dz = z - lp.z;
+                let t = ((dx * dx + dz * dz).sqrt() / r).min(1.0);
+                inten += 1.0 - t * t * (3.0 - 2.0 * t); // smoothstep pool, 0 at reach
+            }
+            // Map intensity to a colour sum spanning the emissive knee (~2.3), so
+            // dark gaps stay below it and lit kerbs ramp up - a smooth gradient.
+            let s = 1.92 + 0.32 * inten.min(3.2);
+            let f = s / wsum;
+            pos.push(Vec3::new(x, y, z));
+            col.push([warm[0] * f, warm[1] * f, warm[2] * f]);
         }
     }
-    for lp in city_lamps(center) {
-        m.bx(Vec3::new(lp.x, 0.42, lp.z), Vec3::new(10.0, 0.03, 10.0), pool_out);
-        m.bx(Vec3::new(lp.x, 0.46, lp.z), Vec3::new(5.5, 0.03, 5.5), pool_in);
+
+    let up = Vec3::Y;
+    for j in 0..n - 1 {
+        for i in 0..n - 1 {
+            let a = j * n + i;
+            let b = a + 1;
+            let c = a + n;
+            let d = c + 1;
+            m.tri3([pos[a], pos[c], pos[b]], [up, up, up], [col[a], col[c], col[b]]);
+            m.tri3([pos[b], pos[c], pos[d]], [up, up, up], [col[b], col[c], col[d]]);
+        }
     }
     m
 }

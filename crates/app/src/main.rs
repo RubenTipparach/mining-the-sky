@@ -138,7 +138,7 @@ const HUD_CAP: u64 = 40000;
 const FX_CAP: u64 = 60000;
 /// Dynamic rocket-view geometry (pad + rocket + spent booster, or a surface
 /// mesh: moon base / cargo module / a full procedural asteroid ~66k verts).
-const DYN_MESH_CAP: u64 = 480_000;
+const DYN_MESH_CAP: u64 = 560_000;
 /// Procedural re-entry plasma glow mesh (prototype mesh approach): an isosurface
 /// shell hugging the vehicle SDF (surface nets), so it can run to tens of
 /// thousands of verts on a boostered stack.
