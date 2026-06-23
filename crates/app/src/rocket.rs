@@ -1271,13 +1271,14 @@ pub fn city(center: Vec3) -> Mesh {
 
 /// A small drivable car: a low body with a cabin and four wheels, modelled in
 /// local metres facing +X (its forward axis), sitting on the ground at y=0. The
-/// drive code positions + yaws it each frame.
-pub fn car() -> Mesh {
+/// drive code positions + yaws it each frame. `body` tints the chassis so player
+/// and traffic cars can differ.
+pub fn car(body: [f32; 3]) -> Mesh {
     let mut m = Mesh::default();
-    let body = [0.80, 0.18, 0.16]; // red
     let cabin = [0.30, 0.33, 0.40]; // tinted glass
     let trim = [0.10, 0.10, 0.11];
     let wheel = [0.06, 0.06, 0.07];
+    let light = [1.0, 0.92, 0.6]; // headlamps (front), brighter so the front reads
     // chassis: ~4.2 m long (X), 1.9 m wide (Z), sitting ~0.45 m off the ground
     m.bx(Vec3::new(0.0, 0.65, 0.0), Vec3::new(2.1, 0.32, 0.95), body);
     // cabin / greenhouse, set back a little
@@ -1285,6 +1286,10 @@ pub fn car() -> Mesh {
     // front + rear bumpers
     m.bx(Vec3::new(2.05, 0.55, 0.0), Vec3::new(0.12, 0.22, 0.95), trim);
     m.bx(Vec3::new(-2.05, 0.55, 0.0), Vec3::new(0.12, 0.22, 0.95), trim);
+    // headlamps on the front (+X) so the facing reads at a glance
+    for sz in [0.62f32, -0.62] {
+        m.bx(Vec3::new(2.12, 0.62, sz), Vec3::new(0.06, 0.10, 0.18), light);
+    }
     // four wheels (short cylinders about the Z axis, via boxes for simplicity)
     for sx in [1.3f32, -1.3] {
         for sz in [1.0f32, -1.0] {
@@ -1297,22 +1302,38 @@ pub fn car() -> Mesh {
 /// A third-person character, modelled facing +X and standing on the ground at
 /// y=0, posed for a walk cycle. `phase` advances the stride; `moving` (0..1)
 /// scales the limb swing so the figure is still when idle and strides when
-/// walking. The drive/walk code positions + yaws it each frame.
-pub fn character(phase: f32, moving: f32) -> Mesh {
+/// walking; `shirt` tints the top so a crowd has variety. The front (+X) carries
+/// a face and a swept fringe and the back (-X) a mass of hair, so the heading is
+/// unmistakable (people are not symmetric front-to-back).
+pub fn character(phase: f32, moving: f32, shirt: [f32; 3]) -> Mesh {
     use std::f32::consts::PI;
     let mut m = Mesh::default();
     let skin = [0.86, 0.66, 0.52];
-    let shirt = [0.20, 0.46, 0.78];
     let pants = [0.24, 0.26, 0.32];
     let shoe = [0.10, 0.10, 0.11];
     let hair = [0.18, 0.12, 0.08];
+    let eye = [0.08, 0.07, 0.07];
 
-    // torso + hips + head + neck (the trunk stays upright)
+    // torso + hips + neck (the trunk stays upright)
     m.bx(Vec3::new(0.0, 1.18, 0.0), Vec3::new(0.17, 0.28, 0.11), shirt);
     m.bx(Vec3::new(0.0, 0.86, 0.0), Vec3::new(0.17, 0.10, 0.11), pants);
     m.bx(Vec3::new(0.0, 1.50, 0.0), Vec3::new(0.07, 0.06, 0.07), skin); // neck
-    m.bx(Vec3::new(0.03, 1.66, 0.0), Vec3::new(0.12, 0.13, 0.12), skin); // head
-    m.bx(Vec3::new(-0.02, 1.74, 0.0), Vec3::new(0.13, 0.06, 0.13), hair); // hair cap
+    // head (skin). Front face is +X.
+    m.bx(Vec3::new(0.03, 1.66, 0.0), Vec3::new(0.12, 0.13, 0.12), skin);
+
+    // --- hair: asymmetric front-to-back so you can read which way they face ---
+    // a mass of hair over the crown, weighted toward the back (-X)
+    m.bx(Vec3::new(-0.04, 1.76, 0.0), Vec3::new(0.12, 0.05, 0.13), hair);
+    // back of the head + nape: hair runs down the rear, well past the face line
+    m.bx(Vec3::new(-0.12, 1.62, 0.0), Vec3::new(0.045, 0.16, 0.125), hair);
+    // a short swept fringe over the brow at the front (does not cover the face)
+    m.bx(Vec3::new(0.10, 1.75, 0.0), Vec3::new(0.06, 0.025, 0.115), hair);
+
+    // --- face on the front (+X) ---
+    for sz in [0.05f32, -0.05] {
+        m.bx(Vec3::new(0.155, 1.69, sz), Vec3::new(0.012, 0.02, 0.022), eye);
+    }
+    m.bx(Vec3::new(0.16, 1.64, 0.0), Vec3::new(0.02, 0.025, 0.022), skin); // nose
 
     // legs: swing the foot fore/aft along X; right leg is half a cycle behind.
     for (sz, ph) in [(-1.0f32, 0.0f32), (1.0, PI)] {

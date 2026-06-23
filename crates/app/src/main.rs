@@ -30,6 +30,7 @@ mod mission;
 mod rocket;
 mod sim_thread;
 mod terrain_job;
+mod traffic;
 mod ui;
 mod universe;
 use flight::{Craft, GravBody, Mode};
@@ -686,6 +687,10 @@ struct World {
     walk_phase: f32, // stride cycle phase (for the walk animation)
     /// Held walk keys: [forward, back, left, right].
     walk_in: [bool; 4],
+
+    /// NPC cars + pedestrians that bring the city to life. Spawned only while the
+    /// player is near the city and frozen/despawned when far away.
+    traffic: traffic::Traffic,
 }
 
 impl World {
@@ -747,7 +752,7 @@ impl World {
             city_mesh: rocket::city(CITY_CENTER),
             // L-shaped access road from just east of the pad out to the city.
             access_road_mesh: rocket::road_l(Vec3::new(40.0, 0.0, 0.0), CITY_CENTER, 10.0),
-            car_mesh: rocket::car(),
+            car_mesh: rocket::car([0.80, 0.18, 0.16]),
             lander_mesh: rocket::lander(),
             show_lander: false,
             base_mesh: None,
@@ -824,6 +829,7 @@ impl World {
             ped_speed: 0.0,
             walk_phase: 0.0,
             walk_in: [false; 4],
+            traffic: traffic::Traffic::new(CITY_CENTER.as_dvec3()),
         };
         // Generate the full Kepler-47 system; the landable moon is injected as
         // home's first moon so the map and the flight sim agree.
@@ -1814,6 +1820,9 @@ impl World {
         // drive the car / walk the character (real time, independent of warp).
         self.advance_car(frame_dt);
         self.advance_ped(frame_dt);
+        // city life: spawn/sim NPCs near the city, freeze + despawn when far.
+        let pp = self.player_pos();
+        self.traffic.update(pp, frame_dt);
 
         // break-up: a destroyed vehicle (burn-through or crash) explodes once.
         if self.launch.as_ref().map(|rk| rk.destroyed).unwrap_or(false) && !self.exploded {
@@ -2225,6 +2234,18 @@ impl World {
         self.walking = false;
         self.ped_speed = 0.0;
         self.walk_in = [false; 4];
+    }
+
+    /// The player's current position in local metres (for proximity systems like
+    /// city traffic). Far from the city unless the player is on foot or driving.
+    fn player_pos(&self) -> DVec3 {
+        if self.driving {
+            self.car_pos
+        } else if self.walking {
+            self.ped_pos
+        } else {
+            DVec3::ZERO // at the pad, ~2.5 km from the city: traffic stays asleep
+        }
     }
 
     /// Whether the character is standing close enough to the car to get in.
@@ -2885,7 +2906,7 @@ impl World {
         // yawed to its heading.
         if self.walking {
             let moving = (self.ped_speed.abs() / 1.5).clamp(0.0, 1.0);
-            let ped = rocket::character(self.walk_phase, moving);
+            let ped = rocket::character(self.walk_phase, moving, [0.20, 0.46, 0.78]);
             let (s, c) = self.ped_yaw.sin_cos();
             for v in &ped.verts {
                 let p = Vec3::from(v.pos);
@@ -2894,6 +2915,32 @@ impl World {
                 let rn = Vec3::new(c * n.x - s * n.z, n.y, s * n.x + c * n.z);
                 let local = self.ped_pos + rp.as_dvec3();
                 out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: rn.into(), color: v.color });
+            }
+        }
+
+        // city traffic: NPC cars + pedestrians, only while the crowd is active
+        // (the player is near the city). A small helper poses a local mesh by a
+        // heading about +Y and drops it at a local position.
+        if self.traffic.active {
+            let center = self.traffic.center();
+            let mut posed = |out: &mut Vec<rocket::MeshVertex>, verts: &[rocket::MeshVertex], yaw: f32, at: DVec3| {
+                let (s, c) = yaw.sin_cos();
+                for v in verts {
+                    let p = Vec3::from(v.pos);
+                    let rp = Vec3::new(c * p.x - s * p.z, p.y, s * p.x + c * p.z);
+                    let n = Vec3::from(v.normal);
+                    let rn = Vec3::new(c * n.x - s * n.z, n.y, s * n.x + c * n.z);
+                    let local = at + rp.as_dvec3();
+                    out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: rn.into(), color: v.color });
+                }
+            };
+            for car in &self.traffic.cars {
+                let mesh = &self.traffic.car_meshes[car.color];
+                posed(&mut out, &mesh.verts, car.yaw(), car.pos(center));
+            }
+            for ped in &self.traffic.peds {
+                let mesh = rocket::character(ped.phase, 1.0, traffic::Traffic::ped_shirt(ped.shirt));
+                posed(&mut out, &mesh.verts, ped.yaw, ped.pos);
             }
         }
 
@@ -5060,6 +5107,26 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
         w.sys_el = 0.32;
     };
     let time = match scenario {
+        "citylife" => {
+            // the city brought to life: drive in, step the sim so NPC cars and
+            // pedestrians spawn and disperse, then frame the street.
+            world.view = View::Rocket;
+            world.enter_drive();
+            // sit on a north-south street lane near the south edge, facing north up
+            // the avenue, with a slightly raised chase camera so the traffic on
+            // the street and at the cross-street intersections reads.
+            let lane_x = (CITY_CENTER.x - 210.0 + 3.0 * 60.0) as f64;
+            world.car_pos = DVec3::new(lane_x, 0.0, (CITY_CENTER.z - 175.0) as f64);
+            world.car_yaw = std::f32::consts::FRAC_PI_2;
+            for _ in 0..45 {
+                world.advance(0.1); // spawn + move the crowd a few seconds
+            }
+            world.car_yaw = std::f32::consts::FRAC_PI_2;
+            world.rocket_az = world.car_yaw + std::f32::consts::PI;
+            world.rocket_el = 0.30;
+            world.rocket_dist = 46.0;
+            0.0
+        }
         "walk" => {
             // the third-person character on foot by the car, mid-stride.
             world.view = View::Rocket;
@@ -5068,9 +5135,10 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.ped_yaw = 0.5;
             world.ped_speed = 3.5; // pose the walk cycle (idle would stand still)
             world.walk_phase = 1.2;
-            world.rocket_az = world.ped_yaw + std::f32::consts::PI + 0.5;
-            world.rocket_el = 0.12;
-            world.rocket_dist = 6.5;
+            // 3/4 front view so the face + swept fringe read against the back hair.
+            world.rocket_az = world.ped_yaw - 0.7;
+            world.rocket_el = 0.10;
+            world.rocket_dist = 5.5;
             0.0
         }
         "drive" => {
@@ -6721,7 +6789,9 @@ fn main() {
                 screenshot_all(1280, 800);
                 return;
             }
-            let scenario = if args.iter().any(|a| a == "cityview") {
+            let scenario = if args.iter().any(|a| a == "citylife") {
+                "citylife"
+            } else if args.iter().any(|a| a == "cityview") {
                 "cityview"
             } else if args.iter().any(|a| a == "walk") {
                 "walk"
