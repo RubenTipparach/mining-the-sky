@@ -246,6 +246,25 @@ fn vehicle_panel(ctx: &egui::Context, world: &mut World) {
             ui.label(egui::RichText::new("Drag parts onto the stack").color(DIM));
             ui.add_space(2.0);
 
+            // ---- one-click presets: load a ready-made vehicle to fly or tweak ----
+            egui::CollapsingHeader::new("Quick-load preset")
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        for p in build::presets() {
+                            if ui
+                                .button(p.name)
+                                .on_hover_text(p.desc)
+                                .clicked()
+                            {
+                                vab = p.vab;
+                                changed = true;
+                            }
+                        }
+                    });
+                });
+            ui.add_space(2.0);
+
             // ---- the stack: a drop slot per stage (engine + tank), top first ----
             for i in (0..vab.stages.len()).rev() {
                 let (ei, ti) = (vab.stages[i].engine, vab.stages[i].tank);

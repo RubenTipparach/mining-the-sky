@@ -119,6 +119,97 @@ impl StageCfg {
     pub fn new(engine: usize, tank: usize) -> Self {
         StageCfg { engine, tank, boosters: 0, booster: 0 }
     }
+    /// A stage ringed with `n` radial strap-on boosters of type `booster`.
+    pub fn boosted(engine: usize, tank: usize, n: u32, booster: usize) -> Self {
+        StageCfg { engine, tank, boosters: n, booster }
+    }
+}
+
+/// A ready-made vehicle the player can load in the VAB with one click, spanning
+/// light sat-launchers up to heavy crewed / lunar stacks. Each is tuned to lift
+/// off at a sane thrust-to-weight (see the `presets_are_flyable` test). Indices
+/// reference `ENGINES`, `TANKS`, `BOOSTERS`, `PAYLOADS` above.
+pub struct Preset {
+    pub name: &'static str,
+    pub desc: &'static str,
+    pub vab: Vab,
+}
+
+/// The catalog of one-click vehicle presets, light to heavy.
+pub fn presets() -> Vec<Preset> {
+    // engine idx: 0 Merlin-1D, 1 LR-87, 2 F-1, 3 RL-10, 4 Merlin-Vac
+    // tank idx:   0 Small, 1 Medium, 2 Large, 3 X-Large
+    // booster idx:0 GEM-63, 1 SRB, 2 Liquid Strap-on
+    vec![
+        Preset {
+            name: "Sparrow",
+            desc: "Light two-stage sat launcher. Cheap ride to LEO for a small bird.",
+            vab: Vab {
+                stages: vec![
+                    StageCfg::boosted(1, 2, 2, 0), // LR-87 + Large + 2x GEM-63
+                    StageCfg::new(4, 0),           // Merlin-Vac + Small
+                ],
+                payload: 1, // ComSat
+            },
+        },
+        Preset {
+            name: "Kestrel",
+            desc: "Medium workhorse. Balanced two-stage lifter for station modules.",
+            vab: Vab {
+                stages: vec![
+                    StageCfg::new(2, 3), // F-1 + X-Large
+                    StageCfg::new(4, 1), // Merlin-Vac + Medium
+                ],
+                payload: 2, // Station Module
+            },
+        },
+        Preset {
+            name: "Falcon Crew",
+            desc: "Crew launcher: gentle liftoff TWR for a capsule to orbit.",
+            vab: Vab {
+                stages: vec![
+                    StageCfg::new(2, 3), // F-1 + X-Large
+                    StageCfg::new(4, 1), // Merlin-Vac + Medium
+                ],
+                payload: 10, // Crew Capsule
+            },
+        },
+        Preset {
+            name: "Atlas Heavy",
+            desc: "Heavy lifter with four solid boosters for big cargo to orbit.",
+            vab: Vab {
+                stages: vec![
+                    StageCfg::boosted(2, 3, 4, 1), // F-1 + X-Large + 4x SRB
+                    StageCfg::new(4, 2),           // Merlin-Vac + Large
+                ],
+                payload: 3, // Fuel Depot
+            },
+        },
+        Preset {
+            name: "Selene",
+            desc: "Three-stage lunar stack: boosted core, sustainer, hydrolox kick.",
+            vab: Vab {
+                stages: vec![
+                    StageCfg::boosted(2, 3, 2, 1), // F-1 + X-Large + 2x SRB
+                    StageCfg::new(2, 2),           // F-1 + Large
+                    StageCfg::new(3, 1),           // RL-10 + Medium
+                ],
+                payload: 4, // Lunar Lander
+            },
+        },
+        Preset {
+            name: "Titan Super Heavy",
+            desc: "Super-heavy: six solids on a triple stack for the biggest payloads.",
+            vab: Vab {
+                stages: vec![
+                    StageCfg::boosted(2, 3, 6, 1), // F-1 + X-Large + 6x SRB
+                    StageCfg::new(2, 3),           // F-1 + X-Large
+                    StageCfg::new(4, 2),           // Merlin-Vac + Large
+                ],
+                payload: 5, // Refinery Module
+            },
+        },
+    ]
 }
 
 /// The player's current vehicle design (stages bottom-first, like `Vehicle`).
@@ -185,5 +276,31 @@ impl Vab {
             })
             .collect();
         Vehicle { name: "Custom Vehicle", stages, payload: self.payload().mass }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every one-click preset must actually fly: lift off at a sane TWR (above 1
+    /// so it leaves the pad, but not so high the crew is crushed) and carry a
+    /// real payload on a multi-stage stack.
+    #[test]
+    fn presets_are_flyable() {
+        let g = 9.81;
+        for p in presets() {
+            let veh = p.vab.to_vehicle();
+            assert!(veh.stages.len() >= 2, "{}: needs at least two stages", p.name);
+            assert!(p.vab.payload().mass > 0.0, "{}: no payload", p.name);
+            let liftoff_mass: f64 =
+                veh.stages.iter().map(|s| s.dry + s.prop).sum::<f64>() + veh.payload;
+            let twr = veh.stages[0].thrust / (liftoff_mass * g);
+            assert!(
+                (1.1..=2.6).contains(&twr),
+                "{}: liftoff TWR {twr:.2} is outside the flyable 1.1..2.6 range",
+                p.name
+            );
+        }
     }
 }
