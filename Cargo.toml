@@ -5,6 +5,7 @@ members = [
     "crates/sim",
     "crates/terrain",
     "crates/worldgen",
+    "crates/worldcity",
 ]
 
 [workspace.package]

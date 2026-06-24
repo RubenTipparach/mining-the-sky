@@ -16,7 +16,41 @@ pub mod sites;
 use grid::Grid;
 use hydrology::Hydrology;
 use roads::Road;
-use sites::{City, LaunchSite, Sites};
+use sites::{City, CityKind, LaunchSite, Sites};
+
+/// Export the world's cities as the unified [`worldcity::CityDesc`] index: the
+/// single source of truth shared by the ground renderer (which generates each
+/// city's layout from this), the far-LOD footprints, and the orbital lights.
+/// Baked to `cities.bin` so the client loads it without re-running worldgen.
+pub fn city_descs(world: &World) -> Vec<worldcity::CityDesc> {
+    world
+        .cities
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let id = i as u32;
+            let pop = c.population as f32;
+            let pm = (pop / 1.0e6).max(0.1);
+            // matches worldcity::generate's grid sizing, so radius_m bounds the
+            // built-up footprint (the LOD / load query radius).
+            let n = (4.0 + 2.4 * pm.sqrt()).clamp(4.0, 11.0);
+            let radius_m = n * 30.0 * 1.45;
+            worldcity::CityDesc {
+                id,
+                kind: match c.kind {
+                    CityKind::Major => 1,
+                    CityKind::Minor => 0,
+                },
+                lon: c.lon as f32,
+                lat: c.lat as f32,
+                pop,
+                seed: id.wrapping_add(1).wrapping_mul(2_654_435_761),
+                radius_m,
+                _pad: 0,
+            }
+        })
+        .collect()
+}
 
 pub struct GenConfig {
     pub seed: u64,

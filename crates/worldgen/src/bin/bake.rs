@@ -16,4 +16,11 @@ fn main() {
     std::fs::create_dir_all("crates/app/assets").unwrap();
     worldgen::render::write_planet_texture(&world, "crates/app/assets/planet.png", 2048, 1024);
     println!("baked crates/app/assets/planet.png (2048x1024, seed {seed})");
+
+    // The unified city index: the client loads this and generates/caches each
+    // city's layout on demand (same data drives ground, far-LOD and orbit lights).
+    let descs = worldgen::city_descs(&world);
+    let index = worldcity::CityIndex::from_descs(descs);
+    std::fs::write("crates/app/assets/cities.bin", index.to_bytes()).unwrap();
+    println!("baked crates/app/assets/cities.bin ({} cities)", index.len());
 }

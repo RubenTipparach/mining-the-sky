@@ -7,3 +7,4 @@ Cargo.lock.orig
 /dist
 /crates/app/dist
 .history/
+/cache/

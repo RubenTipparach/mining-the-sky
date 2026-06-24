@@ -6910,6 +6910,21 @@ fn main() {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let args: Vec<String> = std::env::args().collect();
+
+        // Unified city store: load the baked world city index and warm the
+        // on-disk layout cache. Each city's blocks/buildings are generated once
+        // at world load and stored under cache/cities; later runs read them back.
+        // At render time a world address (camera lon/lat) looks up nearby cities
+        // in the index, then pulls their cached layouts.
+        if let Some(idx) = worldcity::CityIndex::from_bytes(include_bytes!("../assets/cities.bin")) {
+            let cache = worldcity::CityCache::new("cache/cities");
+            let generated = cache.warm(idx.cities());
+            eprintln!(
+                "world cities: {} indexed, {generated} layouts generated this run (rest cached in cache/cities/)",
+                idx.len()
+            );
+        }
+
         if args.iter().any(|a| a == "catalog") {
             let w = World::new();
             let md = w.universe.catalog_markdown();
