@@ -1238,22 +1238,36 @@ pub fn city(center: Vec3, variant: u32) -> Mesh {
     // Thick and slightly sunk so it still covers the ground a couple of km out,
     // where the curved terrain sits a little below the launch-site tangent plane.
     let ground = [0.345, 0.35, 0.37];
+    let dev = |ix: i32, iz: i32| worldcity::cell_developed(seed, nx as u32, nz as u32, ix, iz);
     for ix in 0..nx {
         for iz in 0..nz {
+            // only pave built-up cells, so the city footprint has an organic,
+            // ragged outline instead of a perfect square.
+            if !dev(ix, iz) {
+                continue;
+            }
             let cx = center.x - half_x + (ix as f32 + 0.5) * span;
             let cz = center.z - half_z + (iz as f32 + 0.5) * span;
             m.bx(Vec3::new(cx, -0.95, cz), Vec3::new(span * 0.5, 1.0, span * 0.5), ground);
         }
     }
 
-    // street grid: roads running along every block boundary (X and Z lines)
-    for ix in 0..=nx {
-        let x = center.x - half_x + ix as f32 * span;
-        road_seg(&mut m, Vec3::new(x, 0.0, center.z - half_z), Vec3::new(x, 0.0, center.z + half_z), street * 0.5, false);
-    }
-    for iz in 0..=nz {
-        let z = center.z - half_z + iz as f32 * span;
-        road_seg(&mut m, Vec3::new(center.x - half_x, 0.0, z), Vec3::new(center.x + half_x, 0.0, z), street * 0.5, false);
+    // street grid: the four boundary roads around each built-up cell, so the
+    // road network follows the organic outline (shared edges just overlap).
+    for ix in 0..nx {
+        for iz in 0..nz {
+            if !dev(ix, iz) {
+                continue;
+            }
+            let x0 = center.x - half_x + ix as f32 * span;
+            let x1 = x0 + span;
+            let z0 = center.z - half_z + iz as f32 * span;
+            let z1 = z0 + span;
+            road_seg(&mut m, Vec3::new(x0, 0.0, z0), Vec3::new(x0, 0.0, z1), street * 0.5, false);
+            road_seg(&mut m, Vec3::new(x1, 0.0, z0), Vec3::new(x1, 0.0, z1), street * 0.5, false);
+            road_seg(&mut m, Vec3::new(x0, 0.0, z0), Vec3::new(x1, 0.0, z0), street * 0.5, false);
+            road_seg(&mut m, Vec3::new(x0, 0.0, z1), Vec3::new(x1, 0.0, z1), street * 0.5, false);
+        }
     }
 
     // building palette: concrete, tan, glass-blue, light, dark, plus a warm roof.
