@@ -1162,17 +1162,21 @@ fn road_seg(m: &mut Mesh, a: Vec3, b: Vec3, half_w: f32, curbs: bool) {
         } else {
             (cx, cz + t * hz * 2.0, hx, hz / segs as f32)
         };
-        m.bx(Vec3::new(sx, 0.13, sz), Vec3::new(shx, 0.13, shz), road);
+        // Thick and sunk (like the city ground plane): the surface sits a touch
+        // above the tangent plane while the slab reaches well below it, so the
+        // curved terrain stays buried under the road instead of z-fighting its
+        // way through it. Top at y=0.15, bottom at y=-1.95.
+        m.bx(Vec3::new(sx, -0.9, sz), Vec3::new(shx, 1.05, shz), road);
     }
     if curbs {
-        // dashed-looking light shoulders along both edges
+        // dashed-looking light shoulders along both edges, just proud of the road
         if along_x {
             for sz in [-1.0f32, 1.0] {
-                m.bx(Vec3::new(cx, 0.20, cz + sz * (hz - 0.4)), Vec3::new(hx, 0.20, 0.5), curb);
+                m.bx(Vec3::new(cx, -0.86, cz + sz * (hz - 0.4)), Vec3::new(hx, 1.05, 0.5), curb);
             }
         } else {
             for sx in [-1.0f32, 1.0] {
-                m.bx(Vec3::new(cx + sx * (hx - 0.4), 0.20, cz), Vec3::new(0.5, 0.20, hz), curb);
+                m.bx(Vec3::new(cx + sx * (hx - 0.4), -0.86, cz), Vec3::new(0.5, 1.05, hz), curb);
             }
         }
     }
@@ -1275,6 +1279,11 @@ pub fn city(center: Vec3, variant: u32) -> Mesh {
             // downtown feel: taller toward the centre of the grid.
             let dx = (ix as f32 - (nx as f32 - 1.0) * 0.5) / (nx as f32 * 0.5);
             let dz = (iz as f32 - (nz as f32 - 1.0) * 0.5) / (nz as f32 * 0.5);
+            // organic outline: drop edge cells by the shared built-up mask so the
+            // city is not a perfect square (matches worldcity::generate exactly).
+            if !worldcity::cell_developed(seed, nx as u32, nz as u32, ix, iz) {
+                continue;
+            }
             let central = (1.0 - (dx * dx + dz * dz).sqrt()).clamp(0.0, 1.0);
             // 1..4 buildings per block, laid in a 2x2 sub-grid.
             let count = 1 + (h(ix, iz) * 3.99) as i32;
@@ -1413,8 +1422,14 @@ pub fn city_footprint(layout: &worldcity::CityLayout, center: Vec3) -> Mesh {
     let road = [0.20, 0.205, 0.225]; // asphalt grid
     let concrete = [0.40, 0.40, 0.42]; // block pads between the streets
     let block_half = (span - layout.street) * 0.5; // = block * 0.5
+    let seed = layout.seed as i32;
     for ix in 0..layout.cols as i32 {
         for iz in 0..layout.rows as i32 {
+            // only built-up cells, so the footprint outline matches the organic
+            // (non-square) building layout.
+            if !worldcity::cell_developed(seed, layout.cols, layout.rows, ix, iz) {
+                continue;
+            }
             let cx = center.x - hx + (ix as f32 + 0.5) * span;
             let cz = center.z - hz + (iz as f32 + 0.5) * span;
             // full-cell road base, then an inset concrete pad - the inset gap is
@@ -1423,8 +1438,18 @@ pub fn city_footprint(layout: &worldcity::CityLayout, center: Vec3) -> Mesh {
             m.bx(Vec3::new(cx, 0.09, cz), Vec3::new(block_half, 0.04, block_half), concrete);
         }
     }
+    // Building footprints: lit ones use an emissive warm/cool tile so the city
+    // also glows from far at night (the same `lit` data drives the near windows),
+    // unlit ones use the concrete palette. Night-boosted emissive keeps them
+    // subtle by day.
+    let warm = [1.7, 1.35, 0.8];
+    let cool = [0.95, 1.1, 1.6];
     for b in &layout.buildings {
-        let col = worldcity::PALETTE[(b.pal as usize).min(worldcity::PALETTE.len() - 1)];
+        let col = if b.lit != 0 {
+            if b.warm != 0 { warm } else { cool }
+        } else {
+            worldcity::PALETTE[(b.pal as usize).min(worldcity::PALETTE.len() - 1)]
+        };
         m.bx(Vec3::new(center.x + b.cx, 0.12, center.z + b.cz), Vec3::new(b.fw, 0.04, b.fd), col);
     }
     m
@@ -1470,45 +1495,49 @@ pub fn character(phase: f32, moving: f32, shirt: [f32; 3]) -> Mesh {
     let hair = [0.18, 0.12, 0.08];
     let eye = [0.08, 0.07, 0.07];
 
-    // torso + hips + neck (the trunk stays upright)
-    m.bx(Vec3::new(0.0, 1.18, 0.0), Vec3::new(0.17, 0.28, 0.11), shirt);
-    m.bx(Vec3::new(0.0, 0.86, 0.0), Vec3::new(0.17, 0.10, 0.11), pants);
-    m.bx(Vec3::new(0.0, 1.50, 0.0), Vec3::new(0.07, 0.06, 0.07), skin); // neck
-    // head (skin). Front face is +X.
-    m.bx(Vec3::new(0.03, 1.66, 0.0), Vec3::new(0.12, 0.13, 0.12), skin);
+    // Trunk: shoulders are wider side-to-side (z) than the body is deep (x), so it
+    // reads as a person from the front. Faces +X. Parts abut rather than overlap.
+    m.bx(Vec3::new(0.0, 1.20, 0.0), Vec3::new(0.13, 0.27, 0.19), shirt); // torso
+    m.bx(Vec3::new(0.0, 0.86, 0.0), Vec3::new(0.14, 0.11, 0.16), pants); // hips
+    m.bx(Vec3::new(0.0, 1.49, 0.0), Vec3::new(0.06, 0.06, 0.06), skin); // neck
+    m.bx(Vec3::new(0.02, 1.65, 0.0), Vec3::new(0.115, 0.13, 0.115), skin); // head
 
-    // --- hair: asymmetric front-to-back so you can read which way they face ---
-    // a mass of hair over the crown, weighted toward the back (-X)
-    m.bx(Vec3::new(-0.04, 1.76, 0.0), Vec3::new(0.12, 0.05, 0.13), hair);
-    // back of the head + nape: hair runs down the rear, well past the face line
-    m.bx(Vec3::new(-0.12, 1.62, 0.0), Vec3::new(0.045, 0.16, 0.125), hair);
-    // a short swept fringe over the brow at the front (does not cover the face)
-    m.bx(Vec3::new(0.10, 1.75, 0.0), Vec3::new(0.06, 0.025, 0.115), hair);
+    // Hair: a cap over the whole crown, brought down into a hairline on the
+    // forehead (no bald patch), short around the back and sides (no mullet).
+    m.bx(Vec3::new(0.01, 1.77, 0.0), Vec3::new(0.125, 0.05, 0.13), hair); // crown
+    m.bx(Vec3::new(0.115, 1.745, 0.0), Vec3::new(0.028, 0.035, 0.12), hair); // front hairline
+    m.bx(Vec3::new(-0.085, 1.66, 0.0), Vec3::new(0.05, 0.11, 0.125), hair); // back + sides
 
-    // --- face on the front (+X) ---
-    for sz in [0.05f32, -0.05] {
-        m.bx(Vec3::new(0.155, 1.69, sz), Vec3::new(0.012, 0.02, 0.022), eye);
+    // face on the front (+X)
+    for sz in [0.055f32, -0.055] {
+        m.bx(Vec3::new(0.135, 1.68, sz), Vec3::new(0.012, 0.02, 0.022), eye);
     }
-    m.bx(Vec3::new(0.16, 1.64, 0.0), Vec3::new(0.02, 0.025, 0.022), skin); // nose
+    m.bx(Vec3::new(0.14, 1.63, 0.0), Vec3::new(0.02, 0.025, 0.022), skin); // nose
 
-    // legs: swing the foot fore/aft along X; right leg is half a cycle behind.
+    // Legs: a real walk cycle - the foot lifts off the ground and the knee bends
+    // through the swing, plants at the front, then drives back through the stance
+    // (no foot-on-the-floor shuffling). Right leg is half a cycle behind.
     for (sz, ph) in [(-1.0f32, 0.0f32), (1.0, PI)] {
-        let sw = (phase + ph).sin() * 0.32 * moving;
-        let hip = Vec3::new(0.0, 0.80, sz * 0.09);
-        let knee = Vec3::new(sw * 0.5, 0.42, sz * 0.09);
-        let foot = Vec3::new(sw, 0.07, sz * 0.09);
+        let a = phase + ph;
+        let stride = 0.30 * moving;
+        let fx = a.sin() * stride; // fore/aft foot position
+        let lift = a.cos().max(0.0) * 0.15 * moving; // foot rises through the swing
+        let hip = Vec3::new(0.0, 0.80, sz * 0.10);
+        let foot = Vec3::new(fx, 0.06 + lift, sz * 0.10);
+        // knee drives forward + up while the foot is lifted, so the leg bends.
+        let knee = Vec3::new(fx * 0.45 + lift * 1.1, 0.44 + lift * 0.15, sz * 0.10);
         m.strut(hip, knee, 0.085, pants);
         m.strut(knee, foot, 0.075, pants);
-        m.bx(foot + Vec3::new(0.05, -0.02, 0.0), Vec3::new(0.15, 0.05, 0.09), shoe);
+        m.bx(foot + Vec3::new(0.05, 0.0, 0.0), Vec3::new(0.13, 0.045, 0.085), shoe);
     }
-    // arms: swing opposite to the legs (left arm forward with the right leg).
+    // Arms: swing fore-aft opposite the legs, with a slight elbow bend.
     for (sz, ph) in [(-1.0f32, PI), (1.0, 0.0)] {
-        let sw = (phase + ph).sin() * 0.30 * moving;
-        let sh = Vec3::new(0.0, 1.42, sz * 0.24);
-        let elbow = Vec3::new(sw * 0.5, 1.16, sz * 0.26);
-        let hand = Vec3::new(sw, 0.92, sz * 0.27);
-        m.strut(sh, elbow, 0.065, shirt);
-        m.strut(elbow, hand, 0.06, skin);
+        let sw = (phase + ph).sin() * 0.28 * moving;
+        let sh = Vec3::new(0.0, 1.42, sz * 0.22);
+        let elbow = Vec3::new(sw * 0.6, 1.16, sz * 0.23);
+        let hand = Vec3::new(sw, 0.92, sz * 0.235);
+        m.strut(sh, elbow, 0.058, shirt);
+        m.strut(elbow, hand, 0.052, skin);
     }
     m
 }
@@ -1788,7 +1817,7 @@ fn spaceport_dir() -> DVec3 {
 
 /// The planet elevation field with the launch-pad flat zone applied (unless
 /// MTS_TERRAIN_NOFLAT). Shared by the launch frame and the terrain mesh.
-fn launch_elevation() -> Elevation {
+pub fn launch_elevation() -> Elevation {
     let mut elev = Elevation::new(47);
     if std::env::var("MTS_TERRAIN_NOFLAT").is_err() {
         // flat out far enough to hold the pad, the assembly building ~5 km away,

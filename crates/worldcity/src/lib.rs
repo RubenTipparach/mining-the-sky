@@ -101,7 +101,22 @@ pub struct CityLayout {
     /// Block footprint (m) and street width (m).
     pub block: f32,
     pub street: f32,
+    /// Layout seed (so the far-footprint builder can re-derive the organic
+    /// built-up mask and match the buildings).
+    pub seed: u32,
     pub buildings: Vec<Building>,
+}
+
+/// Whether a grid cell is built up. Cities are NOT perfect squares: cells are
+/// dropped toward the edges by a noisy radial mask, so the built-up area has an
+/// organic, ragged outline with the corners cut. Shared by `generate` and the
+/// far-footprint builder, so buildings and footprints always agree.
+pub fn cell_developed(seed: i32, cols: u32, rows: u32, ix: i32, iz: i32) -> bool {
+    let h = |a: i32, b: i32| hash01(a.wrapping_add(seed), b.wrapping_sub(seed));
+    let dx = (ix as f32 - (cols as f32 - 1.0) * 0.5) / (cols as f32 * 0.5);
+    let dz = (iz as f32 - (rows as f32 - 1.0) * 0.5) / (rows as f32 * 0.5);
+    let r = (dx * dx + dz * dz).sqrt();
+    r <= 0.82 + 0.62 * h(ix * 7 + 91, iz * 7 + 43)
 }
 
 impl CityLayout {
@@ -166,6 +181,11 @@ pub fn generate(desc: &CityDesc) -> CityLayout {
             let bz0 = -half_z + (iz as f32 + 0.5) * span;
             let dx = (ix as f32 - (cols as f32 - 1.0) * 0.5) / (cols as f32 * 0.5);
             let dz = (iz as f32 - (rows as f32 - 1.0) * 0.5) / (rows as f32 * 0.5);
+            // organic outline: skip cells dropped by the built-up mask, so the
+            // city is a ragged blob rather than a perfect square.
+            if !cell_developed(seed, cols, rows, ix, iz) {
+                continue;
+            }
             let central = (1.0 - (dx * dx + dz * dz).sqrt()).clamp(0.0, 1.0);
             let count = 1 + (h(ix, iz) * 3.99) as i32;
             for k in 0..count {
@@ -185,7 +205,7 @@ pub fn generate(desc: &CityDesc) -> CityLayout {
             }
         }
     }
-    CityLayout { cols, rows, block, street, buildings }
+    CityLayout { cols, rows, block, street, seed: desc.seed, buildings }
 }
 
 // --- POD (de)serialisation of one layout: a small header + the building array.
@@ -200,11 +220,11 @@ struct LayoutHeader {
     block: f32,
     street: f32,
     n_buildings: u32,
-    _pad: u32,
+    seed: u32,
 }
 
 const LAYOUT_MAGIC: u32 = 0x4C54_4943; // "CITL"
-const LAYOUT_VERSION: u32 = 2;
+const LAYOUT_VERSION: u32 = 3;
 
 /// Serialise a layout to bytes (header + buildings).
 pub fn layout_to_bytes(l: &CityLayout) -> Vec<u8> {
@@ -216,7 +236,7 @@ pub fn layout_to_bytes(l: &CityLayout) -> Vec<u8> {
         block: l.block,
         street: l.street,
         n_buildings: l.buildings.len() as u32,
-        _pad: 0,
+        seed: l.seed,
     };
     let mut out = bytemuck::bytes_of(&hdr).to_vec();
     out.extend_from_slice(bytemuck::cast_slice(&l.buildings));
@@ -243,7 +263,7 @@ pub fn layout_from_bytes(bytes: &[u8]) -> Option<CityLayout> {
     let buildings: Vec<Building> = (0..hdr.n_buildings as usize)
         .map(|i| bytemuck::pod_read_unaligned(&bytes[hsz + i * bsz..hsz + (i + 1) * bsz]))
         .collect();
-    Some(CityLayout { cols: hdr.cols, rows: hdr.rows, block: hdr.block, street: hdr.street, buildings })
+    Some(CityLayout { cols: hdr.cols, rows: hdr.rows, block: hdr.block, street: hdr.street, seed: hdr.seed, buildings })
 }
 
 #[cfg(test)]

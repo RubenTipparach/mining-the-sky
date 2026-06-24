@@ -640,6 +640,9 @@ struct World {
     /// Far level-of-detail per city: flat block + road footprints (from the same
     /// layout as the buildings), drawn beyond the building range.
     city_footprints: Vec<(Vec3, rocket::Mesh)>,
+    /// The generated layout per city centre (the unified source), kept for the
+    /// footprints and for car-vs-building collision.
+    city_layouts: Vec<(Vec3, worldcity::CityLayout)>,
     roads: Vec<(Vec3, Vec3, rocket::Mesh)>,
     car_mesh: rocket::Mesh,
     lander_mesh: rocket::Mesh,
@@ -704,6 +707,9 @@ struct World {
     launch_up: DVec3,
     launch_east: DVec3,
     launch_north: DVec3,
+    /// Cached home-world elevation (same field the terrain mesh uses), so the car
+    /// and pedestrian can follow the ground height without rebuilding it.
+    terrain_elev: terrain::Elevation,
     // Floating-origin reference (launch-tangent metres). The whole rocket-view
     // scene is rendered relative to this point, snapped near the camera and
     // updated (with a terrain rebuild) when the camera moves far from it.
@@ -821,6 +827,12 @@ impl World {
         let rocket_frame = (rocket_body.focus_y, rocket_body.cam_dist);
         let (rack_mesh_init, rack_slots) = build_rack();
         let (launch_origin, launch_up, launch_east, launch_north) = rocket::launch_frame();
+        // The unified city layouts (one per cluster downtown), generated once and
+        // shared by the footprint LOD and car collision.
+        let city_layouts: Vec<(Vec3, worldcity::CityLayout)> = all_cities()
+            .iter()
+            .map(|&(c, v)| (c, worldcity::generate(&local_city_desc(v))))
+            .collect();
         let home_radius_mm = (body.radius as f32) / MM;
         // A fictional moon: ~0.27 home radii, parked off to one side. Distance is
         // compressed from the real ~60 radii so both bodies frame nicely in one
@@ -859,10 +871,11 @@ impl World {
             platform_mesh: rocket::crawler_platform(),
             city_meshes: all_cities().iter().map(|&(c, v)| (c, rocket::city(c, v))).collect(),
             city_glow: all_cities().iter().map(|&(c, _)| (c, rocket::city_night_glow(c))).collect(),
-            city_footprints: all_cities()
+            city_footprints: city_layouts
                 .iter()
-                .map(|&(c, v)| (c, rocket::city_footprint(&worldcity::generate(&local_city_desc(v)), c)))
+                .map(|(c, l)| (*c, rocket::city_footprint(l, *c)))
                 .collect(),
+            city_layouts,
             roads: build_city_roads(),
             car_mesh: rocket::car([0.80, 0.18, 0.16]),
             lander_mesh: rocket::lander(),
@@ -898,6 +911,7 @@ impl World {
             launch_up,
             launch_east,
             launch_north,
+            terrain_elev: rocket::launch_elevation(),
             ref_local: DVec3::ZERO,
             terrain_dirty: true,
             lod_debug: false,
@@ -2109,6 +2123,46 @@ impl World {
             + self.launch_up * local.y
             + self.launch_north * local.z
     }
+
+    /// Local-frame height (metres) of the visible ground at horizontal local
+    /// position (x, z) - the same surface the terrain mesh draws, so the car and
+    /// pedestrian sit on it instead of the flat tangent plane. In the flattened
+    /// launch/city zone this is ~0; out on the hills it follows the terrain.
+    fn local_ground_height(&self, x: f64, z: f64) -> f64 {
+        let p = self.cam_world(DVec3::new(x, 0.0, z));
+        let dir = p.normalize();
+        let g = dir * (self.body.radius + self.terrain_elev.land_height_m(dir));
+        (g - self.launch_origin).dot(self.launch_up)
+    }
+
+    /// Whether local (x, z) is on pavement (a city's built-up footprint or near a
+    /// road), where the car rolls faster with less friction than on open ground.
+    fn on_pavement(&self, x: f64, z: f64) -> bool {
+        let p = Vec3::new(x as f32, 0.0, z as f32);
+        // inside any city footprint (built-up radius around its centre)
+        for &(center, _) in &self.city_footprints {
+            let dx = (center.x - p.x) as f64;
+            let dz = (center.z - p.z) as f64;
+            // city half-extent (~210 m for a 7x7 grid) plus a margin
+            if dx * dx + dz * dz < 260.0 * 260.0 {
+                return true;
+            }
+        }
+        // near a road segment of the network (point-to-segment distance)
+        for (a, b, _) in &self.roads {
+            let (ax, az, bx, bz) = (a.x as f64, a.z as f64, b.x as f64, b.z as f64);
+            let (px, pz) = (x, z);
+            let (dx, dz) = (bx - ax, bz - az);
+            let len2 = dx * dx + dz * dz;
+            let t = if len2 > 1.0 { (((px - ax) * dx + (pz - az) * dz) / len2).clamp(0.0, 1.0) } else { 0.0 };
+            let (cx, cz) = (ax + t * dx, az + t * dz);
+            let (ex, ez) = (px - cx, pz - cz);
+            if ex * ex + ez * ez < 12.0 * 12.0 {
+                return true;
+            }
+        }
+        false
+    }
     /// `world - ref_local` collapsed to f32 (the floating-origin upload form).
     fn rel(&self, local: DVec3) -> Vec3 {
         (local - self.ref_local).as_vec3()
@@ -2427,11 +2481,11 @@ impl World {
         // brisk accel/decel toward the target speed.
         let k = (1.0 - (-dt / 0.12).exp()).clamp(0.0, 1.0);
         self.ped_speed += (target - self.ped_speed) * k;
-        let turn = (self.walk_in[2] as i32 - self.walk_in[3] as i32) as f32;
+        let turn = (self.walk_in[3] as i32 - self.walk_in[2] as i32) as f32;
         self.ped_yaw += turn * 2.4 * dt;
         let heading = DVec3::new(self.ped_yaw.cos() as f64, 0.0, self.ped_yaw.sin() as f64);
         self.ped_pos += heading * (self.ped_speed * dt) as f64;
-        self.ped_pos.y = 0.0;
+        self.ped_pos.y = self.local_ground_height(self.ped_pos.x, self.ped_pos.z);
         // advance the stride with distance so the gait matches the pace.
         self.walk_phase += self.ped_speed.abs() * 1.7 * dt;
         if self.walk_phase > std::f32::consts::TAU {
@@ -2445,9 +2499,13 @@ impl World {
         if !self.driving || dt <= 0.0 {
             return;
         }
-        let accel = 18.0; // m/s^2 under power
-        let max_fwd = 75.0;
+        // Tarmac rolls fast with little rolling resistance; open ground (grass)
+        // is slower and draggier.
+        let paved = self.on_pavement(self.car_pos.x, self.car_pos.z);
+        let accel = if paved { 22.0 } else { 14.0 }; // m/s^2 under power
+        let max_fwd = if paved { 95.0 } else { 42.0 };
         let max_rev = 24.0;
+        let roll = if paved { 8.0 } else { 22.0 }; // rolling friction
         let mut a = 0.0;
         if self.drive_in[0] {
             a += accel;
@@ -2456,17 +2514,47 @@ impl World {
             a -= accel;
         }
         // steering: turn rate scales with speed and flips when reversing.
-        let steer = (self.drive_in[2] as i32 - self.drive_in[3] as i32) as f32;
+        // A steers left, D steers right (drive_in[2]=A, [3]=D).
+        let steer = (self.drive_in[3] as i32 - self.drive_in[2] as i32) as f32;
         let speed_frac = (self.car_speed / 22.0).clamp(-1.0, 1.0);
         self.car_yaw += steer * 1.7 * speed_frac * dt;
         // engine, then rolling friction always opposing motion.
         self.car_speed += a * dt;
-        let f = 13.0 * dt;
+        let f = roll * dt;
         self.car_speed -= self.car_speed.clamp(-f, f) * if a == 0.0 { 1.0 } else { 0.25 };
         self.car_speed = self.car_speed.clamp(-max_rev, max_fwd);
         let heading = DVec3::new(self.car_yaw.cos() as f64, 0.0, self.car_yaw.sin() as f64);
-        self.car_pos += heading * (self.car_speed * dt) as f64;
-        self.car_pos.y = 0.0;
+        let mut next = self.car_pos + heading * (self.car_speed * dt) as f64;
+        // stop at building walls instead of driving through them.
+        if self.car_blocked(next) {
+            next = self.car_pos;
+            self.car_speed *= 0.2;
+        }
+        self.car_pos = next;
+        // ride on the ground (terrain / road), not the flat tangent plane.
+        self.car_pos.y = self.local_ground_height(self.car_pos.x, self.car_pos.z);
+    }
+
+    /// Whether a car centred at local `p` would sit inside a building footprint
+    /// (simple circle-vs-rectangle test against the near city's buildings, with a
+    /// small car radius), so the car can be stopped at walls.
+    fn car_blocked(&self, p: DVec3) -> bool {
+        let car_r = 2.2f32;
+        let (px, pz) = (p.x as f32, p.z as f32);
+        for (center, layout) in &self.city_layouts {
+            // only test the city the car is actually in (cheap reject)
+            if (center.x - px).powi(2) + (center.z - pz).powi(2) > 320.0 * 320.0 {
+                continue;
+            }
+            for b in &layout.buildings {
+                let bx = center.x + b.cx;
+                let bz = center.z + b.cz;
+                if (px - bx).abs() < b.fw + car_r && (pz - bz).abs() < b.fd + car_r {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Camera eye in launch-tangent metres (f64).
@@ -3039,6 +3127,34 @@ impl World {
         push_static(&mut out, &self.hangar_mesh);
         push_static(&mut out, &self.rack_mesh);
 
+        // The player's car / character are pushed BEFORE the cities so the dynamic
+        // mesh cap (a dense metro can fill it) never truncates the thing the camera
+        // is following. Rotate the local mesh by the heading about +Y.
+        {
+            let (s, c) = self.car_yaw.sin_cos();
+            for v in &self.car_mesh.verts {
+                let p = Vec3::from(v.pos);
+                let rp = Vec3::new(c * p.x - s * p.z, p.y, s * p.x + c * p.z);
+                let n = Vec3::from(v.normal);
+                let rn = Vec3::new(c * n.x - s * n.z, n.y, s * n.x + c * n.z);
+                let local = self.car_pos + rp.as_dvec3();
+                out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: rn.into(), color: v.color });
+            }
+        }
+        if self.walking {
+            let moving = (self.ped_speed.abs() / 1.5).clamp(0.0, 1.0);
+            let ped = rocket::character(self.walk_phase, moving, [0.20, 0.46, 0.78]);
+            let (s, c) = self.ped_yaw.sin_cos();
+            for v in &ped.verts {
+                let p = Vec3::from(v.pos);
+                let rp = Vec3::new(c * p.x - s * p.z, p.y, s * p.x + c * p.z);
+                let n = Vec3::from(v.normal);
+                let rn = Vec3::new(c * n.x - s * n.z, n.y, s * n.x + c * n.z);
+                let local = self.ped_pos + rp.as_dvec3();
+                out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: rn.into(), color: v.color });
+            }
+        }
+
         // City level-of-detail, by camera-eye distance: full 3D buildings within
         // the build range, flat block/road footprints beyond it (out to the far
         // range), so the city still reads as blocks and roads from kilometres up
@@ -3076,36 +3192,6 @@ impl World {
             let mid = (*a + *b) * 0.5;
             if near(*a) || near(*b) || near(mid) {
                 push_static(&mut out, mesh);
-            }
-        }
-
-        // the car, parked or being driven: rotate its local mesh by the heading
-        // about +Y and place it at the car position (mesh forward is +X).
-        {
-            let (s, c) = self.car_yaw.sin_cos();
-            for v in &self.car_mesh.verts {
-                let p = Vec3::from(v.pos);
-                let rp = Vec3::new(c * p.x - s * p.z, p.y, s * p.x + c * p.z);
-                let n = Vec3::from(v.normal);
-                let rn = Vec3::new(c * n.x - s * n.z, n.y, s * n.x + c * n.z);
-                let local = self.car_pos + rp.as_dvec3();
-                out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: rn.into(), color: v.color });
-            }
-        }
-
-        // the third-person character (on foot only), posed for the walk cycle and
-        // yawed to its heading.
-        if self.walking {
-            let moving = (self.ped_speed.abs() / 1.5).clamp(0.0, 1.0);
-            let ped = rocket::character(self.walk_phase, moving, [0.20, 0.46, 0.78]);
-            let (s, c) = self.ped_yaw.sin_cos();
-            for v in &ped.verts {
-                let p = Vec3::from(v.pos);
-                let rp = Vec3::new(c * p.x - s * p.z, p.y, s * p.x + c * p.z);
-                let n = Vec3::from(v.normal);
-                let rn = Vec3::new(c * n.x - s * n.z, n.y, s * n.x + c * n.z);
-                let local = self.ped_pos + rp.as_dvec3();
-                out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: rn.into(), color: v.color });
             }
         }
 
