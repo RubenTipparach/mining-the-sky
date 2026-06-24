@@ -5494,7 +5494,7 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.ped_pos = DVec3::new(28.0, 0.0, 6.0);
             world.ped_yaw = 0.5;
             world.ped_speed = 3.5; // pose the walk cycle (idle would stand still)
-            world.walk_phase = 1.2;
+            world.walk_phase = std::env::var("WALK_PHASE").ok().and_then(|s| s.parse().ok()).unwrap_or(1.2);
             // 3/4 front view so the face + swept fringe read against the back hair.
             world.rocket_az = world.ped_yaw - 0.7;
             world.rocket_el = 0.10;

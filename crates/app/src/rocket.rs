@@ -1519,13 +1519,15 @@ pub fn character(phase: f32, moving: f32, shirt: [f32; 3]) -> Mesh {
     // (no foot-on-the-floor shuffling). Right leg is half a cycle behind.
     for (sz, ph) in [(-1.0f32, 0.0f32), (1.0, PI)] {
         let a = phase + ph;
-        let stride = 0.30 * moving;
+        let stride = 0.34 * moving;
         let fx = a.sin() * stride; // fore/aft foot position
-        let lift = a.cos().max(0.0) * 0.15 * moving; // foot rises through the swing
+        // The foot lifts clearly off the ground through the swing (back -> front)
+        // and is planted flat through the stance, so it steps instead of shuffling.
+        let lift = a.cos().max(0.0).powf(0.7) * 0.22 * moving;
         let hip = Vec3::new(0.0, 0.80, sz * 0.10);
         let foot = Vec3::new(fx, 0.06 + lift, sz * 0.10);
         // knee drives forward + up while the foot is lifted, so the leg bends.
-        let knee = Vec3::new(fx * 0.45 + lift * 1.1, 0.44 + lift * 0.15, sz * 0.10);
+        let knee = Vec3::new(fx * 0.45 + lift * 1.0, 0.45 + lift * 0.1, sz * 0.10);
         m.strut(hip, knee, 0.085, pants);
         m.strut(knee, foot, 0.075, pants);
         m.bx(foot + Vec3::new(0.05, 0.0, 0.0), Vec3::new(0.13, 0.045, 0.085), shoe);
