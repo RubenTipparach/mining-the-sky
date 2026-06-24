@@ -1162,21 +1162,17 @@ fn road_seg(m: &mut Mesh, a: Vec3, b: Vec3, half_w: f32, curbs: bool) {
         } else {
             (cx, cz + t * hz * 2.0, hx, hz / segs as f32)
         };
-        // Thick and sunk (like the city ground plane): the surface sits a touch
-        // above the tangent plane while the slab reaches well below it, so the
-        // curved terrain stays buried under the road instead of z-fighting its
-        // way through it. Top at y=0.15, bottom at y=-1.95.
-        m.bx(Vec3::new(sx, -0.9, sz), Vec3::new(shx, 1.05, shz), road);
+        m.bx(Vec3::new(sx, 0.13, sz), Vec3::new(shx, 0.13, shz), road);
     }
     if curbs {
-        // dashed-looking light shoulders along both edges, just proud of the road
+        // dashed-looking light shoulders along both edges
         if along_x {
             for sz in [-1.0f32, 1.0] {
-                m.bx(Vec3::new(cx, -0.86, cz + sz * (hz - 0.4)), Vec3::new(hx, 1.05, 0.5), curb);
+                m.bx(Vec3::new(cx, 0.20, cz + sz * (hz - 0.4)), Vec3::new(hx, 0.20, 0.5), curb);
             }
         } else {
             for sx in [-1.0f32, 1.0] {
-                m.bx(Vec3::new(cx + sx * (hx - 0.4), -0.86, cz), Vec3::new(0.5, 1.05, hz), curb);
+                m.bx(Vec3::new(cx + sx * (hx - 0.4), 0.20, cz), Vec3::new(0.5, 0.20, hz), curb);
             }
         }
     }

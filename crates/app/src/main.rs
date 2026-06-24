@@ -568,6 +568,23 @@ fn ray_sphere_near(o: Vec3, d: Vec3, c: Vec3, r: f32) -> Option<f32> {
     }
 }
 
+/// Nearest forward intersection distance of ray `o + t*d` with the axis-aligned
+/// box `[lo, hi]`, or `None` if the ray misses. Used for camera collision
+/// against building boxes (slab method, f64). `d` need not be normalised but is
+/// here, so `t` is in metres.
+fn ray_box(o: DVec3, d: DVec3, lo: DVec3, hi: DVec3) -> Option<f64> {
+    let inv = DVec3::new(1.0 / d.x, 1.0 / d.y, 1.0 / d.z);
+    let t1 = (lo - o) * inv;
+    let t2 = (hi - o) * inv;
+    let near = t1.min(t2).max_element();
+    let far = t1.max(t2).min_element();
+    if far >= near.max(0.0) {
+        Some(near.max(0.0))
+    } else {
+        None
+    }
+}
+
 impl OrbitObject {
     /// World position (Mm) at `sys_time`, given the home world's position.
     fn pos_mm(&self, home_pos: DVec3, sys_time: f64) -> DVec3 {
@@ -2557,6 +2574,56 @@ impl World {
         false
     }
 
+    /// Third-person camera collision: march from the look target `tgt` out
+    /// toward the desired eye along `dir`, and return how far the camera may sit
+    /// (<= `max_dist`) before it would pass through terrain or a building. The
+    /// camera keeps the full desired zoom when the path is clear and only pulls
+    /// in when something is in the way, then springs back out as it clears - the
+    /// usual 3rd-person "collide the boom" behaviour.
+    fn camera_boom_dist(&self, tgt: DVec3, dir: DVec3, max_dist: f64) -> f64 {
+        let skin = 0.45; // pull in a touch so the near plane never grazes a face
+        let min_dist = 0.6; // never glue the eye onto the target
+        let mut hit = max_dist;
+
+        // Terrain: walk samples along the boom and stop at the first one whose
+        // eye candidate would dip to/under the visible ground at that (x, z).
+        let steps = 28;
+        let step = max_dist / steps as f64;
+        for i in 1..=steps {
+            let t = step * i as f64;
+            let p = tgt + dir * t;
+            if p.y < self.local_ground_height(p.x, p.z) + skin {
+                hit = hit.min((t - step).max(min_dist));
+                break;
+            }
+        }
+
+        // Buildings: ray vs each nearby building box (footprint + height).
+        for (center, layout) in &self.city_layouts {
+            let cdx = center.x as f64 - tgt.x;
+            let cdz = center.z as f64 - tgt.z;
+            let reach = max_dist + 320.0;
+            if cdx * cdx + cdz * cdz > reach * reach {
+                continue; // city too far to be on the boom
+            }
+            let base = self.local_ground_height(center.x as f64, center.z as f64);
+            for b in &layout.buildings {
+                let bx = (center.x + b.cx) as f64;
+                let bz = (center.z + b.cz) as f64;
+                let hw = (b.fw + 0.3) as f64;
+                let hd = (b.fd + 0.3) as f64;
+                let lo = DVec3::new(bx - hw, base, bz - hd);
+                let hi = DVec3::new(bx + hw, base + b.height as f64, bz + hd);
+                if let Some(t) = ray_box(tgt, dir, lo, hi) {
+                    if t < hit {
+                        hit = (t - skin).max(min_dist);
+                    }
+                }
+            }
+        }
+        hit.clamp(min_dist, max_dist)
+    }
+
     /// Camera eye in launch-tangent metres (f64).
     fn camera_eye_local(&self) -> DVec3 {
         let tgt = self.camera_look_local();
@@ -2565,8 +2632,9 @@ impl World {
             self.rocket_el.sin() as f64,
             (self.rocket_el.cos() * self.rocket_az.sin()) as f64,
         );
-        let mut eye = tgt + dir * self.rocket_dist as f64;
-        // keep above the local ground plane
+        let dist = self.camera_boom_dist(tgt, dir, self.rocket_dist as f64);
+        let mut eye = tgt + dir * dist;
+        // Final safety net: never let the eye sit under the planet surface.
         let ground = self.cam_world(eye).length() - self.body.radius;
         if ground < 2.0 {
             eye.y += 2.0 - ground;
