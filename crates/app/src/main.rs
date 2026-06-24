@@ -5296,6 +5296,28 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.sys_el = 0.14;
             6.0
         }
+        "cityrise" => {
+            // Camera rising straight up over the metro, tilting down to keep it
+            // framed, for a ground-to-altitude ascent sequence. Height (km) and
+            // day/night come from env vars so one scenario drives the whole run.
+            world.view = View::Rocket;
+            let km: f64 = std::env::var("ASCENT_KM").ok().and_then(|s| s.parse().ok()).unwrap_or(2.0);
+            let night = std::env::var("ASCENT_NIGHT").ok().map(|s| s == "1").unwrap_or(false);
+            world.night = night;
+            world.enter_drive();
+            world.car_pos = CITY_CENTER.as_dvec3();
+            for _ in 0..30 {
+                world.advance(0.1); // settle terrain LOD + wake the crowd
+            }
+            // Fixed horizontal standoff; the camera climbs to height `h` and tilts
+            // down (elevation grows with height), focused on the city centre.
+            let h = km * 1000.0;
+            let l = 2500.0f64;
+            world.rocket_dist = (l * l + h * h).sqrt() as f32;
+            world.rocket_el = h.atan2(l) as f32;
+            world.rocket_az = std::f32::consts::FRAC_PI_2;
+            0.0
+        }
         "nightcity" => {
             // street level in the metro at night: the sky is dark and the
             // emissive windows + traffic carry the scene.
@@ -7081,6 +7103,8 @@ fn main() {
                 "overlook"
             } else if args.iter().any(|a| a == "descent") {
                 "descent"
+            } else if args.iter().any(|a| a == "cityrise") {
+                "cityrise"
             } else if args.iter().any(|a| a == "nightcity") {
                 "nightcity"
             } else if args.iter().any(|a| a == "moon") {
@@ -7193,6 +7217,7 @@ fn main() {
                 "overlook" => "out/overlook.png",
                 "descent" => "out/descent.png",
                 "nightcity" => "out/nightcity.png",
+                "cityrise" => "out/cityrise.png",
                 "rocket" => "out/rocket.png",
                 "system" => "out/system.png",
                 "pad" => "out/pad.png",
