@@ -1399,10 +1399,36 @@ pub fn city_night_glow(center: Vec3) -> Mesh {
     m
 }
 
-/// A small drivable car: a low body with a cabin and four wheels, modelled in
-/// local metres facing +X (its forward axis), sitting on the ground at y=0. The
-/// drive code positions + yaws it each frame. `body` tints the chassis so player
-/// and traffic cars can differ.
+/// The far level-of-detail for a city: a flat footprint - the dark street grid,
+/// lighter concrete block pads, and palette-coloured building footprints - with
+/// no 3D massing, drawn beyond the building range so the city still reads as
+/// blocks and roads from kilometres away. Generated from the SAME `CityLayout`
+/// as the near buildings (`worldcity::generate`), so the two line up exactly.
+/// Tessellated per cell so the logarithmic depth resolves at distance.
+pub fn city_footprint(layout: &worldcity::CityLayout, center: Vec3) -> Mesh {
+    let mut m = Mesh::default();
+    let span = layout.span();
+    let hx = layout.half_x();
+    let hz = layout.half_z();
+    let road = [0.20, 0.205, 0.225]; // asphalt grid
+    let concrete = [0.40, 0.40, 0.42]; // block pads between the streets
+    let block_half = (span - layout.street) * 0.5; // = block * 0.5
+    for ix in 0..layout.cols as i32 {
+        for iz in 0..layout.rows as i32 {
+            let cx = center.x - hx + (ix as f32 + 0.5) * span;
+            let cz = center.z - hz + (iz as f32 + 0.5) * span;
+            // full-cell road base, then an inset concrete pad - the inset gap is
+            // the street, so the grid of roads reads from far.
+            m.bx(Vec3::new(cx, 0.05, cz), Vec3::new(span * 0.5, 0.04, span * 0.5), road);
+            m.bx(Vec3::new(cx, 0.09, cz), Vec3::new(block_half, 0.04, block_half), concrete);
+        }
+    }
+    for b in &layout.buildings {
+        let col = worldcity::PALETTE[(b.pal as usize).min(worldcity::PALETTE.len() - 1)];
+        m.bx(Vec3::new(center.x + b.cx, 0.12, center.z + b.cz), Vec3::new(b.fw, 0.04, b.fd), col);
+    }
+    m
+}
 pub fn car(body: [f32; 3]) -> Mesh {
     let mut m = Mesh::default();
     let cabin = [0.30, 0.33, 0.40]; // tinted glass

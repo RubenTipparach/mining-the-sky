@@ -199,9 +199,12 @@ const CLUSTERS: [(Vec3, i32, i32, u32); 3] = [
     (Vec3::new(3200.0, 0.0, -2600.0), 2, 3, 40),
 ];
 
-/// Render a city when the camera focus is within this range (catches a whole
-/// metro at once, so a cluster reads as one continuous sprawl with no pop-in).
-const CITY_RENDER_R: f64 = 2300.0;
+/// Draw a city's full 3D buildings within this range of the camera eye; past it
+/// the flat footprint LOD takes over (we don't render buildings beyond ~5 km).
+const CITY_BUILD_R: f64 = 5000.0;
+/// Draw a city's far footprint (concrete blocks + roads) out to this range, so it
+/// still reads as a city from kilometres away / up.
+const CITY_FOOT_R: f64 = 50000.0;
 
 /// The downtown grid of one metro cluster, centred on `center` (each entry is the
 /// city centre + its layout variant, so neighbouring downtowns look distinct).
@@ -216,6 +219,25 @@ fn cluster_cities(center: Vec3, cols: i32, rows: i32, vbase: u32) -> Vec<(Vec3, 
         }
     }
     v
+}
+
+/// The unified descriptor for a local cluster downtown, so its layout comes from
+/// the same `worldcity::generate` the far footprints and (eventually) the orbital
+/// lights use. `seed = variant * 1009` and a population that yields a 7x7 grid
+/// reproduce exactly the layout `rocket::city` draws, so near buildings and far
+/// footprints line up. (These local cities get high ids to stay clear of the
+/// baked world index; the next phase replaces them with real indexed cities.)
+fn local_city_desc(variant: u32) -> worldcity::CityDesc {
+    worldcity::CityDesc {
+        id: 1_000_000 + variant,
+        kind: 1,
+        lon: 0.0,
+        lat: 0.0,
+        pop: 2.0e6, // -> 7x7 grid, matching the prototype downtown
+        seed: variant.wrapping_mul(1009),
+        radius_m: 360.0,
+        _pad: 0,
+    }
 }
 
 /// Every drivable downtown across all metro clusters (centre + layout variant).
@@ -615,6 +637,9 @@ struct World {
     /// Night-only warm ground lighting per city (amber street wash + lamp pools),
     /// drawn only when `night` so its amber albedo does not tint the day streets.
     city_glow: Vec<(Vec3, rocket::Mesh)>,
+    /// Far level-of-detail per city: flat block + road footprints (from the same
+    /// layout as the buildings), drawn beyond the building range.
+    city_footprints: Vec<(Vec3, rocket::Mesh)>,
     roads: Vec<(Vec3, Vec3, rocket::Mesh)>,
     car_mesh: rocket::Mesh,
     lander_mesh: rocket::Mesh,
@@ -834,6 +859,10 @@ impl World {
             platform_mesh: rocket::crawler_platform(),
             city_meshes: all_cities().iter().map(|&(c, v)| (c, rocket::city(c, v))).collect(),
             city_glow: all_cities().iter().map(|&(c, _)| (c, rocket::city_night_glow(c))).collect(),
+            city_footprints: all_cities()
+                .iter()
+                .map(|&(c, v)| (c, rocket::city_footprint(&worldcity::generate(&local_city_desc(v)), c)))
+                .collect(),
             roads: build_city_roads(),
             car_mesh: rocket::car([0.80, 0.18, 0.16]),
             lander_mesh: rocket::lander(),
@@ -3010,28 +3039,39 @@ impl World {
         push_static(&mut out, &self.hangar_mesh);
         push_static(&mut out, &self.rack_mesh);
 
-        // The cities + their road network are spread across kilometres; only draw
-        // the ones near the camera focus (each city is several km from the next,
-        // so usually just the one you are in is built into the frame).
-        let focus = self.camera_look_local();
-        let near = |p: Vec3| {
-            let d = p.as_dvec3() - focus;
-            d.x * d.x + d.z * d.z < CITY_RENDER_R * CITY_RENDER_R
-        };
+        // City level-of-detail, by camera-eye distance: full 3D buildings within
+        // the build range, flat block/road footprints beyond it (out to the far
+        // range), so the city still reads as blocks and roads from kilometres up
+        // or away. Keyed on the eye (not the look target) so it tracks where the
+        // camera actually is. Horizontal distance, squared.
+        let eye = self.camera_eye_local();
+        // Full 3D distance (includes altitude), so a camera high above a city
+        // drops to the footprint LOD even though it is overhead.
+        let d2 = |p: Vec3| (p.as_dvec3() - eye).length_squared();
+        let build_r2 = CITY_BUILD_R * CITY_BUILD_R;
+        let foot_r2 = CITY_FOOT_R * CITY_FOOT_R;
         for (center, mesh) in &self.city_meshes {
-            if near(*center) {
+            if d2(*center) < build_r2 {
                 push_static(&mut out, mesh);
             }
         }
-        // The warm street/ground lighting is drawn only at night (its amber albedo
-        // would tint the day streets), tracking the same per-city culling.
+        // Warm ground lighting: only near (with the buildings) and only at night
+        // (its amber albedo would tint the day streets).
         if self.night {
             for (center, mesh) in &self.city_glow {
-                if near(*center) {
+                if d2(*center) < build_r2 {
                     push_static(&mut out, mesh);
                 }
             }
         }
+        // Far footprints fill in past the build range.
+        for (center, mesh) in &self.city_footprints {
+            let dd = d2(*center);
+            if dd >= build_r2 && dd < foot_r2 {
+                push_static(&mut out, mesh);
+            }
+        }
+        let near = |p: Vec3| d2(p) < foot_r2;
         for (a, b, mesh) in &self.roads {
             let mid = (*a + *b) * 0.5;
             if near(*a) || near(*b) || near(mid) {
@@ -5312,7 +5352,10 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             // Fixed horizontal standoff; the camera climbs to height `h` and tilts
             // down (elevation grows with height), focused on the city centre.
             let h = km * 1000.0;
-            let l = 2500.0f64;
+            // ASCENT_L sets the horizontal standoff (default 2500 m); a large
+            // standoff + low height gives a low-angle oblique view, handy for
+            // seeing the flat footprint LOD edge-on.
+            let l: f64 = std::env::var("ASCENT_L").ok().and_then(|s| s.parse().ok()).unwrap_or(2500.0);
             world.rocket_dist = (l * l + h * h).sqrt() as f32;
             world.rocket_el = h.atan2(l) as f32;
             world.rocket_az = std::f32::consts::FRAC_PI_2;

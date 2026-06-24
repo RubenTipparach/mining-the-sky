@@ -24,18 +24,21 @@ pub use cache::CityCache;
 pub use index::CityIndex;
 
 /// 0..1 hash from two integer keys - the deterministic noise the generator runs
-/// on, matching the look the prototype's hand-rolled `city()` produced.
+/// on. Bit-identical to the app's `rocket::hash01`, so `generate` reproduces
+/// exactly the building layout the prototype's hand-rolled `city()` drew (the
+/// near buildings and the far footprints therefore line up).
 #[inline]
-pub fn hash01(a: i32, b: i32) -> f32 {
-    let mut h = (a as u32)
-        .wrapping_mul(0x9E37_79B9)
-        .wrapping_add((b as u32).wrapping_mul(0x85EB_CA77));
+pub fn hash01(i: i32, j: i32) -> f32 {
+    let mut h = (i as u32)
+        .wrapping_mul(0x1657_4d2b)
+        .wrapping_add((j as u32).wrapping_mul(0x9e37_79b1))
+        .wrapping_add(0x85eb_ca6b);
     h ^= h >> 15;
-    h = h.wrapping_mul(0x2C1B_3C6D);
+    h = h.wrapping_mul(0x2c1b_3c6d);
     h ^= h >> 12;
-    h = h.wrapping_mul(0x297A_2D39);
+    h = h.wrapping_mul(0x297a_2d39);
     h ^= h >> 15;
-    (h & 0x00FF_FFFF) as f32 / 0x0100_0000 as f32
+    (h & 0x00ff_ffff) as f32 / 0x0100_0000 as f32
 }
 
 /// A city's "world address": where it is on the planet and the seed its layout is
@@ -201,7 +204,7 @@ struct LayoutHeader {
 }
 
 const LAYOUT_MAGIC: u32 = 0x4C54_4943; // "CITL"
-const LAYOUT_VERSION: u32 = 1;
+const LAYOUT_VERSION: u32 = 2;
 
 /// Serialise a layout to bytes (header + buildings).
 pub fn layout_to_bytes(l: &CityLayout) -> Vec<u8> {
