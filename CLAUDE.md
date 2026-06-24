@@ -2,6 +2,15 @@
 
 Guidance for Claude Code when working in this repository.
 
+## Don'ts
+
+- Never rebuild an existing feature from scratch. Before writing something that
+  sounds like it might already exist (a generator, a renderer, a UI panel, a
+  math helper), search the codebase and find it first. Then extend or
+  parameterize the existing code - add an argument, a variant, a strategy - so
+  there is one implementation, not two parallel ones that can drift. If the
+  current code genuinely cannot be adapted, say why before replacing it.
+
 ## Writing conventions
 
 - Never use em-dashes (the "—" character) anywhere in this repo: not in docs,
