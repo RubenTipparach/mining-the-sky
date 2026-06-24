@@ -90,56 +90,63 @@ pub struct Building {
     pub warm: u32,
 }
 
-/// A generated city. The street grid (and thus road/block footprints and the
-/// kerbside lamp positions) is regular and derived from `cols/rows/block/street`;
-/// only the buildings need explicit storage. All coordinates are local metres,
-/// centred on the city origin (place it in the world via the city's `dir`).
+/// One street segment in the city's local frame (x east, z north, metres). The
+/// road network is stored explicitly (not derived from a grid) so a city can be
+/// laid out organically - curving rings and radiating avenues - instead of a
+/// rigid Manhattan grid. POD so the segment list serialises directly.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct RoadSeg {
+    pub ax: f32,
+    pub az: f32,
+    pub bx: f32,
+    pub bz: f32,
+    /// Full road width (m).
+    pub width: f32,
+    pub _pad: f32,
+}
+
+impl RoadSeg {
+    pub fn a(&self) -> Vec2 {
+        Vec2::new(self.ax, self.az)
+    }
+    pub fn b(&self) -> Vec2 {
+        Vec2::new(self.bx, self.bz)
+    }
+}
+
+/// A generated city, laid out organically as a radial-concentric plan: avenues
+/// radiate from the centre and are crossed by (irregular, jittered) ring roads,
+/// so the streets curve and the blocks are wedge-shaped rather than a square
+/// grid. Both the road network and the buildings are stored explicitly, and
+/// every level of detail (near massing, far footprints, orbital glow, kerbside
+/// lamps) is derived from this one layout. All coordinates are local metres,
+/// centred on the city origin (placed in the world via the city's `dir`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct CityLayout {
-    pub cols: u32,
-    pub rows: u32,
-    /// Block footprint (m) and street width (m).
-    pub block: f32,
-    pub street: f32,
-    /// Layout seed (so the far-footprint builder can re-derive the organic
-    /// built-up mask and match the buildings).
+    /// Layout seed.
     pub seed: u32,
+    /// Built-up radius (m): the LOD / paving / glow extent.
+    pub radius: f32,
+    pub roads: Vec<RoadSeg>,
     pub buildings: Vec<Building>,
 }
 
-/// Whether a grid cell is built up. Cities are NOT perfect squares: cells are
-/// dropped toward the edges by a noisy radial mask, so the built-up area has an
-/// organic, ragged outline with the corners cut. Shared by `generate` and the
-/// far-footprint builder, so buildings and footprints always agree.
-pub fn cell_developed(seed: i32, cols: u32, rows: u32, ix: i32, iz: i32) -> bool {
-    let h = |a: i32, b: i32| hash01(a.wrapping_add(seed), b.wrapping_sub(seed));
-    let dx = (ix as f32 - (cols as f32 - 1.0) * 0.5) / (cols as f32 * 0.5);
-    let dz = (iz as f32 - (rows as f32 - 1.0) * 0.5) / (rows as f32 * 0.5);
-    let r = (dx * dx + dz * dz).sqrt();
-    r <= 0.82 + 0.62 * h(ix * 7 + 91, iz * 7 + 43)
-}
-
 impl CityLayout {
-    /// Block-to-block spacing (m).
-    pub fn span(&self) -> f32 {
-        self.block + self.street
+    /// Half-extent of the built-up area (m) - the city is roughly a disc, so the
+    /// same value spans both axes.
+    pub fn half(&self) -> f32 {
+        self.radius
     }
-    /// Half-extent of the built-up area along x (m).
-    pub fn half_x(&self) -> f32 {
-        self.cols as f32 * self.span() * 0.5
-    }
-    /// Half-extent of the built-up area along z (m).
-    pub fn half_z(&self) -> f32 {
-        self.rows as f32 * self.span() * 0.5
-    }
-    /// Street-grid intersection points (local x,z), for kerbside lamps / road
-    /// footprints - derived, not stored.
+    /// Street intersection points (local x,z) - the endpoints of the road
+    /// network, deduplicated, for kerbside lamps.
     pub fn intersections(&self) -> Vec<Vec2> {
-        let (span, hx, hz) = (self.span(), self.half_x(), self.half_z());
-        let mut v = Vec::new();
-        for ix in 0..=self.cols {
-            for iz in 0..=self.rows {
-                v.push(Vec2::new(-hx + ix as f32 * span, -hz + iz as f32 * span));
+        let mut v: Vec<Vec2> = Vec::new();
+        for r in &self.roads {
+            for p in [r.a(), r.b()] {
+                if !v.iter().any(|q| (*q - p).length_squared() < 1.0) {
+                    v.push(p);
+                }
             }
         }
         v
@@ -157,55 +164,133 @@ pub const PALETTE: [[f32; 3]; 6] = [
 ];
 
 /// Deterministically generate a city's layout from its descriptor. Bigger
-/// populations get larger grids; everything else is hashed from `desc.seed`, so
-/// the same descriptor always yields exactly the same city (the property the
-/// cache relies on).
+/// populations get more rings (a larger city); everything else is hashed from
+/// `desc.seed`, so the same descriptor always yields exactly the same city (the
+/// property the cache relies on).
+///
+/// The plan is radial-concentric: `spokes` avenues radiate from the centre,
+/// crossed by `rings` concentric ring roads. Every ring node is pushed off its
+/// ideal circle by hashed jitter (the rings buckle, the avenues wander), so the
+/// streets curve and the blocks between them are irregular wedges - an organic
+/// town, not a grid. Outer blocks are dropped by a noisy mask for a ragged edge.
 pub fn generate(desc: &CityDesc) -> CityLayout {
     let seed = desc.seed as i32;
     let h = |a: i32, b: i32| hash01(a.wrapping_add(seed), b.wrapping_sub(seed));
+    let jit = |a: i32, b: i32| h(a, b) * 2.0 - 1.0; // [-1, 1]
 
     let pm = (desc.pop / 1.0e6).max(0.1);
-    // 4..11 blocks a side, scaling with sqrt(population).
-    let n = (4.0 + 2.4 * pm.sqrt()).clamp(4.0, 11.0) as u32;
-    let (cols, rows) = (n, n);
-    let block = 46.0f32;
-    let street = 14.0f32;
-    let span = block + street;
-    let half_x = cols as f32 * span * 0.5;
-    let half_z = rows as f32 * span * 0.5;
+    // 3..7 rings out from the centre, 7..11 radiating avenues.
+    let rings = (3.0 + 1.7 * pm.sqrt()).clamp(3.0, 7.0) as i32;
+    let spokes = (7.0 + (4.0 * h(11, 23)).floor()).clamp(7.0, 11.0) as i32;
+    let ring0 = 36.0f32; // radius of the innermost ring (a central plaza)
+    let ring_gap = 30.0f32; // nominal radial spacing between rings
+    let street = 13.0f32;
 
-    let mut buildings = Vec::new();
-    for ix in 0..cols as i32 {
-        for iz in 0..rows as i32 {
-            let bx0 = -half_x + (ix as f32 + 0.5) * span;
-            let bz0 = -half_z + (iz as f32 + 0.5) * span;
-            let dx = (ix as f32 - (cols as f32 - 1.0) * 0.5) / (cols as f32 * 0.5);
-            let dz = (iz as f32 - (rows as f32 - 1.0) * 0.5) / (rows as f32 * 0.5);
-            // organic outline: skip cells dropped by the built-up mask, so the
-            // city is a ragged blob rather than a perfect square.
-            if !cell_developed(seed, cols, rows, ix, iz) {
-                continue;
+    // node[k][s]: the intersection of ring k and avenue s, jittered off its
+    // ideal circle so the network buckles organically. s wraps modulo `spokes`.
+    let node = |k: i32, s: i32| -> Vec2 {
+        let sm = ((s % spokes) + spokes) % spokes;
+        let ang = (sm as f32 / spokes as f32) * std::f32::consts::TAU
+            + 0.20 * jit(sm * 13 + 7, 31) // each avenue leans a fixed amount
+            + 0.17 * jit(k * 17 + 3, sm * 5 + 9); // and wanders ring to ring
+        // each ring buckles in and out so it is never a clean circle/polygon
+        let rad = ring0
+            + k as f32 * ring_gap * (0.82 + 0.30 * h(sm * 11 + 5, 17))
+            + ring_gap * 0.55 * jit(k * 23 + 1, sm * 7 + 2);
+        Vec2::new(ang.cos() * rad, ang.sin() * rad)
+    };
+
+    // A block sits between rings k..k+1 and avenues s..s+1. Drop outer blocks by
+    // a noisy mask so the built-up area frays out instead of ending on a clean
+    // circle. The centre is always developed.
+    let developed = |k: i32, s: i32| -> bool {
+        if k < 0 || k >= rings {
+            return false;
+        }
+        let edge = k as f32 / rings as f32; // 0 centre .. ~1 rim
+        h(k * 9 + s * 3 + 5, k * 5 + s * 7 + 1) > edge * 0.85 - 0.12
+    };
+
+    let mut roads: Vec<RoadSeg> = Vec::new();
+    let mut push = |a: Vec2, b: Vec2, w: f32| {
+        roads.push(RoadSeg { ax: a.x, az: a.y, bx: b.x, bz: b.y, width: w, _pad: 0.0 });
+    };
+    // Ring roads (the arcs) and radial avenues, kept only where they border a
+    // developed block, so the network follows the ragged outline.
+    for k in 0..=rings {
+        for s in 0..spokes {
+            // ring arc between avenue s and s+1, on ring k
+            if developed(k, s) || developed(k - 1, s) {
+                push(node(k, s), node(k, s + 1), street);
             }
-            let central = (1.0 - (dx * dx + dz * dz).sqrt()).clamp(0.0, 1.0);
-            let count = 1 + (h(ix, iz) * 3.99) as i32;
-            for k in 0..count {
-                let sx = if k % 2 == 0 { -1.0 } else { 1.0 };
-                let sz = if k < 2 { -1.0 } else { 1.0 };
-                let h1 = h(ix * 31 + k, iz * 17 + 7);
-                let h2 = h(ix * 13 + 5, iz * 29 + k);
-                let fw = block * 0.21 * (0.7 + 0.3 * h1);
-                let fd = block * 0.21 * (0.7 + 0.3 * h2);
-                let height = 8.0 + central * (16.0 + 60.0 * h1) + (1.0 - central) * 10.0 * h2;
-                let pal = ((h(ix + k, iz) * PALETTE.len() as f32) as u32).min(PALETTE.len() as u32 - 1);
-                let cx = bx0 + sx * block * 0.25;
-                let cz = bz0 + sz * block * 0.25;
-                let lit = (h(ix * 3 + k, iz * 9 + 1) > 0.32) as u32;
-                let warm = (h(ix * 7 + k, iz * 5 + 3) > 0.5) as u32;
-                buildings.push(Building { cx, cz, fw, fd, height, pal, lit, warm });
+            // radial avenue between ring k and k+1, on avenue s
+            if k < rings && (developed(k, s) || developed(k, s - 1)) {
+                // avenues are a touch wider than the ring streets
+                push(node(k, s), node(k + 1, s), street * 1.15);
             }
         }
     }
-    CityLayout { cols, rows, block, street, seed: desc.seed, buildings }
+
+    // Buildings: fill each developed block with a few footprints, placed by
+    // bilinear interpolation of the block's four (warped) corners so they sit
+    // inside the wedge. Taller toward the centre for a downtown massing.
+    let mut buildings = Vec::new();
+    for k in 0..rings {
+        for s in 0..spokes {
+            if !developed(k, s) {
+                continue;
+            }
+            let p00 = node(k, s);
+            let p01 = node(k, s + 1);
+            let p10 = node(k + 1, s);
+            let p11 = node(k + 1, s + 1);
+            let bil = |u: f32, v: f32| -> Vec2 {
+                let top = p00.lerp(p01, u);
+                let bot = p10.lerp(p11, u);
+                top.lerp(bot, v)
+            };
+            // block scale, to size + count the buildings that fit
+            let du = (p01 - p00).length().min((p11 - p10).length());
+            let dv = (p10 - p00).length().min((p11 - p01).length());
+            let central = (1.0 - k as f32 / rings as f32).clamp(0.0, 1.0);
+            // up to 2x2 buildings, fewer out at the rim
+            let nu = if du > 46.0 { 2 } else { 1 };
+            let nv = if dv > 46.0 { 2 } else { 1 };
+            for iu in 0..nu {
+                for iv in 0..nv {
+                    let hk = h(k * 41 + s * 7 + iu * 3 + 1, s * 29 + k * 11 + iv * 5 + 2);
+                    if hk < 0.18 {
+                        continue; // a few empty lots
+                    }
+                    let u = (iu as f32 + 0.5) / nu as f32 + 0.12 * jit(k * 7 + iu, s * 9 + iv);
+                    let v = (iv as f32 + 0.5) / nv as f32 + 0.12 * jit(s * 7 + iv, k * 9 + iu);
+                    let c = bil(u.clamp(0.18, 0.82), v.clamp(0.18, 0.82));
+                    let h1 = h(k * 31 + iu, s * 17 + iv + 7);
+                    let h2 = h(k * 13 + 5, s * 29 + iu + iv);
+                    let fw = (du / nu as f32) * 0.30 * (0.7 + 0.3 * h1);
+                    let fd = (dv / nv as f32) * 0.30 * (0.7 + 0.3 * h2);
+                    let height = 8.0 + central * (16.0 + 60.0 * h1) + (1.0 - central) * 10.0 * h2;
+                    let pal =
+                        ((h(k + iu, s + iv) * PALETTE.len() as f32) as u32).min(PALETTE.len() as u32 - 1);
+                    let lit = (h(k * 3 + iu, s * 9 + iv + 1) > 0.32) as u32;
+                    let warm = (h(k * 7 + iu, s * 5 + iv + 3) > 0.5) as u32;
+                    buildings.push(Building {
+                        cx: c.x,
+                        cz: c.y,
+                        fw: fw.max(3.0),
+                        fd: fd.max(3.0),
+                        height,
+                        pal,
+                        lit,
+                        warm,
+                    });
+                }
+            }
+        }
+    }
+
+    let radius = ring0 + rings as f32 * ring_gap * 1.45 + 20.0;
+    CityLayout { seed: desc.seed, radius, roads, buildings }
 }
 
 // --- POD (de)serialisation of one layout: a small header + the building array.
@@ -215,30 +300,27 @@ pub fn generate(desc: &CityDesc) -> CityLayout {
 struct LayoutHeader {
     magic: u32,
     version: u32,
-    cols: u32,
-    rows: u32,
-    block: f32,
-    street: f32,
-    n_buildings: u32,
     seed: u32,
+    radius: f32,
+    n_roads: u32,
+    n_buildings: u32,
 }
 
 const LAYOUT_MAGIC: u32 = 0x4C54_4943; // "CITL"
-const LAYOUT_VERSION: u32 = 3;
+const LAYOUT_VERSION: u32 = 4;
 
-/// Serialise a layout to bytes (header + buildings).
+/// Serialise a layout to bytes (header + roads + buildings).
 pub fn layout_to_bytes(l: &CityLayout) -> Vec<u8> {
     let hdr = LayoutHeader {
         magic: LAYOUT_MAGIC,
         version: LAYOUT_VERSION,
-        cols: l.cols,
-        rows: l.rows,
-        block: l.block,
-        street: l.street,
-        n_buildings: l.buildings.len() as u32,
         seed: l.seed,
+        radius: l.radius,
+        n_roads: l.roads.len() as u32,
+        n_buildings: l.buildings.len() as u32,
     };
     let mut out = bytemuck::bytes_of(&hdr).to_vec();
+    out.extend_from_slice(bytemuck::cast_slice(&l.roads));
     out.extend_from_slice(bytemuck::cast_slice(&l.buildings));
     out
 }
@@ -255,15 +337,20 @@ pub fn layout_from_bytes(bytes: &[u8]) -> Option<CityLayout> {
     if hdr.magic != LAYOUT_MAGIC || hdr.version != LAYOUT_VERSION {
         return None;
     }
+    let rsz = std::mem::size_of::<RoadSeg>();
     let bsz = std::mem::size_of::<Building>();
-    let need = hdr.n_buildings as usize * bsz;
+    let need = hdr.n_roads as usize * rsz + hdr.n_buildings as usize * bsz;
     if bytes.len() < hsz + need {
         return None;
     }
-    let buildings: Vec<Building> = (0..hdr.n_buildings as usize)
-        .map(|i| bytemuck::pod_read_unaligned(&bytes[hsz + i * bsz..hsz + (i + 1) * bsz]))
+    let roads: Vec<RoadSeg> = (0..hdr.n_roads as usize)
+        .map(|i| bytemuck::pod_read_unaligned(&bytes[hsz + i * rsz..hsz + (i + 1) * rsz]))
         .collect();
-    Some(CityLayout { cols: hdr.cols, rows: hdr.rows, block: hdr.block, street: hdr.street, seed: hdr.seed, buildings })
+    let boff = hsz + hdr.n_roads as usize * rsz;
+    let buildings: Vec<Building> = (0..hdr.n_buildings as usize)
+        .map(|i| bytemuck::pod_read_unaligned(&bytes[boff + i * bsz..boff + (i + 1) * bsz]))
+        .collect();
+    Some(CityLayout { seed: hdr.seed, radius: hdr.radius, roads, buildings })
 }
 
 #[cfg(test)]
@@ -287,8 +374,9 @@ mod tests {
     fn population_scales_grid() {
         let small = generate(&desc(1, 0.4e6));
         let big = generate(&desc(2, 18.0e6));
-        assert!(big.cols >= small.cols);
+        assert!(big.radius >= small.radius);
         assert!(big.buildings.len() > small.buildings.len());
+        assert!(!small.roads.is_empty() && !big.roads.is_empty());
     }
 
     #[test]

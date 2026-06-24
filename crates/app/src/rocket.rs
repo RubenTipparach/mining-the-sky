@@ -1189,6 +1189,48 @@ pub fn road_l(a: Vec3, b: Vec3, half_w: f32, curbs: bool) -> Mesh {
     m
 }
 
+/// A flat road ribbon between two arbitrary points (any angle), as a quad lying
+/// on the ground at height `y`. Used for the organic city streets, whose
+/// segments are not axis-aligned. The quad is extended a little past each end so
+/// neighbouring segments overlap at the intersections instead of leaving gaps.
+fn road_ribbon(m: &mut Mesh, a: Vec3, b: Vec3, half_w: f32, y: f32, color: [f32; 3]) {
+    let a = Vec3::new(a.x, 0.0, a.z);
+    let b = Vec3::new(b.x, 0.0, b.z);
+    let along = b - a;
+    let len = along.length();
+    if len < 1e-3 {
+        return;
+    }
+    let dir = along / len;
+    let perp = Vec3::new(-dir.z, 0.0, dir.x) * half_w; // ground-plane normal of dir
+    let ext = dir * half_w; // overrun so corners knit together
+    let a = a - ext;
+    let b = b + ext;
+    let p0 = Vec3::new(a.x - perp.x, y, a.z - perp.z);
+    let p1 = Vec3::new(a.x + perp.x, y, a.z + perp.z);
+    let p2 = Vec3::new(b.x + perp.x, y, b.z + perp.z);
+    let p3 = Vec3::new(b.x - perp.x, y, b.z - perp.z);
+    let up = Vec3::Y;
+    m.tri3([p0, p1, p2], [up, up, up], [color, color, color]);
+    m.tri3([p0, p2, p3], [up, up, up], [color, color, color]);
+}
+
+/// A filled ground disc (triangle fan) with a hashed-ragged rim, so a city's
+/// paved area reads as an organic blob from above rather than a square pad.
+fn ground_disc(m: &mut Mesh, center: Vec3, radius: f32, seed: i32, color: [f32; 3], y: f32) {
+    let n = 56;
+    let up = Vec3::Y;
+    let rim = |i: i32| -> Vec3 {
+        let a = (i.rem_euclid(n) as f32 / n as f32) * std::f32::consts::TAU;
+        let r = radius * (0.86 + 0.14 * hash01(i.rem_euclid(n) * 13 + seed, seed * 7 + 3));
+        Vec3::new(center.x + a.cos() * r, y, center.z + a.sin() * r)
+    };
+    let c = Vec3::new(center.x, y, center.z);
+    for i in 0..n {
+        m.tri3([c, rim(i), rim(i + 1)], [up, up, up], [color, color, color]);
+    }
+}
+
 /// A procedural downtown: a street grid of blocks, each packed with a few
 /// buildings of varying height and colour, taller toward the centre, on a paved
 /// ground plane. Centred at `center` (local metres, ground at y=0). `variant`
@@ -1198,83 +1240,37 @@ pub fn road_l(a: Vec3, b: Vec3, half_w: f32, curbs: bool) -> Mesh {
 /// SW and NE corners), so every road is lit from both sides rather than down the
 /// middle. Shared by the mesh builder (lamp posts + baked gradient) and the
 /// renderer (to drive a few as realtime point lights for moving NPCs).
-pub fn city_lamps(center: Vec3) -> Vec<Vec3> {
-    let (nx, nz) = (7i32, 7i32);
-    let span = 60.0f32; // block (46) + street (14)
-    let half_x = nx as f32 * span * 0.5;
-    let half_z = nz as f32 * span * 0.5;
-    let curb = 8.0f32; // street half-width (7) + a little, so the pole is kerbside
-    let mut v = Vec::with_capacity((2 * (nx + 1) * (nz + 1)) as usize);
-    for ix in 0..=nx {
-        for iz in 0..=nz {
-            let x = center.x - half_x + ix as f32 * span;
-            let z = center.z - half_z + iz as f32 * span;
-            v.push(Vec3::new(x - curb, 5.0, z - curb)); // SW kerb
-            v.push(Vec3::new(x + curb, 5.0, z + curb)); // NE kerb (opposite side)
-        }
-    }
-    v
+pub fn city_lamps(layout: &worldcity::CityLayout, center: Vec3) -> Vec<Vec3> {
+    layout
+        .intersections()
+        .into_iter()
+        .map(|p| Vec3::new(center.x + p.x, 5.0, center.z + p.y))
+        .collect()
 }
 
-/// cluster of these read as one big sprawl of separate downtowns. Fully
-/// deterministic so it meshes the same every frame.
-pub fn city(center: Vec3, variant: u32) -> Mesh {
+/// cluster of these read as one big sprawl of separate downtowns. Built from the
+/// city's [`worldcity::CityLayout`] (the single organic source shared with the
+/// far footprint and orbital glow), so the streets curve and the blocks are
+/// irregular wedges rather than a square grid. Fully deterministic so it meshes
+/// the same every frame.
+pub fn city(layout: &worldcity::CityLayout, center: Vec3) -> Mesh {
     let mut m = Mesh::default();
-    let seed = variant as i32 * 1009;
-    let h = |a: i32, b: i32| hash01(a + seed, b - seed);
-    let nx = 7i32;
-    let nz = 7i32;
-    let block = 46.0f32; // block footprint (X and Z)
-    let street = 14.0f32; // street width between blocks
-    let span = block + street; // block-to-block spacing
-    let half_x = nx as f32 * span * 0.5;
-    let half_z = nz as f32 * span * 0.5;
 
-    // paved ground plane under the whole city (tiled, so no grass shows through).
-    // Thick and slightly sunk so it still covers the ground a couple of km out,
-    // where the curved terrain sits a little below the launch-site tangent plane.
+    // Paved ground: an organic disc covering the built-up area, so no grass shows
+    // through and the outline reads as a blob, not a square pad.
     let ground = [0.345, 0.35, 0.37];
-    let dev = |ix: i32, iz: i32| worldcity::cell_developed(seed, nx as u32, nz as u32, ix, iz);
-    for ix in 0..nx {
-        for iz in 0..nz {
-            // only pave built-up cells, so the city footprint has an organic,
-            // ragged outline instead of a perfect square.
-            if !dev(ix, iz) {
-                continue;
-            }
-            let cx = center.x - half_x + (ix as f32 + 0.5) * span;
-            let cz = center.z - half_z + (iz as f32 + 0.5) * span;
-            m.bx(Vec3::new(cx, -0.95, cz), Vec3::new(span * 0.5, 1.0, span * 0.5), ground);
-        }
-    }
+    ground_disc(&mut m, center, layout.radius, layout.seed as i32, ground, -0.05);
 
-    // street grid: the four boundary roads around each built-up cell, so the
-    // road network follows the organic outline (shared edges just overlap).
-    for ix in 0..nx {
-        for iz in 0..nz {
-            if !dev(ix, iz) {
-                continue;
-            }
-            let x0 = center.x - half_x + ix as f32 * span;
-            let x1 = x0 + span;
-            let z0 = center.z - half_z + iz as f32 * span;
-            let z1 = z0 + span;
-            road_seg(&mut m, Vec3::new(x0, 0.0, z0), Vec3::new(x0, 0.0, z1), street * 0.5, false);
-            road_seg(&mut m, Vec3::new(x1, 0.0, z0), Vec3::new(x1, 0.0, z1), street * 0.5, false);
-            road_seg(&mut m, Vec3::new(x0, 0.0, z0), Vec3::new(x1, 0.0, z0), street * 0.5, false);
-            road_seg(&mut m, Vec3::new(x0, 0.0, z1), Vec3::new(x1, 0.0, z1), street * 0.5, false);
-        }
+    // Streets: a flat ribbon along every road segment of the network.
+    let road = [0.27, 0.27, 0.30];
+    for r in &layout.roads {
+        let a = Vec3::new(center.x + r.ax, 0.0, center.z + r.az);
+        let b = Vec3::new(center.x + r.bx, 0.0, center.z + r.bz);
+        road_ribbon(&mut m, a, b, r.width * 0.5, 0.12, road);
     }
 
     // building palette: concrete, tan, glass-blue, light, dark, plus a warm roof.
-    let pal = [
-        [0.58, 0.58, 0.61],
-        [0.63, 0.58, 0.49],
-        [0.42, 0.53, 0.63],
-        [0.70, 0.71, 0.74],
-        [0.50, 0.52, 0.57],
-        [0.66, 0.62, 0.55],
-    ];
+    let pal = worldcity::PALETTE;
     let roof = [0.30, 0.30, 0.33];
     // Emissive window colours (summed > ~3.1 so the shader treats them as lit).
     // The shader boosts emission at night, so these stay subtle by day and glow
@@ -1282,77 +1278,43 @@ pub fn city(center: Vec3, variant: u32) -> Mesh {
     let warm = [1.7, 1.42, 0.85];
     let cool = [0.92, 1.12, 1.7];
 
-    for ix in 0..nx {
-        for iz in 0..nz {
-            let bx0 = center.x - half_x + (ix as f32 + 0.5) * span;
-            let bz0 = center.z - half_z + (iz as f32 + 0.5) * span;
-            // downtown feel: taller toward the centre of the grid.
-            let dx = (ix as f32 - (nx as f32 - 1.0) * 0.5) / (nx as f32 * 0.5);
-            let dz = (iz as f32 - (nz as f32 - 1.0) * 0.5) / (nz as f32 * 0.5);
-            // organic outline: drop edge cells by the shared built-up mask so the
-            // city is not a perfect square (matches worldcity::generate exactly).
-            if !worldcity::cell_developed(seed, nx as u32, nz as u32, ix, iz) {
-                continue;
-            }
-            let central = (1.0 - (dx * dx + dz * dz).sqrt()).clamp(0.0, 1.0);
-            // 1..4 buildings per block, laid in a 2x2 sub-grid.
-            let count = 1 + (h(ix, iz) * 3.99) as i32;
-            for k in 0..count {
-                let sx = if k % 2 == 0 { -1.0 } else { 1.0 };
-                let sz = if k < 2 { -1.0 } else { 1.0 };
-                let h1 = h(ix * 31 + k, iz * 17 + 7);
-                let h2 = h(ix * 13 + 5, iz * 29 + k);
-                let fw = block * 0.21 * (0.7 + 0.3 * h1);
-                let fd = block * 0.21 * (0.7 + 0.3 * h2);
-                // height: low at the rim (8 m) climbing to ~70 m downtown.
-                let height = 8.0 + central * (16.0 + 60.0 * h1) + (1.0 - central) * 10.0 * h2;
-                let col = pal[((h(ix + k, iz) * pal.len() as f32) as usize).min(pal.len() - 1)];
-                let cx = bx0 + sx * block * 0.25;
-                let cz = bz0 + sz * block * 0.25;
-                m.bx(Vec3::new(cx, height * 0.5, cz), Vec3::new(fw, height * 0.5, fd), col);
-                // a flat roof cap + a small rooftop unit, for silhouette interest.
-                m.bx(Vec3::new(cx, height + 0.5, cz), Vec3::new(fw * 0.96, 0.5, fd * 0.96), roof);
-                if h2 > 0.5 {
-                    m.bx(Vec3::new(cx + fw * 0.3, height + 1.6, cz - fd * 0.3), Vec3::new(fw * 0.25, 1.1, fd * 0.25), roof);
-                }
+    for b in &layout.buildings {
+        let cx = center.x + b.cx;
+        let cz = center.z + b.cz;
+        let (fw, fd, height) = (b.fw, b.fd, b.height);
+        let col = pal[(b.pal as usize).min(pal.len() - 1)];
+        m.bx(Vec3::new(cx, height * 0.5, cz), Vec3::new(fw, height * 0.5, fd), col);
+        // a flat roof cap + a small rooftop unit, for silhouette interest.
+        m.bx(Vec3::new(cx, height + 0.5, cz), Vec3::new(fw * 0.96, 0.5, fd * 0.96), roof);
+        if b.warm != 0 {
+            m.bx(Vec3::new(cx + fw * 0.3, height + 1.6, cz - fd * 0.3), Vec3::new(fw * 0.25, 1.1, fd * 0.25), roof);
+        }
 
-                // Lit windows: thin emissive bands up the four faces of most (not
-                // all) buildings, so the city glows like an occupied skyline at
-                // night. Gated and capped to keep the vertex count down.
-                if h(ix * 3 + k, iz * 9 + 1) > 0.32 {
-                    let win = if h(ix * 7 + k, iz * 5 + 3) > 0.5 { warm } else { cool };
-                    let bands = ((height / 7.0) as i32).clamp(1, 6);
-                    for bnd in 0..bands {
-                        if h(ix * 53 + k * 7 + bnd, iz * 37 + bnd * 3) < 0.45 {
-                            continue;
-                        }
-                        let wy = 3.0 + bnd as f32 * 7.0;
-                        if wy > height - 1.5 {
-                            break;
-                        }
-                        m.bx(Vec3::new(cx + fw, wy, cz), Vec3::new(0.06, 0.9, fd * 0.82), win);
-                        m.bx(Vec3::new(cx - fw, wy, cz), Vec3::new(0.06, 0.9, fd * 0.82), win);
-                        m.bx(Vec3::new(cx, wy, cz + fd), Vec3::new(fw * 0.82, 0.9, 0.06), win);
-                        m.bx(Vec3::new(cx, wy, cz - fd), Vec3::new(fw * 0.82, 0.9, 0.06), win);
-                    }
+        // Lit windows: thin emissive bands up the four faces of lit buildings, so
+        // the city glows like an occupied skyline at night. Capped to keep the
+        // vertex count down.
+        if b.lit != 0 {
+            let win = if b.warm != 0 { warm } else { cool };
+            let bands = ((height / 7.0) as i32).clamp(1, 6);
+            for bnd in 0..bands {
+                let wy = 3.0 + bnd as f32 * 7.0;
+                if wy > height - 1.5 {
+                    break;
                 }
+                m.bx(Vec3::new(cx + fw, wy, cz), Vec3::new(0.06, 0.9, fd * 0.82), win);
+                m.bx(Vec3::new(cx - fw, wy, cz), Vec3::new(0.06, 0.9, fd * 0.82), win);
+                m.bx(Vec3::new(cx, wy, cz + fd), Vec3::new(fw * 0.82, 0.9, 0.06), win);
+                m.bx(Vec3::new(cx, wy, cz - fd), Vec3::new(fw * 0.82, 0.9, 0.06), win);
             }
         }
     }
 
-    // Warm sodium street lighting baked onto the roads so the WHOLE street glows
-    // amber at night (brightest under the lamps), like a real lit street rather
-    // than isolated pools. A continuous amber wash runs the length of every
-    // street; brighter pools, poles and emissive heads sit at the intersections.
-    // All of this glows via the night-boosted emissive term and stays subtle by
-    // day; the lamps also drive realtime point lights for moving NPCs.
-    // Streetlight poles + emissive heads (these read fine by day; the warm ground
-    // wash and pools that actually light the streets at night live in the
-    // separate `city_night_glow` mesh, drawn only at night - their bright amber
-    // albedo would otherwise tint the streets tan in daylight).
+    // Streetlight poles + emissive heads at the intersections (these read fine by
+    // day; the warm ground wash that actually lights the streets at night lives
+    // in the separate `city_night_glow` mesh, drawn only at night).
     let pole = [0.20, 0.20, 0.23];
     let head = [2.0, 1.5, 0.85]; // emissive warm sodium head
-    for lp in city_lamps(center) {
+    for lp in city_lamps(layout, center) {
         m.bx(Vec3::new(lp.x, 2.5, lp.z), Vec3::new(0.16, 2.5, 0.16), pole);
         m.bx(Vec3::new(lp.x, lp.y, lp.z), Vec3::new(0.5, 0.28, 0.5), head);
     }
@@ -1367,10 +1329,10 @@ pub fn city(center: Vec3, variant: u32) -> Mesh {
 /// by day; the renderer draws it only at night, where the night-boosted emissive
 /// term makes it glow. Lifted clear of the paved ground so the logarithmic depth
 /// resolves against the cell-tessellated ground.
-pub fn city_night_glow(center: Vec3) -> Mesh {
+pub fn city_night_glow(layout: &worldcity::CityLayout, center: Vec3) -> Mesh {
     let mut m = Mesh::default();
-    let lamps = city_lamps(center);
-    let half = 7.0 * 60.0 * 0.5; // city half-extent (210 m)
+    let lamps = city_lamps(layout, center);
+    let half = layout.radius; // city half-extent
     let margin = 30.0f32; // spill a little onto the surrounding land
     let lo_x = center.x - half - margin;
     let lo_z = center.z - half - margin;
@@ -1426,27 +1388,16 @@ pub fn city_night_glow(center: Vec3) -> Mesh {
 /// Tessellated per cell so the logarithmic depth resolves at distance.
 pub fn city_footprint(layout: &worldcity::CityLayout, center: Vec3) -> Mesh {
     let mut m = Mesh::default();
-    let span = layout.span();
-    let hx = layout.half_x();
-    let hz = layout.half_z();
-    let road = [0.20, 0.205, 0.225]; // asphalt grid
-    let concrete = [0.40, 0.40, 0.42]; // block pads between the streets
-    let block_half = (span - layout.street) * 0.5; // = block * 0.5
-    let seed = layout.seed as i32;
-    for ix in 0..layout.cols as i32 {
-        for iz in 0..layout.rows as i32 {
-            // only built-up cells, so the footprint outline matches the organic
-            // (non-square) building layout.
-            if !worldcity::cell_developed(seed, layout.cols, layout.rows, ix, iz) {
-                continue;
-            }
-            let cx = center.x - hx + (ix as f32 + 0.5) * span;
-            let cz = center.z - hz + (iz as f32 + 0.5) * span;
-            // full-cell road base, then an inset concrete pad - the inset gap is
-            // the street, so the grid of roads reads from far.
-            m.bx(Vec3::new(cx, 0.05, cz), Vec3::new(span * 0.5, 0.04, span * 0.5), road);
-            m.bx(Vec3::new(cx, 0.09, cz), Vec3::new(block_half, 0.04, block_half), concrete);
-        }
+    let road = [0.20, 0.205, 0.225]; // asphalt
+    let concrete = [0.40, 0.40, 0.42]; // paved blocks under the buildings
+    // Concrete pad (organic disc) for the whole built-up area, then the road
+    // ribbons over it - so from far the city reads as paved blocks cut by a
+    // curving street network, matching the near massing.
+    ground_disc(&mut m, center, layout.radius, layout.seed as i32, concrete, 0.05);
+    for r in &layout.roads {
+        let a = Vec3::new(center.x + r.ax, 0.0, center.z + r.az);
+        let b = Vec3::new(center.x + r.bx, 0.0, center.z + r.bz);
+        road_ribbon(&mut m, a, b, r.width * 0.5, 0.09, road);
     }
     // Building footprints: lit ones use an emissive warm/cool tile so the city
     // also glows from far at night (the same `lit` data drives the near windows),

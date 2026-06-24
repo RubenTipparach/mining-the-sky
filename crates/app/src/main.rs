@@ -886,8 +886,8 @@ impl World {
             // crawls the rocket along it.
             road_mesh: rocket::crawlerway(HANGAR_POS.x, 12.0, 14.0),
             platform_mesh: rocket::crawler_platform(),
-            city_meshes: all_cities().iter().map(|&(c, v)| (c, rocket::city(c, v))).collect(),
-            city_glow: all_cities().iter().map(|&(c, _)| (c, rocket::city_night_glow(c))).collect(),
+            city_meshes: city_layouts.iter().map(|(c, l)| (*c, rocket::city(l, *c))).collect(),
+            city_glow: city_layouts.iter().map(|(c, l)| (*c, rocket::city_night_glow(l, *c))).collect(),
             city_footprints: city_layouts
                 .iter()
                 .map(|(c, l)| (*c, rocket::city_footprint(l, *c)))
@@ -1342,21 +1342,22 @@ impl World {
         let mut nlights = 0usize;
 
         let focus = self.cam_target_local();
-        let mut city_night: Option<Vec3> = None;
+        let mut city_night: Option<&(Vec3, worldcity::CityLayout)> = None;
         if self.night {
             let mut best = 700.0f64 * 700.0;
-            for (c, _) in all_cities() {
+            for pair in &self.city_layouts {
+                let c = pair.0;
                 let d = (c.x as f64 - focus.x).powi(2) + (c.z as f64 - focus.z).powi(2);
                 if d < best {
                     best = d;
-                    city_night = Some(c);
+                    city_night = Some(pair);
                 }
             }
         }
 
-        if let Some(c) = city_night {
+        if let Some((c, layout)) = city_night {
             // warm sodium streetlights: the nearest lamps to the camera focus.
-            let mut lamps = rocket::city_lamps(c);
+            let mut lamps = rocket::city_lamps(layout, *c);
             lamps.sort_by(|a, b| {
                 let da = (a.x as f64 - focus.x).powi(2) + (a.z as f64 - focus.z).powi(2);
                 let db = (b.x as f64 - focus.x).powi(2) + (b.z as f64 - focus.z).powi(2);
@@ -5521,17 +5522,16 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.view = View::Rocket;
             world.night = true;
             world.enter_drive();
-            // sit the car at a street intersection (a lamp + pool right there) on
-            // a north-south avenue, facing north up the street.
-            let lane_x = (CITY_CENTER.x - 210.0 + 3.0 * 60.0) as f64;
-            world.car_pos = DVec3::new(lane_x, 0.0, (CITY_CENTER.z - 210.0 + 2.0 * 60.0) as f64);
-            world.car_yaw = std::f32::consts::FRAC_PI_2;
+            // sit the car just south of downtown facing north into the lit city,
+            // so the camera trails it with the glowing skyline ahead.
+            world.car_pos = (CITY_CENTER + Vec3::new(0.0, 0.0, -250.0)).as_dvec3();
+            world.car_yaw = std::f32::consts::FRAC_PI_2; // face +Z (toward the city)
             for _ in 0..45 {
                 world.advance(0.1);
             }
             world.car_yaw = std::f32::consts::FRAC_PI_2;
             world.rocket_az = world.car_yaw + std::f32::consts::PI;
-            world.rocket_el = 0.13;
+            world.rocket_el = 0.16;
             world.rocket_dist = 26.0;
             0.0
         }
