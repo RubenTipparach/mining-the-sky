@@ -164,116 +164,127 @@ pub const PALETTE: [[f32; 3]; 6] = [
 ];
 
 /// Deterministically generate a city's layout from its descriptor. Bigger
-/// populations get more rings (a larger city); everything else is hashed from
-/// `desc.seed`, so the same descriptor always yields exactly the same city (the
-/// property the cache relies on).
+/// populations get a larger grid; everything else is hashed from `desc.seed`, so
+/// the same descriptor always yields exactly the same city (the property the
+/// cache relies on).
 ///
-/// The plan is radial-concentric: `spokes` avenues radiate from the centre,
-/// crossed by `rings` concentric ring roads. Every ring node is pushed off its
-/// ideal circle by hashed jitter (the rings buckle, the avenues wander), so the
-/// streets curve and the blocks between them are irregular wedges - an organic
-/// town, not a grid. Outer blocks are dropped by a noisy mask for a ragged edge.
+/// The plan is an *irregular grid*: orthogonal streets like a real city grid,
+/// but with non-uniform block sizes (so the roads are different lengths), a mild
+/// per-node warp (so the streets wobble instead of being mechanically straight),
+/// and a ragged round-ish outline (so the city is not a filled square). That
+/// reads as an organic town while keeping the legible grid structure, rather
+/// than the random-looking radial plan it replaces.
 pub fn generate(desc: &CityDesc) -> CityLayout {
     let seed = desc.seed as i32;
     let h = |a: i32, b: i32| hash01(a.wrapping_add(seed), b.wrapping_sub(seed));
     let jit = |a: i32, b: i32| h(a, b) * 2.0 - 1.0; // [-1, 1]
 
     let pm = (desc.pop / 1.0e6).max(0.1);
-    // 3..7 rings out from the centre, 7..11 radiating avenues.
-    let rings = (3.0 + 1.7 * pm.sqrt()).clamp(3.0, 7.0) as i32;
-    let spokes = (7.0 + (4.0 * h(11, 23)).floor()).clamp(7.0, 11.0) as i32;
-    let ring0 = 36.0f32; // radius of the innermost ring (a central plaza)
-    let ring_gap = 30.0f32; // nominal radial spacing between rings
+    // 5..10 blocks a side, scaling with sqrt(population).
+    let cols = (5.0 + 1.8 * pm.sqrt()).clamp(5.0, 10.0) as i32;
+    let rows = (5.0 + 1.8 * pm.sqrt()).clamp(5.0, 10.0) as i32;
     let street = 13.0f32;
+    let base = 42.0f32; // nominal block size
 
-    // node[k][s]: the intersection of ring k and avenue s, jittered off its
-    // ideal circle so the network buckles organically. s wraps modulo `spokes`.
-    let node = |k: i32, s: i32| -> Vec2 {
-        let sm = ((s % spokes) + spokes) % spokes;
-        let ang = (sm as f32 / spokes as f32) * std::f32::consts::TAU
-            + 0.20 * jit(sm * 13 + 7, 31) // each avenue leans a fixed amount
-            + 0.17 * jit(k * 17 + 3, sm * 5 + 9); // and wanders ring to ring
-        // each ring buckles in and out so it is never a clean circle/polygon
-        let rad = ring0
-            + k as f32 * ring_gap * (0.82 + 0.30 * h(sm * 11 + 5, 17))
-            + ring_gap * 0.55 * jit(k * 23 + 1, sm * 7 + 2);
-        Vec2::new(ang.cos() * rad, ang.sin() * rad)
+    // Non-uniform grid-line positions: each block's width/depth is hashed, so
+    // adjacent streets sit at varying distances and the road segments between
+    // intersections come out different lengths - the organic part of the grid.
+    let mut xs = vec![0.0f32; (cols + 1) as usize];
+    for i in 1..=cols as usize {
+        let w = base * (0.55 + 0.9 * h(i as i32 * 7 + 3, 11));
+        xs[i] = xs[i - 1] + w + street;
+    }
+    let mut zs = vec![0.0f32; (rows + 1) as usize];
+    for j in 1..=rows as usize {
+        let d = base * (0.55 + 0.9 * h(j as i32 * 7 + 5, 23));
+        zs[j] = zs[j - 1] + d + street;
+    }
+    let cx = xs[cols as usize] * 0.5; // centre the grid on the origin
+    let cz = zs[rows as usize] * 0.5;
+
+    // Grid node, with a small hashed warp so the streets are not mechanically
+    // perfect (kept well under a block so they stay clearly orthogonal).
+    let warp = base * 0.10;
+    let node = |i: i32, j: i32| -> Vec2 {
+        let (ic, jc) = (i.clamp(0, cols) as usize, j.clamp(0, rows) as usize);
+        Vec2::new(
+            xs[ic] - cx + warp * jit(i * 13 + 1, j * 7 + 2),
+            zs[jc] - cz + warp * jit(i * 5 + 9, j * 17 + 4),
+        )
     };
 
-    // A block sits between rings k..k+1 and avenues s..s+1. Drop outer blocks by
-    // a noisy mask so the built-up area frays out instead of ending on a clean
-    // circle. The centre is always developed.
-    let developed = |k: i32, s: i32| -> bool {
-        if k < 0 || k >= rings {
+    let (nc, nr) = (cols as f32, rows as f32);
+    // Whether block (i, j) is built up: a ragged round-ish mask drops the corners
+    // and frays the edge, so the city is an organic blob, not a filled square.
+    let developed = |i: i32, j: i32| -> bool {
+        if i < 0 || i >= cols || j < 0 || j >= rows {
             return false;
         }
-        let edge = k as f32 / rings as f32; // 0 centre .. ~1 rim
-        h(k * 9 + s * 3 + 5, k * 5 + s * 7 + 1) > edge * 0.85 - 0.12
+        let dx = (i as f32 + 0.5 - nc * 0.5) / (nc * 0.5);
+        let dz = (j as f32 + 0.5 - nr * 0.5) / (nr * 0.5);
+        (dx * dx + dz * dz).sqrt() <= 0.94 + 0.46 * h(i * 7 + 91, j * 7 + 43)
     };
 
+    // Roads: the four boundary edges of every developed block, so the street grid
+    // follows the ragged outline (shared interior edges simply overlap).
     let mut roads: Vec<RoadSeg> = Vec::new();
     let mut push = |a: Vec2, b: Vec2, w: f32| {
         roads.push(RoadSeg { ax: a.x, az: a.y, bx: b.x, bz: b.y, width: w, _pad: 0.0 });
     };
-    // Ring roads (the arcs) and radial avenues, kept only where they border a
-    // developed block, so the network follows the ragged outline.
-    for k in 0..=rings {
-        for s in 0..spokes {
-            // ring arc between avenue s and s+1, on ring k
-            if developed(k, s) || developed(k - 1, s) {
-                push(node(k, s), node(k, s + 1), street);
+    for i in 0..cols {
+        for j in 0..rows {
+            if !developed(i, j) {
+                continue;
             }
-            // radial avenue between ring k and k+1, on avenue s
-            if k < rings && (developed(k, s) || developed(k, s - 1)) {
-                // avenues are a touch wider than the ring streets
-                push(node(k, s), node(k + 1, s), street * 1.15);
-            }
+            let (p00, p10) = (node(i, j), node(i + 1, j));
+            let (p01, p11) = (node(i, j + 1), node(i + 1, j + 1));
+            push(p00, p10, street); // south edge
+            push(p01, p11, street); // north edge
+            push(p00, p01, street); // west edge
+            push(p10, p11, street); // east edge
         }
     }
 
-    // Buildings: fill each developed block with a few footprints, placed by
-    // bilinear interpolation of the block's four (warped) corners so they sit
-    // inside the wedge. Taller toward the centre for a downtown massing.
+    // Buildings: fill each developed block, taller toward the centre. Sub-divided
+    // into up to 2x2 footprints, placed by bilinear interpolation of the block's
+    // four (warped) corners so they sit inside the block.
     let mut buildings = Vec::new();
-    for k in 0..rings {
-        for s in 0..spokes {
-            if !developed(k, s) {
+    for i in 0..cols {
+        for j in 0..rows {
+            if !developed(i, j) {
                 continue;
             }
-            let p00 = node(k, s);
-            let p01 = node(k, s + 1);
-            let p10 = node(k + 1, s);
-            let p11 = node(k + 1, s + 1);
+            let (p00, p10) = (node(i, j), node(i + 1, j));
+            let (p01, p11) = (node(i, j + 1), node(i + 1, j + 1));
             let bil = |u: f32, v: f32| -> Vec2 {
-                let top = p00.lerp(p01, u);
-                let bot = p10.lerp(p11, u);
-                top.lerp(bot, v)
+                let lo = p00.lerp(p10, u);
+                let hi = p01.lerp(p11, u);
+                lo.lerp(hi, v)
             };
-            // block scale, to size + count the buildings that fit
-            let du = (p01 - p00).length().min((p11 - p10).length());
-            let dv = (p10 - p00).length().min((p11 - p01).length());
-            let central = (1.0 - k as f32 / rings as f32).clamp(0.0, 1.0);
-            // up to 2x2 buildings, fewer out at the rim
-            let nu = if du > 46.0 { 2 } else { 1 };
-            let nv = if dv > 46.0 { 2 } else { 1 };
+            let bw = (p10 - p00).length(); // block width (x)
+            let bd = (p01 - p00).length(); // block depth (z)
+            let dx = (i as f32 + 0.5 - nc * 0.5) / (nc * 0.5);
+            let dz = (j as f32 + 0.5 - nr * 0.5) / (nr * 0.5);
+            let central = (1.0 - (dx * dx + dz * dz).sqrt()).clamp(0.0, 1.0);
+            let nu = if bw > 40.0 { 2 } else { 1 };
+            let nv = if bd > 40.0 { 2 } else { 1 };
             for iu in 0..nu {
                 for iv in 0..nv {
-                    let hk = h(k * 41 + s * 7 + iu * 3 + 1, s * 29 + k * 11 + iv * 5 + 2);
-                    if hk < 0.18 {
+                    if h(i * 41 + iu * 3 + 1, j * 29 + iv * 5 + 2) < 0.12 {
                         continue; // a few empty lots
                     }
-                    let u = (iu as f32 + 0.5) / nu as f32 + 0.12 * jit(k * 7 + iu, s * 9 + iv);
-                    let v = (iv as f32 + 0.5) / nv as f32 + 0.12 * jit(s * 7 + iv, k * 9 + iu);
-                    let c = bil(u.clamp(0.18, 0.82), v.clamp(0.18, 0.82));
-                    let h1 = h(k * 31 + iu, s * 17 + iv + 7);
-                    let h2 = h(k * 13 + 5, s * 29 + iu + iv);
-                    let fw = (du / nu as f32) * 0.30 * (0.7 + 0.3 * h1);
-                    let fd = (dv / nv as f32) * 0.30 * (0.7 + 0.3 * h2);
+                    let u = (iu as f32 + 0.5) / nu as f32;
+                    let v = (iv as f32 + 0.5) / nv as f32;
+                    let c = bil(u, v);
+                    let h1 = h(i * 31 + iu, j * 17 + iv + 7);
+                    let h2 = h(i * 13 + 5, j * 29 + iu + iv);
+                    let fw = (bw / nu as f32) * 0.34 * (0.7 + 0.3 * h1);
+                    let fd = (bd / nv as f32) * 0.34 * (0.7 + 0.3 * h2);
                     let height = 8.0 + central * (16.0 + 60.0 * h1) + (1.0 - central) * 10.0 * h2;
                     let pal =
-                        ((h(k + iu, s + iv) * PALETTE.len() as f32) as u32).min(PALETTE.len() as u32 - 1);
-                    let lit = (h(k * 3 + iu, s * 9 + iv + 1) > 0.32) as u32;
-                    let warm = (h(k * 7 + iu, s * 5 + iv + 3) > 0.5) as u32;
+                        ((h(i + iu, j + iv) * PALETTE.len() as f32) as u32).min(PALETTE.len() as u32 - 1);
+                    let lit = (h(i * 3 + iu, j * 9 + iv + 1) > 0.32) as u32;
+                    let warm = (h(i * 7 + iu, j * 5 + iv + 3) > 0.5) as u32;
                     buildings.push(Building {
                         cx: c.x,
                         cz: c.y,
@@ -289,7 +300,7 @@ pub fn generate(desc: &CityDesc) -> CityLayout {
         }
     }
 
-    let radius = ring0 + rings as f32 * ring_gap * 1.45 + 20.0;
+    let radius = cx.hypot(cz) + street; // disc covers the whole grid, corners too
     CityLayout { seed: desc.seed, radius, roads, buildings }
 }
 
@@ -307,7 +318,7 @@ struct LayoutHeader {
 }
 
 const LAYOUT_MAGIC: u32 = 0x4C54_4943; // "CITL"
-const LAYOUT_VERSION: u32 = 4;
+const LAYOUT_VERSION: u32 = 5;
 
 /// Serialise a layout to bytes (header + roads + buildings).
 pub fn layout_to_bytes(l: &CityLayout) -> Vec<u8> {
