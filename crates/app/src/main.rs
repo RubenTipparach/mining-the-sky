@@ -253,16 +253,19 @@ fn all_cities() -> Vec<(Vec3, u32)> {
 /// inter-metro highways wiring the cluster centres into a loop, and avenues
 /// linking neighbouring downtowns inside each metro. Each entry is (a, b, mesh)
 /// so the renderer can distance-cull a link the player is nowhere near.
-fn build_city_roads() -> Vec<(Vec3, Vec3, rocket::Mesh)> {
+/// The inter-city road network as topology only: (a, b, half-width, curbs). The
+/// terrain-following ribbon meshes are built from this once the world frame and
+/// terrain are known (see `World::build_roads`).
+fn city_road_segments() -> Vec<(Vec3, Vec3, f32, bool)> {
     let pad = Vec3::new(40.0, 0.0, 0.0);
     let mut roads = Vec::new();
     // access road from the launch complex to the main metro (with curbs).
-    roads.push((pad, CITY_CENTER, rocket::road_l(pad, CITY_CENTER, 10.0, true)));
+    roads.push((pad, CITY_CENTER, 10.0, true));
     // inter-metro highways: link the cluster centres into a loop.
     let n = CLUSTERS.len();
     for i in 0..n {
         let (a, b) = (CLUSTERS[i].0, CLUSTERS[(i + 1) % n].0);
-        roads.push((a, b, rocket::road_l(a, b, 9.0, false)));
+        roads.push((a, b, 9.0, false));
     }
     // avenues between neighbouring (axis-adjacent) downtowns within each metro.
     let max = (CITY_SPACING * 1.3) as f64;
@@ -271,7 +274,7 @@ fn build_city_roads() -> Vec<(Vec3, Vec3, rocket::Mesh)> {
         for i in 0..cs.len() {
             for j in (i + 1)..cs.len() {
                 if (cs[i].0 - cs[j].0).length() as f64 <= max {
-                    roads.push((cs[i].0, cs[j].0, rocket::road_l(cs[i].0, cs[j].0, 9.0, false)));
+                    roads.push((cs[i].0, cs[j].0, 9.0, false));
                 }
             }
         }
@@ -893,7 +896,7 @@ impl World {
                 .map(|(c, l)| (*c, rocket::city_footprint(l, *c)))
                 .collect(),
             city_layouts,
-            roads: build_city_roads(),
+            roads: Vec::new(), // built below, once the terrain frame is in place
             car_mesh: rocket::car([0.80, 0.18, 0.16]),
             lander_mesh: rocket::lander(),
             show_lander: false,
@@ -991,7 +994,25 @@ impl World {
         w.focus = w.universe.home_index();
         w.focus_rocket = true;
         w.apply_focus();
+        // Build the inter-city roads now that the terrain frame is in place, so
+        // each ribbon drapes over the actual ground instead of a flat plane.
+        w.roads = w.build_roads();
         w
+    }
+
+    /// Build the inter-city road meshes, each a terrain-following ribbon over the
+    /// real ground height (so they hug hills instead of floating / sinking).
+    fn build_roads(&self) -> Vec<(Vec3, Vec3, rocket::Mesh)> {
+        let ground = |x: f32, z: f32| self.local_ground_height(x as f64, z as f64) as f32;
+        city_road_segments()
+            .into_iter()
+            .map(|(a, b, half_w, curbs)| {
+                // L-shaped path (along X then Z), as the old flat roads ran.
+                let corner = Vec3::new(b.x, 0.0, a.z);
+                let mesh = rocket::road_strip(&[a, corner, b], half_w, curbs, &ground);
+                (a, b, mesh)
+            })
+            .collect()
     }
 
     /// Spin up the dedicated physics thread and route the player launch through
@@ -2599,8 +2620,11 @@ impl World {
             }
         }
 
-        // Buildings: ray vs each nearby building box (footprint + height).
-        for (center, layout) in &self.city_layouts {
+        // Buildings: ray vs each nearby building box (footprint + height). Only
+        // at gameplay follow distances (driving / on foot) - a far overview or
+        // fly-over camera should sail over the rooftops, not snap to a tower.
+        let test_buildings = (self.driving || self.walking) && max_dist < 90.0;
+        for (center, layout) in self.city_layouts.iter().filter(|_| test_buildings) {
             let cdx = center.x as f64 - tgt.x;
             let cdz = center.z as f64 - tgt.z;
             let reach = max_dist + 320.0;

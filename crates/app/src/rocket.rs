@@ -1141,54 +1141,6 @@ fn hash01(i: i32, j: i32) -> f32 {
 
 /// A flat, axis-aligned road slab (thin box, just proud of the ground) running
 /// between two ground points that share an X or a Z. Curbs optional.
-fn road_seg(m: &mut Mesh, a: Vec3, b: Vec3, half_w: f32, curbs: bool) {
-    let road = [0.27, 0.27, 0.30];
-    let curb = [0.40, 0.40, 0.36]; // light shoulder/centre tone
-    let cx = (a.x + b.x) * 0.5;
-    let cz = (a.z + b.z) * 0.5;
-    let along_x = (b.x - a.x).abs() >= (b.z - a.z).abs();
-    let (hx, hz) = if along_x {
-        ((b.x - a.x).abs() * 0.5 + half_w, half_w)
-    } else {
-        (half_w, (b.z - a.z).abs() * 0.5 + half_w)
-    };
-    // tile long segments so a single huge quad doesn't mis-rasterise on terrain
-    let len = if along_x { hx * 2.0 } else { hz * 2.0 };
-    let segs = (len / 40.0).ceil().max(1.0) as i32;
-    for s in 0..segs {
-        let t = (s as f32 + 0.5) / segs as f32 - 0.5;
-        let (sx, sz, shx, shz) = if along_x {
-            (cx + t * hx * 2.0, cz, hx / segs as f32, hz)
-        } else {
-            (cx, cz + t * hz * 2.0, hx, hz / segs as f32)
-        };
-        m.bx(Vec3::new(sx, 0.13, sz), Vec3::new(shx, 0.13, shz), road);
-    }
-    if curbs {
-        // dashed-looking light shoulders along both edges
-        if along_x {
-            for sz in [-1.0f32, 1.0] {
-                m.bx(Vec3::new(cx, 0.20, cz + sz * (hz - 0.4)), Vec3::new(hx, 0.20, 0.5), curb);
-            }
-        } else {
-            for sx in [-1.0f32, 1.0] {
-                m.bx(Vec3::new(cx + sx * (hx - 0.4), 0.20, cz), Vec3::new(0.5, 0.20, hz), curb);
-            }
-        }
-    }
-}
-
-/// An L-shaped road from `a` to `b` (along X first, then Z), so a road visibly
-/// runs between two points. `curbs` adds light shoulders (kept off for the long
-/// inter-city links to keep their vertex count down).
-pub fn road_l(a: Vec3, b: Vec3, half_w: f32, curbs: bool) -> Mesh {
-    let mut m = Mesh::default();
-    let corner = Vec3::new(b.x, 0.0, a.z);
-    road_seg(&mut m, Vec3::new(a.x, 0.0, a.z), corner, half_w, curbs);
-    road_seg(&mut m, corner, Vec3::new(b.x, 0.0, b.z), half_w, curbs);
-    m
-}
-
 /// A flat road ribbon between two arbitrary points (any angle), as a quad lying
 /// on the ground at height `y`. Used for the organic city streets, whose
 /// segments are not axis-aligned. The quad is extended a little past each end so
@@ -1213,6 +1165,61 @@ fn road_ribbon(m: &mut Mesh, a: Vec3, b: Vec3, half_w: f32, y: f32, color: [f32;
     let up = Vec3::Y;
     m.tri3([p0, p1, p2], [up, up, up], [color, color, color]);
     m.tri3([p0, p2, p3], [up, up, up], [color, color, color]);
+}
+
+/// A road that follows the terrain: a ribbon along the polyline `pts`, each leg
+/// subdivided and every vertex's height sampled from `ground`, so the strip
+/// drapes over hills instead of floating above or cutting through the curved
+/// terrain (which the old flat-slab roads did). Width is `2 * half_w`; `curbs`
+/// adds light shoulders along both edges. Used for the inter-city roads.
+pub fn road_strip(pts: &[Vec3], half_w: f32, curbs: bool, ground: &dyn Fn(f32, f32) -> f32) -> Mesh {
+    let mut m = Mesh::default();
+    let road = [0.27, 0.27, 0.30];
+    let curb = [0.40, 0.40, 0.36];
+    let up = Vec3::Y;
+    let lift = 0.12; // sit just proud of the ground it samples
+    // height-sampled point `off` metres to the side of cross-section centre `c`
+    let sample = |c: Vec3, perp: Vec3, off: f32, extra: f32| -> Vec3 {
+        let p = c + perp * off;
+        Vec3::new(p.x, ground(p.x, p.z) + lift + extra, p.z)
+    };
+    for w in pts.windows(2) {
+        let a = Vec3::new(w[0].x, 0.0, w[0].z);
+        let b = Vec3::new(w[1].x, 0.0, w[1].z);
+        let seg = b - a;
+        let len = seg.length();
+        if len < 1e-3 {
+            continue;
+        }
+        let dir = seg / len;
+        let perp = Vec3::new(-dir.z, 0.0, dir.x);
+        // overrun each end by half a width so the legs knit at the corners
+        let a = a - dir * half_w;
+        let total = len + half_w * 2.0;
+        let steps = (total / 18.0).ceil().max(1.0) as i32; // drape resolution
+        for s in 0..steps {
+            let c0 = a + dir * (total * s as f32 / steps as f32);
+            let c1 = a + dir * (total * (s + 1) as f32 / steps as f32);
+            let l0 = sample(c0, perp, -half_w, 0.0);
+            let r0 = sample(c0, perp, half_w, 0.0);
+            let l1 = sample(c1, perp, -half_w, 0.0);
+            let r1 = sample(c1, perp, half_w, 0.0);
+            m.tri3([l0, r0, r1], [up, up, up], [road, road, road]);
+            m.tri3([l0, r1, l1], [up, up, up], [road, road, road]);
+            if curbs {
+                for sgn in [-1.0f32, 1.0] {
+                    let e = half_w - 0.35;
+                    let a0 = sample(c0, perp, sgn * e, 0.08);
+                    let b0 = sample(c0, perp, sgn * (e + 0.6), 0.08);
+                    let a1 = sample(c1, perp, sgn * e, 0.08);
+                    let b1 = sample(c1, perp, sgn * (e + 0.6), 0.08);
+                    m.tri3([a0, b0, b1], [up, up, up], [curb, curb, curb]);
+                    m.tri3([a0, b1, a1], [up, up, up], [curb, curb, curb]);
+                }
+            }
+        }
+    }
+    m
 }
 
 /// A filled ground disc (triangle fan) with a hashed-ragged rim, so a city's
