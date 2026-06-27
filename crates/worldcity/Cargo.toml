@@ -1,0 +1,15 @@
+[package]
+name = "worldcity"
+version = "0.1.0"
+edition = "2021"
+
+# Unified procedural city system: one deterministic generator drives every LOD
+# (near buildings, far block/road footprints, orbital light emission), plus a
+# disk cache and a spatial index so a world address (lon/lat) maps to the city
+# resources to load. Intentionally light (glam + bytemuck only) so it compiles to
+# wasm; the on-disk cache is native-only.
+[lib]
+
+[dependencies]
+glam = "0.30"
+bytemuck = { version = "1", features = ["derive"] }

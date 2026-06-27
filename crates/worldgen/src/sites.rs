@@ -90,7 +90,7 @@ pub fn place_sites(
     // --- Major cities: best-flow coastal deltas, spaced apart. ---
     let mut cand = delta_candidates(elev, hydro, sea_level);
     cand.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    let major_sep = 0.26; // radians of great-circle separation
+    let major_sep = 0.18; // radians of great-circle separation
     let mut majors: Vec<City> = Vec::new();
     for (i, _) in &cand {
         if majors.len() >= n_major {
@@ -111,11 +111,11 @@ pub fn place_sites(
 
     // --- Minor cities: inland river corridors, spaced apart. ---
     let mut river: Vec<(usize, f32)> = (0..w * h)
-        .filter(|&i| hydro.is_ocean.data[i] == 0 && hydro.flow.data[i] > 3.5)
+        .filter(|&i| hydro.is_ocean.data[i] == 0 && hydro.flow.data[i] > 2.0)
         .map(|i| (i, hydro.flow.data[i]))
         .collect();
     river.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    let minor_sep = 0.14;
+    let minor_sep = 0.085;
     let mut minors: Vec<City> = Vec::new();
     for (i, _) in &river {
         if minors.len() >= n_minor {

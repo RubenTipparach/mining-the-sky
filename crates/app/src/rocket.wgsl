@@ -177,20 +177,39 @@ fn fs(in: VsOut) -> FsOut {
     }
 
     let diff = max(dot(n, s), 0.0) * ao;
+    let sun_vis = step(0.0001, dot(n, s)); // 1 on the sun-facing hemisphere
     // Airless (lunar) bodies have no sky-fill: ambient is near-black so the only
     // light is the direct sun, giving stark crater shadows. On worlds with air,
-    // use the bluish hemispheric sky/ground ambient.
+    // use a richer bluish hemispheric sky/ground ambient.
     let airless = u.sun.w;
-    let amb_air = mix(vec3<f32>(0.18, 0.16, 0.14), vec3<f32>(0.40, 0.45, 0.55), clamp(n.y * 0.5 + 0.5, 0.0, 1.0));
+    // Day/night from the sun's elevation (local-up component). At night the
+    // bluish sky-fill collapses to faint cool moonlight and the direct sun fades
+    // out, so only emissive city lights and the moon carry the scene.
+    let day = smoothstep(-0.18, 0.06, u.sun.y);
+    let amb_air_day = mix(vec3<f32>(0.22, 0.20, 0.17), vec3<f32>(0.48, 0.54, 0.64), clamp(n.y * 0.5 + 0.5, 0.0, 1.0));
+    let amb_night = vec3<f32>(0.040, 0.050, 0.078);
+    let amb_air = mix(amb_night, amb_air_day, day);
     let amb_moon = vec3<f32>(0.09, 0.09, 0.10);
     let amb = mix(amb_air, amb_moon, airless);
-    let sun_col = mix(vec3<f32>(1.0, 0.97, 0.9), vec3<f32>(1.25, 1.22, 1.15), airless);
+    let sun_col = mix(vec3<f32>(1.05, 1.0, 0.92), vec3<f32>(1.25, 1.22, 1.15), airless) * max(day, airless);
+
+    // Soft sun specular (Blinn-Phong): a sheen on the car, buildings and metal so
+    // surfaces catch the light instead of reading as flat matte blocks.
+    let vdir = normalize(-in.wpos); // camera sits at the origin in camera-rel space
+    let hvec = normalize(s + vdir);
+    let spec = pow(max(dot(n, hvec), 0.0), 26.0) * 0.20 * ao * sun_vis;
+
     // Inside the assembly building (interior -> 1) the roof shades the sun, so
     // dim sun + ambient and let the work lights carry the scene.
     let interior = u.params.w;
     let sf = 1.0 - 0.9 * interior;
     let af = 1.0 - 0.68 * interior;
-    var lit = in.color * (amb * af + sun_col * diff * 0.95 * sf);
+    var lit = in.color * (amb * af + sun_col * diff * 1.05 * sf) + sun_col * spec * sf;
+
+    // A subtle sky reflection on grazing faces (worlds with air only): lifts the
+    // edges of buildings/vehicles with a hint of sky colour for some depth.
+    let fres = pow(1.0 - max(dot(n, vdir), 0.0), 4.0);
+    lit = lit + vec3<f32>(0.45, 0.52, 0.64) * fres * 0.08 * (1.0 - airless) * day;
 
     // interior point lights (work lights in the assembly building): per-fragment
     // diffuse with inverse-square-ish falloff, so they pool light on nearby
@@ -204,6 +223,16 @@ fn fs(in: VsOut) -> FsOut {
         let atten = 1.0 / (1.0 + (dist * dist) / (range * range));
         lit = lit + in.color * u.light_col[i].rgb * (max(dot(n, ld), 0.0) * atten);
     }
+
+    // Emissive surfaces: a colour pushed well above 1.0 (lit windows, street
+    // lamps, work lights) reads as self-illuminated, so it glows at dusk and on
+    // shadowed faces instead of being darkened by the lighting. Keyed on summed
+    // brightness so ordinary albedo (which stays under ~1 each) is untouched.
+    // Emission boosts at night (lights come on), so windows/lamps stay subtle by
+    // day but glow after dark.
+    let lum = in.color.r + in.color.g + in.color.b;
+    let emis = smoothstep(2.3, 3.1, lum);
+    lit = mix(lit, in.color, emis * (0.22 + 0.78 * (1.0 - day)));
 
     // aerial perspective: fade toward horizon haze with view distance.
     let dist = in.flogz - 1.0; // = view-space distance (clip.w)

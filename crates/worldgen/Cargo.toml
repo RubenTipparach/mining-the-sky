@@ -12,6 +12,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 rand = "0.8"
 rand_pcg = "0.3"
 rayon = "1"
+worldcity = { path = "../worldcity" }
 
 [lib]
 name = "worldgen"

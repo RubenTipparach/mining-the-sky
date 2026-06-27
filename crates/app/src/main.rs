@@ -28,7 +28,9 @@ mod flight;
 mod launch;
 mod mission;
 mod rocket;
+mod sim_thread;
 mod terrain_job;
+mod traffic;
 mod ui;
 mod universe;
 use flight::{Craft, GravBody, Mode};
@@ -134,11 +136,31 @@ const OVERLAY_CAP: u64 = 8192;
 const HUD_CAP: u64 = 40000;
 /// Thruster-FX billboards (flame + smoke particles).
 const FX_CAP: u64 = 60000;
-/// Dynamic rocket-view geometry (pad + rocket + spent booster, or a surface
-/// mesh: moon base / cargo module / a full procedural asteroid ~66k verts).
-const DYN_MESH_CAP: u64 = 200_000;
-/// Full-planet LOD terrain (rebuilt as the rocket moves across the grid).
-const TERRAIN_CAP: u64 = 500_000;
+/// Dynamic rocket-view geometry: the per-frame movers only (player car/character,
+/// NPC traffic, the rocket stack + debris). The static city/ground scenery moved
+/// to its own buffer (see `STATIC_MESH_CAP`), so this stays small.
+const DYN_MESH_CAP: u64 = 560_000;
+/// Static rocket-view scenery (the city LOD set + ground structures), uploaded
+/// once and rebuilt only when the floating origin shifts or the visible LOD set
+/// changes - never per frame. Sized for a whole metro of full 3D buildings in the
+/// build range at once (~1M verts measured), with headroom.
+const STATIC_MESH_CAP: u64 = 2_400_000;
+/// Procedural re-entry plasma glow mesh (prototype mesh approach): an isosurface
+/// shell hugging the vehicle SDF (surface nets), so it can run to tens of
+/// thousands of verts on a boostered stack.
+const PLASMA_MESH_CAP: u64 = 262_144;
+// ---- Re-entry glow-mesh look (play with these) ----
+/// Number of nested glow shells extracted from the vehicle SDF. More shells read
+/// as a softer, more volumetric fireball (the inner one hugs the hull, the outer
+/// ones are progressively fainter, offset wisps).
+const PLASMA_GLOW_LAYERS: usize = 8;
+/// How far the outermost shell stands off the hull, as a multiple of the glow
+/// standoff. Bigger = the glow diffuses further out (softer, puffier silhouette).
+const PLASMA_GLOW_SPREAD: f32 = 1.9;
+/// Full-planet LOD terrain (rebuilt as the rocket moves across the grid). Sized
+/// for the high-detail budget (~1-2M triangles = 3-6M non-indexed vertices); the
+/// GPU buffer is this many vertices, so it bounds the densest terrain frame.
+const TERRAIN_CAP: u64 = 4_500_000;
 
 /// Floating-origin grid for the planet terrain. The reference is snapped to a
 /// lattice so the same rocket position always yields byte-identical geometry
@@ -148,7 +170,13 @@ const TERRAIN_CAP: u64 = 500_000;
 /// The min is ~1 km so slow, low movement never thrashes the mesh; the max
 /// keeps rebuilds rare from orbit.
 const TERRAIN_GRID_MIN_M: f64 = 1_024.0;
-const TERRAIN_GRID_MAX_M: f64 = 262_144.0;
+const TERRAIN_GRID_MAX_M: f64 = 1_048_576.0;
+
+/// Altitude (m) above which the planet terrain transitions to the stable coarse
+/// cube-sphere LOD regime: rebuild cells widen super-linearly so the high
+/// altitude globe stops re-meshing on every kilometre of travel. ~50 km, where
+/// the surface no longer shows resolvable fine relief.
+const HIGH_ALT_STABLE_M: f64 = 50_000.0;
 
 /// Render-space length unit for the system view: 1000 km.
 const MM: f32 = 1.0e6;
@@ -157,6 +185,108 @@ const MM: f32 = 1.0e6;
 /// the pad (which is at the origin); the rocket rolls out across the flats to it.
 const HANGAR_POS: Vec3 = Vec3::new(-5000.0, 0.0, 0.0);
 const RACK_POS: Vec3 = Vec3::new(-5000.0, 0.0, 42.0);
+
+/// Centre of the main metro (local metres, east + north of the pad): the middle
+/// downtown of cluster 0, reached by the access road, where you spawn the car.
+const CITY_CENTER: Vec3 = Vec3::new(1600.0, 0.0, 1800.0);
+
+/// Spacing between neighbouring downtowns inside a metro cluster (metres). A touch
+/// wider than a single 420 m city grid, so the grids nearly meet and read as one
+/// continuous sprawl while only one or two NPC crowds wake at a time.
+const CITY_SPACING: f32 = 460.0;
+
+/// The metro clusters: (centre, cols, rows, variant base). Each is a dense block
+/// of `cols * rows` downtowns packed together into one big sprawl; the clusters
+/// sit kilometres apart so only the metro you are in renders / simulates. Cluster
+/// 0 is the main metro by the launch pad.
+const CLUSTERS: [(Vec3, i32, i32, u32); 3] = [
+    (CITY_CENTER, 3, 3, 0),
+    (Vec3::new(-2900.0, 0.0, 2700.0), 3, 2, 20),
+    (Vec3::new(3200.0, 0.0, -2600.0), 2, 3, 40),
+];
+
+/// Draw a city's full 3D buildings within this range of the camera eye; past it
+/// the flat footprint LOD takes over (we don't render buildings beyond ~5 km).
+const CITY_BUILD_R: f64 = 5000.0;
+/// Draw a city's far footprint (concrete blocks + roads) out to this range, so it
+/// still reads as a city from kilometres away / up.
+const CITY_FOOT_R: f64 = 50000.0;
+
+/// The downtown grid of one metro cluster, centred on `center` (each entry is the
+/// city centre + its layout variant, so neighbouring downtowns look distinct).
+fn cluster_cities(center: Vec3, cols: i32, rows: i32, vbase: u32) -> Vec<(Vec3, u32)> {
+    let mut v = Vec::new();
+    let ox = (cols as f32 - 1.0) * 0.5;
+    let oz = (rows as f32 - 1.0) * 0.5;
+    for c in 0..cols {
+        for r in 0..rows {
+            let p = center + Vec3::new((c as f32 - ox) * CITY_SPACING, 0.0, (r as f32 - oz) * CITY_SPACING);
+            v.push((p, vbase + (c * rows + r) as u32));
+        }
+    }
+    v
+}
+
+/// The unified descriptor for a local cluster downtown, so its layout comes from
+/// the same `worldcity::generate` the far footprints and (eventually) the orbital
+/// lights use. `seed = variant * 1009` and a population that yields a 7x7 grid
+/// reproduce exactly the layout `rocket::city` draws, so near buildings and far
+/// footprints line up. (These local cities get high ids to stay clear of the
+/// baked world index; the next phase replaces them with real indexed cities.)
+fn local_city_desc(variant: u32) -> worldcity::CityDesc {
+    worldcity::CityDesc {
+        id: 1_000_000 + variant,
+        kind: 1,
+        lon: 0.0,
+        lat: 0.0,
+        pop: 2.0e6, // -> 7x7 grid, matching the prototype downtown
+        seed: variant.wrapping_mul(1009),
+        radius_m: 360.0,
+        _pad: 0,
+    }
+}
+
+/// Every drivable downtown across all metro clusters (centre + layout variant).
+fn all_cities() -> Vec<(Vec3, u32)> {
+    let mut v = Vec::new();
+    for &(center, cols, rows, vbase) in &CLUSTERS {
+        v.extend(cluster_cities(center, cols, rows, vbase));
+    }
+    v
+}
+
+/// The road network: a curbed access road from the pad to the main metro, lean
+/// inter-metro highways wiring the cluster centres into a loop, and avenues
+/// linking neighbouring downtowns inside each metro. Each entry is (a, b, mesh)
+/// so the renderer can distance-cull a link the player is nowhere near.
+/// The inter-city road network as topology only: (a, b, half-width, curbs). The
+/// terrain-following ribbon meshes are built from this once the world frame and
+/// terrain are known (see `World::build_roads`).
+fn city_road_segments() -> Vec<(Vec3, Vec3, f32, bool)> {
+    let pad = Vec3::new(40.0, 0.0, 0.0);
+    let mut roads = Vec::new();
+    // access road from the launch complex to the main metro (with curbs).
+    roads.push((pad, CITY_CENTER, 10.0, true));
+    // inter-metro highways: link the cluster centres into a loop.
+    let n = CLUSTERS.len();
+    for i in 0..n {
+        let (a, b) = (CLUSTERS[i].0, CLUSTERS[(i + 1) % n].0);
+        roads.push((a, b, 9.0, false));
+    }
+    // avenues between neighbouring (axis-adjacent) downtowns within each metro.
+    let max = (CITY_SPACING * 1.3) as f64;
+    for &(center, cols, rows, vbase) in &CLUSTERS {
+        let cs = cluster_cities(center, cols, rows, vbase);
+        for i in 0..cs.len() {
+            for j in (i + 1)..cs.len() {
+                if (cs[i].0 - cs[j].0).length() as f64 <= max {
+                    roads.push((cs[i].0, cs[j].0, 9.0, false));
+                }
+            }
+        }
+    }
+    roads
+}
 
 /// Interior work lights of the assembly building: (offset from HANGAR_POS,
 /// colour*intensity, range metres). Mounted high on the wall corners (cool) and
@@ -172,6 +302,46 @@ const HANGAR_LIGHTS: [(Vec3, [f32; 3], f32); 6] = [
 
 /// Depth format for the rocket view's mesh pass.
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+/// GLSL-style smoothstep for f32 (Hermite ease between edges e0..e1).
+fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
+    let t = ((x - e0) / (e1 - e0).max(1e-6)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Polynomial smooth-minimum (iq): blends two SDF values over a radius `k` so a
+/// union of overlapping shapes reads as one creaseless surface (no faceted ridge
+/// where the parts meet). Used to fuse the smeared wake copies of the hull SDF.
+fn smooth_min(a: f32, b: f32, k: f32) -> f32 {
+    let h = (0.5 + 0.5 * (b - a) / k.max(1e-6)).clamp(0.0, 1.0);
+    b * (1.0 - h) + a * h - k * h * (1.0 - h)
+}
+
+/// Signed distance to a round cone (capsule with end radii `r1`..`r2`) from `a`
+/// to `b`. Rust port of the iq round-cone SDF, for building the re-entry plasma
+/// the glow-mesh isosurface on the CPU.
+fn sd_round_cone(p: Vec3, a: Vec3, b: Vec3, r1: f32, r2: f32) -> f32 {
+    let ba = b - a;
+    let l2 = ba.dot(ba).max(1e-6);
+    let rr = r1 - r2;
+    let a2 = l2 - rr * rr;
+    let il2 = 1.0 / l2;
+    let pa = p - a;
+    let y = pa.dot(ba);
+    let z = y - l2;
+    let d2v = pa * l2 - ba * y;
+    let x2 = d2v.dot(d2v);
+    let y2 = y * y * l2;
+    let z2 = z * z * l2;
+    let k = rr.signum() * rr * rr * x2;
+    if z.signum() * a2 * z2 > k {
+        return (x2 + z2).sqrt() * il2 - r2;
+    }
+    if y.signum() * a2 * y2 < k {
+        return (x2 + y2).sqrt() * il2 - r1;
+    }
+    (x2 * a2 * il2).sqrt() * il2 + y * rr * il2 - r1
+}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum View {
@@ -220,6 +390,29 @@ struct SkyUniforms {
     params: [f32; 4],
 }
 
+/// Max engine nozzles for the volumetric plume pass (main + radial boosters).
+const MAX_PLUME_NOZZLES: usize = 12;
+
+/// Uniforms for the volumetric exhaust-plume pass (camera-relative scene space).
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct PlumeUniforms {
+    right: [f32; 4],
+    up: [f32; 4],
+    fwd: [f32; 4],
+    eye: [f32; 4],
+    /// xyz = bounding centre (camera-relative), w = bounding radius.
+    center: [f32; 4],
+    /// xyz = exhaust direction (unit), w = plume length.
+    dir: [f32; 4],
+    /// x = tan(fov/2), y = aspect, z = time, w = intensity (0..1).
+    params: [f32; 4],
+    /// x = nozzle count, y = base radius.
+    nnoz: [f32; 4],
+    /// Per nozzle: xyz position (camera-relative), w = per-nozzle radius scale.
+    noz: [[f32; 4]; MAX_PLUME_NOZZLES],
+}
+
 /// Far plane for the rocket-view log-depth buffer (m): beyond planet diameter.
 const LOG_DEPTH_FAR: f32 = 2.0e7;
 
@@ -229,6 +422,9 @@ const HORIZON: [f32; 3] = [0.74, 0.82, 0.93];
 /// Sun direction in the launch tangent frame (east, up, north). The home world
 /// uses a fairly high sun; the moon uses a low, grazing sun for long shadows.
 const SUN_LOCAL: Vec3 = Vec3::new(0.40, 0.72, 0.55);
+/// Night sun: well below the horizon, so the atmosphere shader renders a dark
+/// sky and the mesh shader's day/night factor collapses the sky-fill ambient.
+const SUN_LOCAL_NIGHT: Vec3 = Vec3::new(0.42, -0.40, 0.50);
 const SUN_LOCAL_MOON: Vec3 = Vec3::new(0.62, 0.17, 0.77);
 /// Deep-space (asteroid) sun: higher than the lunar grazing sun so a body
 /// viewed from the sun side reads as a solid lit rock.
@@ -272,9 +468,38 @@ struct SepBooster {
     vel: Vec3,
     rot: Quat,
     spin: Vec3,
+    /// Local-frame gravitational acceleration at the separation point (m/s^2),
+    /// so the spent stage falls away under the *actual* gravity at altitude
+    /// (gentle high up, in the correct down-direction) instead of a fixed 1 g.
+    grav: Vec3,
     age: f32,
     /// Vertex range (in the rocket body mesh) of the jettisoned stage.
     range: std::ops::Range<usize>,
+}
+
+/// One chunk of a destroyed vehicle, tumbling away from the blast in the
+/// rocket-view local frame. Like `SepBooster` but many at once, each a vertex
+/// range of the original rocket mesh.
+struct Debris {
+    pos: Vec3,
+    vel: Vec3,
+    rot: Quat,
+    spin: Vec3,
+    grav: Vec3,
+    age: f32,
+    range: std::ops::Range<usize>,
+}
+
+/// One fireball/smoke particle of an explosion. Drawn through the FX smoke
+/// pipeline, but colour-ramped from white-hot through orange to dark smoke as it
+/// ages, so a burst reads as a fireball collapsing into a smoke cloud.
+struct Boom {
+    pos: Vec3,
+    vel: Vec3,
+    age: f32,
+    life: f32,
+    size0: f32,
+    seed: f32,
 }
 
 /// A planned maneuver (burn node) on the craft's current orbit: where to burn
@@ -352,6 +577,23 @@ fn ray_sphere_near(o: Vec3, d: Vec3, c: Vec3, r: f32) -> Option<f32> {
     }
 }
 
+/// Nearest forward intersection distance of ray `o + t*d` with the axis-aligned
+/// box `[lo, hi]`, or `None` if the ray misses. Used for camera collision
+/// against building boxes (slab method, f64). `d` need not be normalised but is
+/// here, so `t` is in metres.
+fn ray_box(o: DVec3, d: DVec3, lo: DVec3, hi: DVec3) -> Option<f64> {
+    let inv = DVec3::new(1.0 / d.x, 1.0 / d.y, 1.0 / d.z);
+    let t1 = (lo - o) * inv;
+    let t2 = (hi - o) * inv;
+    let near = t1.min(t2).max_element();
+    let far = t1.max(t2).min_element();
+    if far >= near.max(0.0) {
+        Some(near.max(0.0))
+    } else {
+        None
+    }
+}
+
 impl OrbitObject {
     /// World position (Mm) at `sys_time`, given the home world's position.
     fn pos_mm(&self, home_pos: DVec3, sys_time: f64) -> DVec3 {
@@ -368,6 +610,16 @@ struct Smoke {
     age: f32,
     life: f32,
     size0: f32,
+    seed: f32,
+}
+
+/// One re-entry spark: a tiny bright ember shed off the windward shock and
+/// streaming downstream through the wake, in the rocket-view local frame.
+struct Spark {
+    pos: Vec3,
+    vel: Vec3,
+    age: f32,
+    life: f32,
     seed: f32,
 }
 
@@ -393,6 +645,9 @@ struct World {
     /// Roll-out progress: 0 = in the hangar, 1 = on the pad. Animates.
     rollout: f32,
     rolling_out: bool,
+    /// Crawler speed multiplier while rolling out (1x .. 64x): lets the player
+    /// fast-forward the slow transport instead of watching it creep.
+    rollout_speed: f32,
     rocket_body: rocket::RocketBody,
     pad_mesh: rocket::Mesh,
     hangar_mesh: rocket::Mesh,
@@ -401,6 +656,21 @@ struct World {
     /// the rocket along it (drawn at the rocket's resting base while not flown).
     road_mesh: rocket::Mesh,
     platform_mesh: rocket::Mesh,
+    /// The drivable cities (centre + building mesh) and the road network linking
+    /// them to each other and the launch complex (each road is (a, b, mesh) so it
+    /// can be distance-culled). All static, in launch-tangent local metres.
+    city_meshes: Vec<(Vec3, rocket::Mesh)>,
+    /// Night-only warm ground lighting per city (amber street wash + lamp pools),
+    /// drawn only when `night` so its amber albedo does not tint the day streets.
+    city_glow: Vec<(Vec3, rocket::Mesh)>,
+    /// Far level-of-detail per city: flat block + road footprints (from the same
+    /// layout as the buildings), drawn beyond the building range.
+    city_footprints: Vec<(Vec3, rocket::Mesh)>,
+    /// The generated layout per city centre (the unified source), kept for the
+    /// footprints and for car-vs-building collision.
+    city_layouts: Vec<(Vec3, worldcity::CityLayout)>,
+    roads: Vec<(Vec3, Vec3, rocket::Mesh)>,
+    car_mesh: rocket::Mesh,
     lander_mesh: rocket::Mesh,
     /// Show the lunar lander standing on the ground (instead of the rocket).
     show_lander: bool,
@@ -424,6 +694,9 @@ struct World {
     ast_radius: f64,
     /// Render the surface as the moon: grey regolith + black airless sky.
     lunar: bool,
+    /// Night on the home world: a below-horizon sun, so the sky goes dark and
+    /// the emissive city lights carry the scene.
+    night: bool,
     /// Height (m) the lander floats above the surface (0 = landed).
     lander_alt: f32,
     /// Fire the lander's descent engine (plume under the bell).
@@ -440,18 +713,29 @@ struct World {
     /// Drag ghost position (camera-relative) while grabbing.
     grab_ghost: Vec3,
     sep: Option<SepBooster>,
+    /// Chunks of a destroyed vehicle + the fireball particles of its explosion,
+    /// and a latch so the blast spawns exactly once.
+    debris: Vec<Debris>,
+    boom: Vec<Boom>,
+    exploded: bool,
     /// Payloads delivered to orbit by completed missions (they accumulate).
     orbits: Vec<OrbitObject>,
     /// Whether the active launch's payload has been captured to orbit yet.
     mission_captured: bool,
     smoke: Vec<Smoke>,
     smoke_accum: f32, // fractional particle spawn carry
+    /// Re-entry sparks shed off the plasma shock, streaming through the wake.
+    sparks: Vec<Spark>,
+    spark_accum: f32, // fractional spark spawn carry
     anim: f32,        // FX animation clock (seconds)
     // launch-site tangent frame (home-centred metres): origin + up/east/north.
     launch_origin: DVec3,
     launch_up: DVec3,
     launch_east: DVec3,
     launch_north: DVec3,
+    /// Cached home-world elevation (same field the terrain mesh uses), so the car
+    /// and pedestrian can follow the ground height without rebuilding it.
+    terrain_elev: terrain::Elevation,
     // Floating-origin reference (launch-tangent metres). The whole rocket-view
     // scene is rendered relative to this point, snapped near the camera and
     // updated (with a terrain rebuild) when the camera moves far from it.
@@ -459,6 +743,28 @@ struct World {
     terrain_dirty: bool,
     terrain_verts: Vec<rocket::MeshVertex>,
     terrain_count: u32,
+    /// Static rocket-view scenery (cities + ground structures): vertex count in
+    /// the static buffer, a dirty flag set when the floating origin shifts, and a
+    /// signature of the current LOD selection (which cities at which detail +
+    /// night) so a changed selection triggers exactly one rebuild. Rebuilt only on
+    /// those events, never per frame - see `build_static_mesh` / `static_mesh_sig`.
+    static_count: u32,
+    static_dirty: bool,
+    static_sig: u64,
+    /// LOD-debug overlay: colour the terrain by quadtree depth (toggle with `L`
+    /// in the rocket view) so the split rings are visible and tunable.
+    lod_debug: bool,
+    /// Vertex count of the re-entry plasma glow mesh built this frame.
+    plasma_mesh_n: u32,
+    /// Frozen re-entry test scene: the vehicle is held at full heat in place so
+    /// the plasma FX play continuously and you can orbit / re-aim it to inspect
+    /// the shock. No physics integration, no heat damage, never destroyed. Set
+    /// by `setup_reentry`, cleared on any normal ignite / reset.
+    reentry_test: bool,
+    /// Friction (heating) level dialed by the test-scene slider, 0..1. In the
+    /// frozen test it drives the vehicle's heat glow directly so you can sweep the
+    /// re-entry FX from cold to white-hot and confirm it ramps smoothly.
+    test_friction: f32,
     /// Background planet-terrain mesher (double-buffered). See [`terrain_job`].
     terrain_svc: terrain_job::TerrainService,
 
@@ -497,6 +803,42 @@ struct World {
     focus_rocket: bool,
     /// egui body-browser search text.
     ui_search: String,
+
+    /// Dedicated physics thread that owns and integrates the player launch on its
+    /// own wall-clock, separate from rendering (live native game only). When set,
+    /// `launch` is a render-side snapshot mirror: control inputs are forwarded to
+    /// the thread and the authoritative state is read back each frame. `None` in
+    /// tests / headless `shot` / `ascentcsv` and on wasm, where the launch is
+    /// integrated inline and synchronously so those paths stay deterministic.
+    sim: Option<sim_thread::SimThread>,
+    /// True while the dedicated thread is actively flying the player launch. The
+    /// frozen / hand-placed test scenes (re-entry, parachute, powered descent)
+    /// hand-place state and integrate synchronously, so they detach the thread
+    /// (clear this) and run inline; a normal ignition re-arms it.
+    sim_drives_launch: bool,
+
+    /// A drivable car you can take from the launch complex out to the city. When
+    /// `driving`, WASD steers it and the rocket-view camera follows it.
+    driving: bool,
+    car_pos: DVec3, // local launch-tangent metres (x east, y up, z north)
+    car_yaw: f32,   // heading, 0 = +X (east)
+    car_speed: f32, // signed m/s along the heading
+    /// Held drive keys: [forward, back, left, right].
+    drive_in: [bool; 4],
+
+    /// On foot: a third-person character you can walk around (and use to get in
+    /// and out of the car). When `walking`, WASD moves it and the camera follows.
+    walking: bool,
+    ped_pos: DVec3, // local metres
+    ped_yaw: f32,   // heading, 0 = +X
+    ped_speed: f32, // m/s along the heading
+    walk_phase: f32, // stride cycle phase (for the walk animation)
+    /// Held walk keys: [forward, back, left, right].
+    walk_in: [bool; 4],
+
+    /// NPC cars + pedestrians that bring each city to life. One crowd per city,
+    /// each spawned only while the player is near it and despawned when far away.
+    traffic: Vec<traffic::Traffic>,
 }
 
 impl World {
@@ -504,10 +846,27 @@ impl World {
         let mission = Mission::pioneer_from_spaceport();
         let body = CentralBody::home();
         let vab = build::Vab::default_build();
-        let rocket_body = rocket::rocket_body(&vab.to_vehicle(), vab.payload().color, vab.payload().module);
+        let init_boosters: Vec<rocket::BoosterViz> = (0..vab.stages.len())
+            .map(|i| {
+                let (b, n) = vab.booster(i);
+                rocket::BoosterViz { count: n, prop: b.prop as f32, solid: b.solid }
+            })
+            .collect();
+        let rocket_body = rocket::rocket_body(
+            &vab.to_vehicle(),
+            vab.payload().color,
+            vab.payload().module,
+            &init_boosters,
+        );
         let rocket_frame = (rocket_body.focus_y, rocket_body.cam_dist);
         let (rack_mesh_init, rack_slots) = build_rack();
         let (launch_origin, launch_up, launch_east, launch_north) = rocket::launch_frame();
+        // The unified city layouts (one per cluster downtown), generated once and
+        // shared by the footprint LOD and car collision.
+        let city_layouts: Vec<(Vec3, worldcity::CityLayout)> = all_cities()
+            .iter()
+            .map(|&(c, v)| (c, worldcity::generate(&local_city_desc(v))))
+            .collect();
         let home_radius_mm = (body.radius as f32) / MM;
         // A fictional moon: ~0.27 home radii, parked off to one side. Distance is
         // compressed from the real ~60 radii so both bodies frame nicely in one
@@ -534,6 +893,7 @@ impl World {
             vab_mode: true,
             rollout: 0.0,
             rolling_out: false,
+            rollout_speed: 1.0,
             launch: None,
             rocket_body,
             pad_mesh: rocket::pad_and_mount(),
@@ -543,6 +903,15 @@ impl World {
             // crawls the rocket along it.
             road_mesh: rocket::crawlerway(HANGAR_POS.x, 12.0, 14.0),
             platform_mesh: rocket::crawler_platform(),
+            city_meshes: city_layouts.iter().map(|(c, l)| (*c, rocket::city(l, *c))).collect(),
+            city_glow: city_layouts.iter().map(|(c, l)| (*c, rocket::city_night_glow(l, *c))).collect(),
+            city_footprints: city_layouts
+                .iter()
+                .map(|(c, l)| (*c, rocket::city_footprint(l, *c)))
+                .collect(),
+            city_layouts,
+            roads: Vec::new(), // built below, once the terrain frame is in place
+            car_mesh: rocket::car([0.80, 0.18, 0.16]),
             lander_mesh: rocket::lander(),
             show_lander: false,
             base_mesh: None,
@@ -553,6 +922,7 @@ impl World {
             ast_elev: None,
             ast_radius: 0.0,
             lunar: false,
+            night: false,
             lander_alt: 0.0,
             lander_firing: false,
             lander_rcs: 0.0,
@@ -561,19 +931,32 @@ impl World {
             grab_target: None,
             grab_ghost: Vec3::ZERO,
             sep: None,
+            debris: Vec::new(),
+            boom: Vec::new(),
+            exploded: false,
             orbits: Vec::new(),
             mission_captured: false,
             smoke: Vec::new(),
             smoke_accum: 0.0,
+            sparks: Vec::new(),
+            spark_accum: 0.0,
             anim: 0.0,
             launch_origin,
             launch_up,
             launch_east,
             launch_north,
+            terrain_elev: rocket::launch_elevation(),
             ref_local: DVec3::ZERO,
             terrain_dirty: true,
+            lod_debug: false,
+            plasma_mesh_n: 0,
+            reentry_test: false,
+            test_friction: 0.9,
             terrain_verts: Vec::new(),
             terrain_count: 0,
+            static_count: 0,
+            static_dirty: true,
+            static_sig: 0,
             terrain_svc: terrain_job::TerrainService::new(),
             view: View::Rocket,
             sys_az: 1.4,
@@ -597,6 +980,20 @@ impl World {
             focus: 0,
             focus_rocket: false,
             ui_search: String::new(),
+            sim: None,
+            sim_drives_launch: false,
+            driving: false,
+            car_pos: DVec3::new(30.0, 0.0, 0.0),
+            car_yaw: 0.0,
+            car_speed: 0.0,
+            drive_in: [false; 4],
+            walking: false,
+            ped_pos: DVec3::new(34.0, 0.0, 4.0),
+            ped_yaw: 0.0,
+            ped_speed: 0.0,
+            walk_phase: 0.0,
+            walk_in: [false; 4],
+            traffic: all_cities().iter().map(|&(c, _)| traffic::Traffic::new(c.as_dvec3())).collect(),
         };
         // Generate the full Kepler-47 system; the landable moon is injected as
         // home's first moon so the map and the flight sim agree.
@@ -614,7 +1011,64 @@ impl World {
         w.focus = w.universe.home_index();
         w.focus_rocket = true;
         w.apply_focus();
+        // Build the inter-city roads now that the terrain frame is in place, so
+        // each ribbon drapes over the actual ground instead of a flat plane.
+        w.roads = w.build_roads();
         w
+    }
+
+    /// Build the inter-city road meshes, each a terrain-following ribbon over the
+    /// real ground height (so they hug hills instead of floating / sinking).
+    fn build_roads(&self) -> Vec<(Vec3, Vec3, rocket::Mesh)> {
+        let ground = |x: f32, z: f32| self.local_ground_height(x as f64, z as f64) as f32;
+        city_road_segments()
+            .into_iter()
+            .map(|(a, b, half_w, curbs)| {
+                // L-shaped path (along X then Z), as the old flat roads ran.
+                let corner = Vec3::new(b.x, 0.0, a.z);
+                let mesh = rocket::road_strip(&[a, corner, b], half_w, curbs, &ground);
+                (a, b, mesh)
+            })
+            .collect()
+    }
+
+    /// Spin up the dedicated physics thread and route the player launch through
+    /// it. Called only for the live native game (the windowed run): tests,
+    /// headless `shot` / `ascentcsv` and wasm leave `sim` as `None` and integrate
+    /// the launch inline + synchronously so they stay deterministic.
+    fn enable_threaded_sim(&mut self) {
+        self.sim = Some(sim_thread::SimThread::spawn());
+    }
+
+    /// Release the dedicated thread from the current launch and integrate inline
+    /// instead. Used by the hand-placed / frozen test scenes, which set state
+    /// directly and step synchronously.
+    fn detach_sim_launch(&mut self) {
+        if let Some(sim) = self.sim.as_ref() {
+            sim.stop();
+        }
+        self.sim_drives_launch = false;
+    }
+
+    /// Whether the dedicated thread should be driving the launch this frame.
+    fn sim_thread_active(&self) -> bool {
+        self.sim.is_some() && self.sim_drives_launch
+    }
+
+    /// Snapshot the render-side control inputs to hand to the sim thread.
+    fn launch_controls(&self, rk: &launch::Rocket) -> sim_thread::Controls {
+        sim_thread::Controls {
+            throttle: rk.throttle,
+            pitch: rk.pitch,
+            yaw: rk.yaw,
+            roll: rk.roll,
+            attitude_hold: rk.attitude_hold,
+            auto_land: rk.auto_land,
+            chute_armed: rk.chute_armed,
+            frozen: self.reentry_test,
+            test_heat: (self.test_friction * 1.4) as f64,
+            warp: self.warp,
+        }
     }
 
     /// The currently focused body.
@@ -726,6 +1180,171 @@ impl World {
         };
     }
 
+    /// Toggle the LOD-debug terrain colouring and force an immediate rebuild so
+    /// the new colours appear without waiting for the next floating-origin snap.
+    fn toggle_lod_debug(&mut self) {
+        self.lod_debug = !self.lod_debug;
+        if self.view == View::Rocket {
+            self.rebuild_terrain();
+            self.terrain_dirty = true;
+        }
+    }
+
+    /// Drop the live view straight into a re-entry test: a vehicle at full heating
+    /// in the upper atmosphere. `kind` selects the attitude - 0 = axial
+    /// (nose-first), 1 = pitched-over (high angle of attack), 2 = broadside. The
+    /// shot scenarios `reentry`, `reentry_tilt`, `reentry_side` use the same setup,
+    /// and the "Test Scenes" UI menu calls this directly (no hotkey).
+    fn setup_reentry(&mut self, kind: u8) {
+        self.view = View::Rocket;
+        self.ignite_launch();
+        // Hand-placed, frozen scene: integrate inline, not on the thread.
+        self.detach_sim_launch();
+        let radius = self.body.radius;
+        let up = self.launch_up;
+        let east = self.launch_east;
+        if let Some(rk) = self.launch.as_mut() {
+            rk.throttle = 0.0;
+            match kind {
+                0 => {
+                    rk.r = up * (radius + 58_000.0);
+                    rk.v = -up * 6_000.0 + east * 2_600.0;
+                    rk.pitch = 0.0;
+                }
+                1 => {
+                    rk.r = up * (radius + 58_000.0);
+                    rk.pitch = 0.8;
+                    rk.v = east * 5_400.0 - up * 3_200.0;
+                }
+                _ => {
+                    rk.r = up * (radius + 55_000.0);
+                    rk.pitch = 0.0;
+                    rk.v = east * 6_600.0;
+                }
+            }
+            // hold the set-up attitude (so a broadside/tilt entry is not weathervaned
+            // away during the bloom) and place the nose there immediately.
+            rk.attitude_hold = true;
+            rk.place_attitude();
+        }
+        // Integrate a short while so the heating glow blooms to full, then
+        // freeze the scene: from here the vehicle holds its pose at full heat
+        // (see the `reentry_test` branch in `advance`) so the FX run forever and
+        // you can orbit / pitch it instead of watching it fall and burn up.
+        for _ in 0..12 {
+            self.advance(0.1); // ~1.2 s for the plasma to bloom
+        }
+        if let Some(rk) = self.launch.as_mut() {
+            rk.health = 100.0; // pristine airframe for the test
+            rk.destroyed = false;
+            rk.crashed = false;
+            rk.throttle = 0.0;
+        }
+        self.exploded = false;
+        self.reentry_test = true;
+        self.rocket_az = 4.2;
+        self.rocket_el = if kind == 0 { -0.05 } else { 0.05 };
+        self.rocket_dist = 95.0;
+    }
+
+    /// Test scene: a light crew capsule descending under a deployed parachute in
+    /// the lower atmosphere. Builds a throwaway light vehicle without disturbing
+    /// the player's VAB design.
+    fn setup_parachute(&mut self) {
+        self.view = View::Rocket;
+        let saved = self.vab.clone();
+        self.vab.stages = vec![crate::build::StageCfg::new(0, 0)]; // Sparrow + Small
+        self.vab.payload = 10; // Crew Capsule
+        self.ignite_launch();
+        self.vab = saved; // restore the player's design (rocket_body already built)
+        // Hand-placed descent scene: integrate inline, not on the thread.
+        self.detach_sim_launch();
+        let radius = self.body.radius;
+        let up = self.launch_up;
+        if let Some(rk) = self.launch.as_mut() {
+            rk.throttle = 0.0;
+            for s in rk.stages.iter_mut() {
+                s.prop = 0.0; // spent: only dry structure + capsule (light)
+            }
+            rk.r = up * (radius + 3500.0);
+            rk.v = -up * 130.0; // falling
+            rk.pitch = 0.0;
+            rk.attitude_hold = true; // hangs nose-up under the canopy
+            rk.place_attitude();
+            rk.deploy_chute();
+        }
+        for _ in 0..45 {
+            self.advance(0.1); // ~4.5 s: the canopy inflates and the fall slows
+        }
+        self.rocket_az = 4.2;
+        self.rocket_el = 0.16;
+        self.rocket_dist = 80.0;
+        self.rocket_focus_y = 8.0;
+    }
+
+    /// Test scene: a compact stage doing a powered (suicide-burn) descent to a
+    /// soft landing under the auto-descent autopilot.
+    fn setup_powered_descent(&mut self) {
+        self.view = View::Rocket;
+        let saved = self.vab.clone();
+        self.vab.stages = vec![crate::build::StageCfg::new(1, 0)]; // Merlin + Small
+        self.vab.payload = 10; // Crew Capsule
+        self.ignite_launch();
+        self.vab = saved;
+        // Hand-placed descent scene: integrate inline, not on the thread.
+        self.detach_sim_launch();
+        let radius = self.body.radius;
+        let up = self.launch_up;
+        if let Some(rk) = self.launch.as_mut() {
+            rk.r = up * (radius + 1800.0);
+            rk.v = -up * 160.0; // falling
+            rk.pitch = 0.0;
+            rk.attitude_hold = true; // hold nose-up for the retro-burn
+            rk.place_attitude();
+            rk.auto_land = true; // engage the powered-descent autopilot
+        }
+        for _ in 0..30 {
+            self.advance(0.1); // ~3 s into the retro-burn
+        }
+        self.rocket_az = 4.2;
+        self.rocket_el = 0.10;
+        self.rocket_dist = 90.0;
+        self.rocket_focus_y = 12.0;
+    }
+
+    /// Test scene: stand a rocket on the pad carrying `payload`, fairing cracked
+    /// open so the payload module is visible. Used to inspect crew/service builds.
+    fn setup_payload_preview(&mut self, payload: usize) {
+        self.view = View::Rocket;
+        self.vab.payload = payload;
+        self.rebuild_vehicle();
+        self.vab_mode = false;
+        self.rolling_out = false;
+        self.rollout = 1.0;
+        self.launch = None; // resting on the pad, not flying
+        self.fairing_open = 0.6;
+        let top = self.rocket_body.height;
+        self.rocket_az = 5.05;
+        self.rocket_el = 0.06;
+        self.rocket_focus_y = top - 7.0;
+        self.rocket_dist = 16.0;
+    }
+
+    /// Live LOD-debug stats for the HUD: the active planet LOD (patch counts per
+    /// depth) selected from the current camera, plus the camera altitude (m) and
+    /// the current rebuild-grid cell size (m). Planet rocket view only.
+    pub fn lod_debug_stats(&self) -> (terrain::Lod, f64, f64) {
+        let cam_world = self.cam_world(self.ref_local);
+        let lod = rocket::planet_lod(cam_world, 19);
+        let p = self.cam_target_local();
+        let alt = (self.cam_world(p).length() - self.body.radius).max(0.0);
+        // mirror terrain_anchor_local's cell computation for display
+        let base = 0.5 * alt.max(1.0) / rocket::PLANET_SPLIT_FACTOR;
+        let raw = if alt > HIGH_ALT_STABLE_M { base * (alt / HIGH_ALT_STABLE_M) } else { base };
+        let cell = raw.clamp(TERRAIN_GRID_MIN_M, TERRAIN_GRID_MAX_M).log2().floor().exp2();
+        (lod, alt, cell)
+    }
+
     /// Rocket-view camera, floating-origin: eye + look target are returned
     /// relative to `ref_local` (small f32 near the camera), plus the basis and
     /// tan(fov/2). The whole rocket-view scene is uploaded in this same frame.
@@ -750,13 +1369,45 @@ impl World {
         let vp = proj * view;
         let fcoef = 1.0 / (LOG_DEPTH_FAR + 1.0).log2();
 
-        // Interior work lights, brightest in the building and fading out as the
-        // rocket rolls onto the pad (so the pad stays sunlit).
+        // Realtime point lights (max 8). At night, the nearest streetlights of
+        // the city the camera is in carry the scene so moving NPCs (and the road
+        // around the camera) are lit dynamically; the static streets/buildings
+        // already glow from their baked emissive pools/windows. Otherwise, the
+        // interior work lights pool inside the assembly building.
         let mut lights = [[0.0f32; 4]; MAX_LIGHTS];
         let mut light_col = [[0.0f32; 4]; MAX_LIGHTS];
         let scale = (1.0 - self.rollout).clamp(0.0, 1.0);
         let mut nlights = 0usize;
-        if scale > 0.01 {
+
+        let focus = self.cam_target_local();
+        let mut city_night: Option<&(Vec3, worldcity::CityLayout)> = None;
+        if self.night {
+            let mut best = 700.0f64 * 700.0;
+            for pair in &self.city_layouts {
+                let c = pair.0;
+                let d = (c.x as f64 - focus.x).powi(2) + (c.z as f64 - focus.z).powi(2);
+                if d < best {
+                    best = d;
+                    city_night = Some(pair);
+                }
+            }
+        }
+
+        if let Some((c, layout)) = city_night {
+            // warm sodium streetlights: the nearest lamps to the camera focus.
+            let mut lamps = rocket::city_lamps(layout, *c);
+            lamps.sort_by(|a, b| {
+                let da = (a.x as f64 - focus.x).powi(2) + (a.z as f64 - focus.z).powi(2);
+                let db = (b.x as f64 - focus.x).powi(2) + (b.z as f64 - focus.z).powi(2);
+                da.partial_cmp(&db).unwrap()
+            });
+            for lp in lamps.iter().take(MAX_LIGHTS) {
+                let p = self.rel(lp.as_dvec3());
+                lights[nlights] = [p.x, p.y, p.z, 30.0];
+                light_col[nlights] = [0.95, 0.74, 0.44, 0.0];
+                nlights += 1;
+            }
+        } else if scale > 0.01 {
             // a subtle flicker so the lighting reads as live
             let flick = 0.92 + 0.08 * (self.anim * 9.0).sin();
             for (off, col, range) in HANGAR_LIGHTS {
@@ -790,6 +1441,8 @@ impl World {
             SUN_LOCAL_SPACE
         } else if self.lunar {
             SUN_LOCAL_MOON
+        } else if self.night {
+            SUN_LOCAL_NIGHT
         } else {
             SUN_LOCAL
         };
@@ -836,6 +1489,8 @@ impl World {
             SUN_LOCAL_SPACE
         } else if self.lunar {
             SUN_LOCAL_MOON
+        } else if self.night {
+            SUN_LOCAL_NIGHT
         } else {
             SUN_LOCAL
         };
@@ -856,6 +1511,348 @@ impl World {
                 if self.space { 2.0 } else if self.lunar { 1.0 } else { 0.0 },
             ],
             params: [tan, aspect, self.body.radius as f32, r_atm as f32],
+        }
+    }
+
+    /// Current re-entry heating glow (0 when not launched / cool). Drives whether
+    /// the volumetric plasma pass runs and how bright it is.
+    fn plasma_heat(&self) -> f32 {
+        self.launch
+            .as_ref()
+            .filter(|rk| !rk.destroyed)
+            .map(|rk| rk.heat as f32)
+            .unwrap_or(0.0)
+    }
+
+    /// PROTOTYPE (mesh approach): build a glow shell that HUGS the vehicle hull
+    /// for the re-entry plasma, instead of raymarching it. The shell is the
+    /// isosurface (via surface nets) of the vehicle SDF, smeared downstream along
+    /// the airflow so it wraps the real geometry (boosters get their own bulge)
+    /// and trails into a wake. Each vertex carries a "cool" coordinate (0 at the
+    /// windward face .. 1 at the wake tail) in `color.x` for the white -> orange
+    /// -> red ramp, and an outward SDF-gradient normal for the fresnel rim. Verts
+    /// are camera-relative, so the mesh pass transforms + depth-tests it.
+    fn plasma_mesh(&self) -> Vec<rocket::MeshVertex> {
+        let rk = match self.launch.as_ref() {
+            Some(rk) if !rk.destroyed => rk,
+            _ => return Vec::new(),
+        };
+        let base = self.to_local_d(rk.r);
+        let quat = self.rocket_quat(rk); // full attitude incl. roll
+        let heat = (rk.heat as f32).clamp(0.0, 1.4); // glow intensity, fades the FX in
+        let height = self.rocket_body.height.max(8.0);
+        let center = self.rel(base + (quat * Vec3::new(0.0, height * 0.45, 0.0)).as_dvec3());
+        let vrad = self.rocket_body.engine_r.first().copied().unwrap_or(2.0).max(2.5);
+        let axis = self.dir_to_local(rk.point_dir());
+        let vdir = self.dir_to_local(rk.v.normalize_or_zero());
+        let flow = if vdir.length_squared() > 1e-6 {
+            let axis_signed = if vdir.dot(axis) < 0.0 { -axis } else { axis };
+            let aoa = vdir.dot(axis_signed).clamp(-1.0, 1.0).acos();
+            let t = ((aoa - 0.21) / (0.96 - 0.21)).clamp(0.0, 1.0);
+            let blend = t * t * (3.0 - 2.0 * t);
+            axis_signed.lerp(vdir, blend).normalize_or_zero()
+        } else {
+            axis
+        };
+
+        // Attached SDF prims in camera-relative space (the hull to hug).
+        let mut prims: Vec<(Vec3, f32, Vec3, f32)> = Vec::new();
+        let xform = |m: [f32; 3]| self.rel(base + (quat * Vec3::from(m)).as_dvec3());
+        for (si, pr) in &self.rocket_body.sdf_stage {
+            if *si >= rk.stage_base {
+                prims.push((xform(pr.a), pr.r1, xform(pr.b), pr.r2));
+            }
+        }
+        for pr in &self.rocket_body.sdf_payload {
+            prims.push((xform(pr.a), pr.r1, xform(pr.b), pr.r2));
+        }
+        if prims.is_empty() {
+            return Vec::new();
+        }
+
+        let shell = vrad * 0.6; // glow standoff off the hull
+        let wake = height * 2.2; // downstream wake length (long, fades to nothing)
+
+        // Flow-aligned frame: +s windward, x/y perpendicular.
+        let upref = if flow.dot(Vec3::Y).abs() > 0.9 { Vec3::X } else { Vec3::Y };
+        let rt = flow.cross(upref).normalize_or_zero();
+        let upv = rt.cross(flow).normalize_or_zero();
+
+        // SDF of the hull (union of round cones) and a downstream-smeared field
+        // whose isosurface `== shell` hugs the windward hull and trails a wake.
+        let sdf = |p: Vec3| -> f32 {
+            prims
+                .iter()
+                .fold(f32::MAX, |d, &(a, r1, b, r2)| d.min(sd_round_cone(p, a, b, r1, r2)))
+        };
+
+        // Bounds of the shell in the flow frame, lead/tail along the airflow.
+        let (mut smin, mut smax) = (f32::MAX, f32::MIN);
+        let (mut xmin, mut xmax) = (f32::MAX, f32::MIN);
+        let (mut ymin, mut ymax) = (f32::MAX, f32::MIN);
+        let mut lead = f32::MIN;
+        let mut tail = f32::MAX;
+        for &(a, r1, b, r2) in &prims {
+            for (p, r) in [(a, r1), (b, r2)] {
+                let d = p - center;
+                let (s, x, y) = (d.dot(flow), d.dot(rt), d.dot(upv));
+                let rr = r + shell;
+                smin = smin.min(s - rr);
+                smax = smax.max(s + rr);
+                xmin = xmin.min(x - rr);
+                xmax = xmax.max(x + rr);
+                ymin = ymin.min(y - rr);
+                ymax = ymax.max(y + rr);
+                lead = lead.max(s + r);
+                tail = tail.min(s - r);
+            }
+        }
+        let body = (lead - tail).max(vrad);
+
+        // Downstream-smeared field whose `== shell` isosurface hugs the windward
+        // hull and trails a tapering wake. Smear = smooth-union over upstream
+        // shifts of the hull SDF: the smooth min fuses the shifted copies into one
+        // creaseless wake (no banding/scallops at any attitude), the step is kept
+        // within the smoothing radius so they always overlap, and a per-shift
+        // taper pinches the far wake to a point instead of a flat tube.
+        let smk = shell * 1.6; // wake-union smoothing radius
+        let ksmear = ((wake / smk).ceil() as usize + 1).clamp(8, 24);
+        let taper = shell * 2.2 / wake;
+        let field = |p: Vec3| -> f32 {
+            let mut d = sdf(p);
+            for m in 1..ksmear {
+                let kd = wake * m as f32 / (ksmear - 1) as f32;
+                d = smooth_min(d, sdf(p + flow * kd) + kd * taper, smk);
+            }
+            d - shell
+        };
+
+        smin -= wake; // wake trails downstream (toward low s)
+        let pad = shell * 1.8; // room for the outer (offset) glow layers
+        smin -= pad;
+        xmin -= pad;
+        ymin -= pad;
+        smax += pad;
+        xmax += pad;
+        ymax += pad;
+
+        // Grid (cell ~ standoff), capped per axis to bound vert count + CPU cost.
+        let cell = (vrad * 0.55).max(0.7);
+        let dim = |lo: f32, hi: f32| (((hi - lo) / cell).ceil() as usize).clamp(2, 30);
+        let (gs, gx, gy) = (dim(smin, smax), dim(xmin, xmax), dim(ymin, ymax));
+        let cs = (smax - smin) / gs as f32;
+        let cx = (xmax - xmin) / gx as f32;
+        let cy = (ymax - ymin) / gy as f32;
+        let cpos = |i: usize, j: usize, k: usize| -> Vec3 {
+            center
+                + flow * (smin + i as f32 * cs)
+                + rt * (xmin + j as f32 * cx)
+                + upv * (ymin + k as f32 * cy)
+        };
+
+        // Sample the field at every grid corner.
+        let (nx, ny, nz) = (gs + 1, gx + 1, gy + 1);
+        let cidx = |i: usize, j: usize, k: usize| (i * ny + j) * nz + k;
+        let mut fval = vec![0.0f32; nx * ny * nz];
+        for i in 0..nx {
+            for j in 0..ny {
+                for k in 0..nz {
+                    fval[cidx(i, j, k)] = field(cpos(i, j, k));
+                }
+            }
+        }
+
+        // Surface nets, extracted at a few iso levels so the glow reads as nested
+        // shells (volume + flow) rather than one hard skin: the inner shell is
+        // bright and tight on the hull, the outer ones are fainter offset wisps
+        // that the shader ripples with animated noise. The expensive field
+        // sampling is shared - each extra layer is just another cheap extraction.
+        const EDGES: [((usize, usize, usize), (usize, usize, usize)); 12] = [
+            ((0, 0, 0), (1, 0, 0)), ((0, 1, 0), (1, 1, 0)), ((0, 0, 1), (1, 0, 1)), ((0, 1, 1), (1, 1, 1)),
+            ((0, 0, 0), (0, 1, 0)), ((1, 0, 0), (1, 1, 0)), ((0, 0, 1), (0, 1, 1)), ((1, 0, 1), (1, 1, 1)),
+            ((0, 0, 0), (0, 0, 1)), ((1, 0, 0), (1, 0, 1)), ((0, 1, 0), (0, 1, 1)), ((1, 1, 0), (1, 1, 1)),
+        ];
+        let lidx = |i: usize, j: usize, k: usize| (i * gx + j) * gy + k;
+        let grad_eps = cell * 0.5;
+        // Nested iso levels (iso offset into the field, layer coord 0=inner ..
+        // 1=outer for the shader), spaced from the hull out to PLASMA_GLOW_SPREAD.
+        let nlayers = PLASMA_GLOW_LAYERS.max(1);
+        let layers: Vec<(f32, f32)> = (0..nlayers)
+            .map(|i| {
+                let f = if nlayers > 1 { i as f32 / (nlayers - 1) as f32 } else { 0.0 };
+                (shell * PLASMA_GLOW_SPREAD * f, f)
+            })
+            .collect();
+        let mut out: Vec<rocket::MeshVertex> = Vec::new();
+        for &(iso, layer) in &layers {
+            let mut cellv: Vec<i32> = vec![-1; gs * gx * gy];
+            let mut pos: Vec<Vec3> = Vec::new();
+            let mut nrm: Vec<Vec3> = Vec::new();
+            let mut coolv: Vec<f32> = Vec::new();
+            for i in 0..gs {
+                for j in 0..gx {
+                    for k in 0..gy {
+                        let mut acc = Vec3::ZERO;
+                        let mut cnt = 0.0f32;
+                        for &((ax, ay, az), (bx, by, bz)) in EDGES.iter() {
+                            let fa = fval[cidx(i + ax, j + ay, k + az)] - iso;
+                            let fb = fval[cidx(i + bx, j + by, k + bz)] - iso;
+                            if (fa < 0.0) != (fb < 0.0) {
+                                let t = fa / (fa - fb);
+                                acc += cpos(i + ax, j + ay, k + az)
+                                    .lerp(cpos(i + bx, j + by, k + bz), t);
+                                cnt += 1.0;
+                            }
+                        }
+                        if cnt > 0.0 {
+                            let p = acc / cnt;
+                            // outward normal from the hull SDF gradient (for fresnel).
+                            let n = Vec3::new(
+                                sdf(p + Vec3::X * grad_eps) - sdf(p - Vec3::X * grad_eps),
+                                sdf(p + Vec3::Y * grad_eps) - sdf(p - Vec3::Y * grad_eps),
+                                sdf(p + Vec3::Z * grad_eps) - sdf(p - Vec3::Z * grad_eps),
+                            )
+                            .normalize_or_zero();
+                            // cool: downstream distance from the windward face (0 hot),
+                            // 0..0.30 over the hull, 0.30..1 through the wake.
+                            let ds = (lead - (p - center).dot(flow)).max(0.0);
+                            let cool = if ds <= body {
+                                0.30 * (ds / body)
+                            } else {
+                                (0.30 + 0.70 * ((ds - body) / wake)).min(1.0)
+                            };
+                            cellv[lidx(i, j, k)] = pos.len() as i32;
+                            pos.push(p);
+                            nrm.push(n);
+                            coolv.push(cool);
+                        }
+                    }
+                }
+            }
+
+            let mut tri = |a: i32, b: i32, c: i32, out: &mut Vec<rocket::MeshVertex>| {
+                if a < 0 || b < 0 || c < 0 {
+                    return;
+                }
+                for &vi in &[a as usize, b as usize, c as usize] {
+                    let p = pos[vi];
+                    let n = nrm[vi];
+                    out.push(rocket::MeshVertex {
+                        pos: [p.x, p.y, p.z],
+                        normal: [n.x, n.y, n.z],
+                        color: [coolv[vi], layer, heat], // z = heat (FX fades in with it)
+                    });
+                }
+            };
+            // Quad around each crossed interior edge (double-sided pipeline, so the
+            // winding does not matter - only the normals do).
+            let mut quad = |c0: i32, c1: i32, c2: i32, c3: i32, out: &mut Vec<rocket::MeshVertex>| {
+                tri(c0, c1, c2, out);
+                tri(c0, c2, c3, out);
+            };
+            for i in 0..gs {
+                for j in 1..gx {
+                    for k in 1..gy {
+                        if (fval[cidx(i, j, k)] < iso) != (fval[cidx(i + 1, j, k)] < iso) {
+                            quad(
+                                cellv[lidx(i, j - 1, k - 1)], cellv[lidx(i, j, k - 1)],
+                                cellv[lidx(i, j, k)], cellv[lidx(i, j - 1, k)], &mut out,
+                            );
+                        }
+                    }
+                }
+            }
+            for i in 1..gs {
+                for j in 0..gx {
+                    for k in 1..gy {
+                        if (fval[cidx(i, j, k)] < iso) != (fval[cidx(i, j + 1, k)] < iso) {
+                            quad(
+                                cellv[lidx(i - 1, j, k - 1)], cellv[lidx(i, j, k - 1)],
+                                cellv[lidx(i, j, k)], cellv[lidx(i - 1, j, k)], &mut out,
+                            );
+                        }
+                    }
+                }
+            }
+            for i in 1..gs {
+                for j in 1..gx {
+                    for k in 0..gy {
+                        if (fval[cidx(i, j, k)] < iso) != (fval[cidx(i, j, k + 1)] < iso) {
+                            quad(
+                                cellv[lidx(i - 1, j - 1, k)], cellv[lidx(i, j - 1, k)],
+                                cellv[lidx(i, j, k)], cellv[lidx(i - 1, j, k)], &mut out,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Exhaust intensity of the active engine (0 when not thrusting / destroyed).
+    fn plume_intensity(&self) -> f32 {
+        self.launch
+            .as_ref()
+            .filter(|rk| !rk.destroyed && rk.live_thrust() > 0.0)
+            .map(|rk| rk.throttle as f32)
+            .unwrap_or(0.0)
+    }
+
+    /// Uniforms for the volumetric exhaust-plume pass: the active engine nozzle
+    /// (plus any radial-booster nozzles), all firing along the exhaust direction.
+    fn plume_uniforms(&self, res: [f32; 2]) -> PlumeUniforms {
+        let aspect = res[0] / res[1].max(1.0);
+        let (eye, _t, right, up, fwd, tan) = self.rocket_camera(aspect);
+        let inten = self.plume_intensity();
+        let mut noz = [[0.0f32; 4]; MAX_PLUME_NOZZLES];
+        let mut nn = 0usize;
+        let (center, bound, dir, length, base_r) = match self.launch.as_ref() {
+            Some(rk) => {
+                let pdir = self.dir_to_local(rk.point_dir());
+                let exhaust = -pdir;
+                let q = Quat::from_rotation_arc(Vec3::Y, pdir);
+                let base = self.to_local_d(rk.r);
+                let sb = rk.stage_base;
+                let er = self.rocket_body.engine_r.get(sb).copied().unwrap_or(0.9).max(0.5);
+                let ny = self.rocket_body.nozzle_y.get(sb).copied().unwrap_or(0.0);
+                let booster_stage = sb == 0;
+                let length = (if booster_stage { 30.0 } else { 18.0 }) * (0.6 + 0.4 * inten);
+                let main = self.rel(base + (q * Vec3::new(0.0, ny - 1.2, 0.0)).as_dvec3());
+                noz[nn] = [main.x, main.y, main.z, 1.0];
+                nn += 1;
+                let mut spread = 0.0f32;
+                if let Some(&(bn, rr)) = self.rocket_body.booster_rings.get(sb) {
+                    spread = rr;
+                    for k in 0..bn {
+                        if nn >= MAX_PLUME_NOZZLES {
+                            break;
+                        }
+                        let a = k as f32 / bn.max(1) as f32 * std::f32::consts::TAU;
+                        let off = Vec3::new(a.cos() * rr, ny - 1.0, a.sin() * rr);
+                        let p = self.rel(base + (q * off).as_dvec3());
+                        noz[nn] = [p.x, p.y, p.z, 0.6];
+                        nn += 1;
+                    }
+                }
+                let center = main + exhaust * (length * 0.5);
+                let bound = length * 0.65 + spread + er * 2.0;
+                (center, bound, exhaust, length, er)
+            }
+            None => (Vec3::ZERO, 10.0, Vec3::NEG_Y, 10.0, 1.0),
+        };
+        PlumeUniforms {
+            right: [right.x, right.y, right.z, 0.0],
+            up: [up.x, up.y, up.z, 0.0],
+            fwd: [fwd.x, fwd.y, fwd.z, 0.0],
+            eye: [eye.x, eye.y, eye.z, 0.0],
+            center: [center.x, center.y, center.z, bound],
+            dir: [dir.x, dir.y, dir.z, length],
+            params: [tan, aspect, self.anim, inten],
+            // z = log-depth Fcoef (same as the scene mesh) so the plume's frag
+            // depth occludes correctly against the rocket / terrain.
+            nnoz: [nn as f32, base_r, 1.0 / (LOG_DEPTH_FAR + 1.0).log2(), 0.0],
+            noz,
         }
     }
 
@@ -981,9 +1978,10 @@ impl World {
         }
 
         // roll the assembled rocket out of the hangar across the flats to the
-        // pad. ~64 s end to end: a slow crawler-transporter pace.
+        // pad. ~64 s end to end at 1x: a slow crawler-transporter pace, but the
+        // player can crank `rollout_speed` to fast-forward it.
         if self.rolling_out {
-            self.rollout = (self.rollout + frame_dt / 64.0).min(1.0);
+            self.rollout = (self.rollout + frame_dt / 64.0 * self.rollout_speed).min(1.0);
             if self.rollout >= 1.0 {
                 self.rolling_out = false;
                 self.vab_mode = false; // now on the pad, ready to launch
@@ -991,16 +1989,75 @@ impl World {
         }
 
         // player-controlled launch + any tumbling spent booster
-        if let Some(rk) = self.launch.as_mut() {
+        let frozen = self.reentry_test;
+        let test_heat = (self.test_friction * 1.4) as f64; // slider -> glow level
+        if self.sim_thread_active() {
+            // Threaded: the dedicated physics thread owns and integrates the
+            // rocket on its own wall-clock. Forward the current control inputs,
+            // then adopt the latest authoritative snapshot as our render-side
+            // mirror - keeping the player-owned control fields so an input made
+            // this frame is not clobbered by a slightly older snapshot.
+            let sim = self.sim.as_ref().unwrap();
+            if let Some(rk) = self.launch.as_ref() {
+                sim.set_controls(self.launch_controls(rk));
+            }
+            if let Some(snap) = sim.try_snapshot() {
+                if let Some(old) = self.launch.as_ref() {
+                    let mut s = snap;
+                    s.throttle = old.throttle;
+                    s.pitch = old.pitch;
+                    s.yaw = old.yaw;
+                    s.roll = old.roll;
+                    s.attitude_hold = old.attitude_hold;
+                    s.auto_land = old.auto_land;
+                    s.chute_armed = old.chute_armed;
+                    self.launch = Some(s);
+                }
+                // launch == None means we just reset; ignore stale snapshots.
+            }
+        } else if let Some(rk) = self.launch.as_mut() {
+            // Inline (tests / headless / wasm): integrate synchronously so these
+            // paths stay deterministic.
             rk.just_staged = None;
-            let dt = (frame_dt * self.warp).min(2.0);
-            rk.integrate(&self.body, dt as f64);
+            if frozen {
+                // Frozen plasma test: hold the vehicle in place so the FX play
+                // continuously and you can orbit / re-aim it. Skip integration
+                // entirely (no motion, no damage, never breaks up); attitude tracks
+                // the command (W/S/A/D/Q/E), and the friction slider drives the heat
+                // glow so you can sweep the re-entry FX from cold to white-hot.
+                rk.place_attitude();
+                rk.health = 100.0;
+                rk.destroyed = false;
+                rk.crashed = false;
+                rk.heat = test_heat;
+            } else {
+                let dt = (frame_dt * self.warp).min(2.0);
+                rk.integrate(&self.body, dt as f64);
+            }
+        }
+        // drive the car / walk the character (real time, independent of warp).
+        self.advance_car(frame_dt);
+        self.advance_ped(frame_dt);
+        // city life: each city's crowd spawns/sims when the player is near it and
+        // despawns when far. When driving, hand the NPCs the player's car so they
+        // brake for it.
+        let pp = self.player_pos();
+        let pc = if self.driving { Some(self.car_pos) } else { None };
+        for t in self.traffic.iter_mut() {
+            t.update(pp, pc, frame_dt);
+        }
+
+        // break-up: a destroyed vehicle (burn-through or crash) explodes once.
+        if self.launch.as_ref().map(|rk| rk.destroyed).unwrap_or(false) && !self.exploded {
+            self.spawn_explosion();
         }
         self.capture_orbit_if_reached();
         let fx_dt = (frame_dt * self.warp).min(0.5);
         self.anim += fx_dt;
         self.advance_sep(frame_dt * self.warp.min(8.0));
+        self.advance_debris(frame_dt * self.warp.min(8.0));
         self.advance_smoke(fx_dt);
+        self.advance_sparks(fx_dt);
 
         // Keep the planet terrain in sync with the floating-origin reference.
         if self.view == View::Rocket {
@@ -1017,6 +2074,7 @@ impl World {
                     self.ref_local = eye;
                     self.rebuild_terrain();
                     self.terrain_dirty = true;
+                    self.static_dirty = true; // origin moved: rebuild static scenery
                 }
             }
 
@@ -1048,10 +2106,19 @@ impl World {
         // split_factor` across, so that is the finest patch edge near the
         // rocket. Make the rebuild threshold (the grid cell) ~half of it: lower
         // LODs (higher up) therefore get proportionally larger thresholds, and
-        // we never rebuild for sub-patch motion. `SPLIT_FACTOR` must match the
-        // value `planet_terrain` passes to `select()`.
-        const SPLIT_FACTOR: f64 = 1.5;
-        let raw = (0.5 * alt / SPLIT_FACTOR).clamp(TERRAIN_GRID_MIN_M, TERRAIN_GRID_MAX_M);
+        // we never rebuild for sub-patch motion.
+        let base = 0.5 * alt / rocket::PLANET_SPLIT_FACTOR;
+        // Above ~50 km the ground reads as a smooth globe (no fine relief is
+        // resolvable), so we transition to a stable coarse cube-sphere LOD
+        // planet: widen the rebuild cell super-linearly with altitude so the
+        // upper terrain re-meshes only at large steps instead of churning every
+        // kilometre of downrange travel. This is the "annoying rebuild" fix.
+        let raw = if alt > HIGH_ALT_STABLE_M {
+            base * (alt / HIGH_ALT_STABLE_M)
+        } else {
+            base
+        };
+        let raw = raw.clamp(TERRAIN_GRID_MIN_M, TERRAIN_GRID_MAX_M);
         // Snap the cell size itself to a power of two so it only steps at
         // altitude octaves instead of drifting continuously with altitude.
         let grid = (raw.log2().floor()).exp2();
@@ -1073,6 +2140,7 @@ impl World {
             self.ref_local = anchor;
             self.rebuild_terrain();
             self.terrain_dirty = true;
+            self.static_dirty = true; // origin moved: rebuild static scenery
         } else if anchor != self.ref_local && !self.terrain_svc.busy() {
             self.terrain_svc.request(terrain_job::PlanetJob {
                 cam_world: self.cam_world(anchor),
@@ -1083,6 +2151,7 @@ impl World {
                 north: self.launch_north,
                 depth: 19,
                 lunar: self.lunar,
+                lod_debug: self.lod_debug,
             });
         }
 
@@ -1093,6 +2162,7 @@ impl World {
             self.terrain_count = (res.verts.len() as u64).min(TERRAIN_CAP) as u32;
             self.terrain_verts = res.verts;
             self.terrain_dirty = true; // upload pending
+            self.static_dirty = true; // origin moved: rebuild static scenery
         }
     }
 
@@ -1111,6 +2181,46 @@ impl World {
             + self.launch_east * local.x
             + self.launch_up * local.y
             + self.launch_north * local.z
+    }
+
+    /// Local-frame height (metres) of the visible ground at horizontal local
+    /// position (x, z) - the same surface the terrain mesh draws, so the car and
+    /// pedestrian sit on it instead of the flat tangent plane. In the flattened
+    /// launch/city zone this is ~0; out on the hills it follows the terrain.
+    fn local_ground_height(&self, x: f64, z: f64) -> f64 {
+        let p = self.cam_world(DVec3::new(x, 0.0, z));
+        let dir = p.normalize();
+        let g = dir * (self.body.radius + self.terrain_elev.land_height_m(dir));
+        (g - self.launch_origin).dot(self.launch_up)
+    }
+
+    /// Whether local (x, z) is on pavement (a city's built-up footprint or near a
+    /// road), where the car rolls faster with less friction than on open ground.
+    fn on_pavement(&self, x: f64, z: f64) -> bool {
+        let p = Vec3::new(x as f32, 0.0, z as f32);
+        // inside any city footprint (built-up radius around its centre)
+        for &(center, _) in &self.city_footprints {
+            let dx = (center.x - p.x) as f64;
+            let dz = (center.z - p.z) as f64;
+            // city half-extent (~210 m for a 7x7 grid) plus a margin
+            if dx * dx + dz * dz < 260.0 * 260.0 {
+                return true;
+            }
+        }
+        // near a road segment of the network (point-to-segment distance)
+        for (a, b, _) in &self.roads {
+            let (ax, az, bx, bz) = (a.x as f64, a.z as f64, b.x as f64, b.z as f64);
+            let (px, pz) = (x, z);
+            let (dx, dz) = (bx - ax, bz - az);
+            let len2 = dx * dx + dz * dz;
+            let t = if len2 > 1.0 { (((px - ax) * dx + (pz - az) * dz) / len2).clamp(0.0, 1.0) } else { 0.0 };
+            let (cx, cz) = (ax + t * dx, az + t * dz);
+            let (ex, ez) = (px - cx, pz - cz);
+            if ex * ex + ez * ez < 12.0 * 12.0 {
+                return true;
+            }
+        }
+        false
     }
     /// `world - ref_local` collapsed to f32 (the floating-origin upload form).
     fn rel(&self, local: DVec3) -> Vec3 {
@@ -1159,6 +2269,14 @@ impl World {
 
     /// The point the rocket-view camera looks at (launch-tangent metres, f64).
     fn camera_look_local(&self) -> DVec3 {
+        // Driving / on foot: frame the car or the character (the camera orbits
+        // and zooms around it as usual).
+        if self.driving {
+            return self.car_pos + DVec3::new(0.0, 1.4, 0.0);
+        }
+        if self.walking {
+            return self.ped_pos + DVec3::new(0.0, 1.5, 0.0);
+        }
         let target = self.cam_target_local();
         match self.launch.as_ref() {
             Some(rk) => {
@@ -1279,12 +2397,276 @@ impl World {
         }
     }
 
+    /// Skip the crawler animation and jump straight to the pad, ready to launch.
+    fn skip_rollout(&mut self) {
+        self.rollout = 1.0;
+        self.rolling_out = false;
+        self.vab_mode = false;
+    }
+
+    /// Speed up (or slow down) the crawler while it rolls out to the pad.
+    /// Doubles/halves the rate, clamped to 1x..64x (64x turns the ~64 s creep
+    /// into about a second). The chosen pace persists to the next roll-out.
+    fn bump_rollout_speed(&mut self, faster: bool) {
+        self.rollout_speed = if faster {
+            (self.rollout_speed * 2.0).min(64.0)
+        } else {
+            (self.rollout_speed * 0.5).max(1.0)
+        };
+    }
+
     /// Send the rocket back into the assembly building (between missions).
     fn back_to_vab(&mut self) {
         self.reset_launch();
         self.vab_mode = true;
         self.rolling_out = false;
         self.rollout = 0.0;
+    }
+
+    /// Hop in the car and start driving (rocket view). Parks it just east of the
+    /// pad on the access road, pointing toward the city, with the camera trailing.
+    fn enter_drive(&mut self) {
+        self.view = View::Rocket;
+        self.reset_launch();
+        self.vab_mode = false;
+        self.show_lander = false;
+        self.car_pos = DVec3::new(40.0, 0.0, 0.0);
+        let to_city = CITY_CENTER.as_dvec3() - self.car_pos;
+        self.car_yaw = (to_city.z as f32).atan2(to_city.x as f32); // face the city
+        self.start_driving();
+    }
+
+    /// Begin driving the car wherever it currently sits (used both by the direct
+    /// "Drive car" entry and by getting in on foot), with the camera trailing.
+    fn start_driving(&mut self) {
+        self.car_speed = 0.0;
+        self.drive_in = [false; 4];
+        self.driving = true;
+        self.walking = false;
+        self.rocket_az = self.car_yaw + std::f32::consts::PI;
+        self.rocket_el = 0.22;
+        self.rocket_dist = 18.0;
+    }
+
+    /// Park the car and leave drive mode.
+    fn exit_drive(&mut self) {
+        self.driving = false;
+        self.car_speed = 0.0;
+        self.drive_in = [false; 4];
+    }
+
+    /// Get out on foot beside the car: switch from driving to walking, dropping
+    /// the character next to the driver's door.
+    fn get_out_car(&mut self) {
+        self.driving = false;
+        self.car_speed = 0.0;
+        self.drive_in = [false; 4];
+        // step out to the left of the car's heading.
+        let side = DVec3::new(-(self.car_yaw.sin() as f64), 0.0, self.car_yaw.cos() as f64);
+        self.ped_pos = self.car_pos + side * 3.0;
+        self.ped_pos.y = 0.0;
+        self.ped_yaw = self.car_yaw;
+        self.start_walking();
+    }
+
+    /// Set out on foot from the launch complex: spawn the character by the parked
+    /// car so it's easy to find and get into.
+    fn enter_walk(&mut self) {
+        self.view = View::Rocket;
+        self.reset_launch();
+        self.vab_mode = false;
+        self.show_lander = false;
+        // park the car near the pad and stand the character beside it.
+        self.car_pos = DVec3::new(34.0, 0.0, 0.0);
+        let to_city = CITY_CENTER.as_dvec3() - self.car_pos;
+        self.car_yaw = (to_city.z as f32).atan2(to_city.x as f32);
+        self.ped_pos = DVec3::new(30.0, 0.0, 4.0);
+        self.ped_yaw = self.car_yaw;
+        self.start_walking();
+    }
+
+    fn start_walking(&mut self) {
+        self.walking = true;
+        self.driving = false;
+        self.ped_speed = 0.0;
+        self.walk_in = [false; 4];
+        self.rocket_az = self.ped_yaw + std::f32::consts::PI;
+        self.rocket_el = 0.20;
+        self.rocket_dist = 7.0;
+    }
+
+    /// Stop walking and return to the standard launch-complex view.
+    fn exit_walk(&mut self) {
+        self.walking = false;
+        self.ped_speed = 0.0;
+        self.walk_in = [false; 4];
+    }
+
+    /// The player's current position in local metres (for proximity systems like
+    /// city traffic). Far from the city unless the player is on foot or driving.
+    fn player_pos(&self) -> DVec3 {
+        if self.driving {
+            self.car_pos
+        } else if self.walking {
+            self.ped_pos
+        } else {
+            DVec3::ZERO // at the pad, ~2.5 km from the city: traffic stays asleep
+        }
+    }
+
+    /// Whether the character is standing close enough to the car to get in.
+    fn near_car(&self) -> bool {
+        let d = self.ped_pos - self.car_pos;
+        (d.x * d.x + d.z * d.z) < 5.0 * 5.0
+    }
+
+    /// Get into the car from on foot (only when standing next to it): keeps the
+    /// car where it is and starts driving.
+    fn get_in_car(&mut self) {
+        if self.near_car() {
+            self.start_driving();
+        }
+    }
+
+    /// Walking dynamics: held WASD move the character (forward/back along its
+    /// facing, A/D turn), with a quick ramp and a walk-cycle phase that advances
+    /// with distance travelled. Real time (independent of warp).
+    fn advance_ped(&mut self, dt: f32) {
+        if !self.walking || dt <= 0.0 {
+            return;
+        }
+        let walk_speed = 4.2; // m/s
+        let target = ((self.walk_in[0] as i32 - self.walk_in[1] as i32) as f32) * walk_speed;
+        // brisk accel/decel toward the target speed.
+        let k = (1.0 - (-dt / 0.12).exp()).clamp(0.0, 1.0);
+        self.ped_speed += (target - self.ped_speed) * k;
+        let turn = (self.walk_in[3] as i32 - self.walk_in[2] as i32) as f32;
+        self.ped_yaw += turn * 2.4 * dt;
+        let heading = DVec3::new(self.ped_yaw.cos() as f64, 0.0, self.ped_yaw.sin() as f64);
+        self.ped_pos += heading * (self.ped_speed * dt) as f64;
+        self.ped_pos.y = self.local_ground_height(self.ped_pos.x, self.ped_pos.z);
+        // advance the stride with distance so the gait matches the pace.
+        self.walk_phase += self.ped_speed.abs() * 1.7 * dt;
+        if self.walk_phase > std::f32::consts::TAU {
+            self.walk_phase -= std::f32::consts::TAU;
+        }
+    }
+
+    /// Arcade car dynamics: held WASD give throttle/reverse + steering, with
+    /// rolling friction and a top speed. Runs in real time (independent of warp).
+    fn advance_car(&mut self, dt: f32) {
+        if !self.driving || dt <= 0.0 {
+            return;
+        }
+        // Tarmac rolls fast with little rolling resistance; open ground (grass)
+        // is slower and draggier.
+        let paved = self.on_pavement(self.car_pos.x, self.car_pos.z);
+        let accel = if paved { 22.0 } else { 14.0 }; // m/s^2 under power
+        let max_fwd = if paved { 95.0 } else { 42.0 };
+        let max_rev = 24.0;
+        let roll = if paved { 8.0 } else { 22.0 }; // rolling friction
+        let mut a = 0.0;
+        if self.drive_in[0] {
+            a += accel;
+        }
+        if self.drive_in[1] {
+            a -= accel;
+        }
+        // steering: turn rate scales with speed and flips when reversing.
+        // A steers left, D steers right (drive_in[2]=A, [3]=D).
+        let steer = (self.drive_in[3] as i32 - self.drive_in[2] as i32) as f32;
+        let speed_frac = (self.car_speed / 22.0).clamp(-1.0, 1.0);
+        self.car_yaw += steer * 1.7 * speed_frac * dt;
+        // engine, then rolling friction always opposing motion.
+        self.car_speed += a * dt;
+        let f = roll * dt;
+        self.car_speed -= self.car_speed.clamp(-f, f) * if a == 0.0 { 1.0 } else { 0.25 };
+        self.car_speed = self.car_speed.clamp(-max_rev, max_fwd);
+        let heading = DVec3::new(self.car_yaw.cos() as f64, 0.0, self.car_yaw.sin() as f64);
+        let mut next = self.car_pos + heading * (self.car_speed * dt) as f64;
+        // stop at building walls instead of driving through them.
+        if self.car_blocked(next) {
+            next = self.car_pos;
+            self.car_speed *= 0.2;
+        }
+        self.car_pos = next;
+        // ride on the ground (terrain / road), not the flat tangent plane.
+        self.car_pos.y = self.local_ground_height(self.car_pos.x, self.car_pos.z);
+    }
+
+    /// Whether a car centred at local `p` would sit inside a building footprint
+    /// (simple circle-vs-rectangle test against the near city's buildings, with a
+    /// small car radius), so the car can be stopped at walls.
+    fn car_blocked(&self, p: DVec3) -> bool {
+        let car_r = 2.2f32;
+        let (px, pz) = (p.x as f32, p.z as f32);
+        for (center, layout) in &self.city_layouts {
+            // only test the city the car is actually in (cheap reject)
+            if (center.x - px).powi(2) + (center.z - pz).powi(2) > 320.0 * 320.0 {
+                continue;
+            }
+            for b in &layout.buildings {
+                let bx = center.x + b.cx;
+                let bz = center.z + b.cz;
+                if (px - bx).abs() < b.fw + car_r && (pz - bz).abs() < b.fd + car_r {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Third-person camera collision: march from the look target `tgt` out
+    /// toward the desired eye along `dir`, and return how far the camera may sit
+    /// (<= `max_dist`) before it would pass through terrain or a building. The
+    /// camera keeps the full desired zoom when the path is clear and only pulls
+    /// in when something is in the way, then springs back out as it clears - the
+    /// usual 3rd-person "collide the boom" behaviour.
+    fn camera_boom_dist(&self, tgt: DVec3, dir: DVec3, max_dist: f64) -> f64 {
+        let skin = 0.45; // pull in a touch so the near plane never grazes a face
+        let min_dist = 0.6; // never glue the eye onto the target
+        let mut hit = max_dist;
+
+        // Terrain: walk samples along the boom and stop at the first one whose
+        // eye candidate would dip to/under the visible ground at that (x, z).
+        let steps = 28;
+        let step = max_dist / steps as f64;
+        for i in 1..=steps {
+            let t = step * i as f64;
+            let p = tgt + dir * t;
+            if p.y < self.local_ground_height(p.x, p.z) + skin {
+                hit = hit.min((t - step).max(min_dist));
+                break;
+            }
+        }
+
+        // Buildings: ray vs each nearby building box (footprint + height). Only
+        // at gameplay follow distances (driving / on foot) - a far overview or
+        // fly-over camera should sail over the rooftops, not snap to a tower.
+        let test_buildings = (self.driving || self.walking) && max_dist < 90.0;
+        for (center, layout) in self.city_layouts.iter().filter(|_| test_buildings) {
+            let cdx = center.x as f64 - tgt.x;
+            let cdz = center.z as f64 - tgt.z;
+            let reach = max_dist + 320.0;
+            if cdx * cdx + cdz * cdz > reach * reach {
+                continue; // city too far to be on the boom
+            }
+            let base = self.local_ground_height(center.x as f64, center.z as f64);
+            for b in &layout.buildings {
+                let bx = (center.x + b.cx) as f64;
+                let bz = (center.z + b.cz) as f64;
+                let hw = (b.fw + 0.3) as f64;
+                let hd = (b.fd + 0.3) as f64;
+                let lo = DVec3::new(bx - hw, base, bz - hd);
+                let hi = DVec3::new(bx + hw, base + b.height as f64, bz + hd);
+                if let Some(t) = ray_box(tgt, dir, lo, hi) {
+                    if t < hit {
+                        hit = (t - skin).max(min_dist);
+                    }
+                }
+            }
+        }
+        hit.clamp(min_dist, max_dist)
     }
 
     /// Camera eye in launch-tangent metres (f64).
@@ -1295,8 +2677,9 @@ impl World {
             self.rocket_el.sin() as f64,
             (self.rocket_el.cos() * self.rocket_az.sin()) as f64,
         );
-        let mut eye = tgt + dir * self.rocket_dist as f64;
-        // keep above the local ground plane
+        let dist = self.camera_boom_dist(tgt, dir, self.rocket_dist as f64);
+        let mut eye = tgt + dir * dist;
+        // Final safety net: never let the eye sit under the planet surface.
         let ground = self.cam_world(eye).length() - self.body.radius;
         if ground < 2.0 {
             eye.y += 2.0 - ground;
@@ -1331,7 +2714,10 @@ impl World {
         // air density fraction: lots of smoke low down, little in the thin upper
         // atmosphere, none in vacuum (the flame remains regardless).
         let dens = (-(alt / 9000.0)).exp().clamp(0.0, 1.0) as f32;
-        let on_pad = alt < 30.0;
+        // Height above the launch site (the pad sits on terrain well above the
+        // body's reference radius, so absolute altitude is the wrong gauge here).
+        let agl = (rk.r.length() - self.launch_origin.length()) as f32;
+        let on_pad = agl < 30.0;
         let base = self.to_local(rk.r);
         let down = -self.dir_to_local(rk.point_dir()); // exhaust direction
         // emit from the ACTIVE stage's nozzle (up the mesh by nozzle_y)
@@ -1340,8 +2726,17 @@ impl World {
         let nozzle = base + q * Vec3::new(0.0, ny - 1.2, 0.0);
         let er = self.rocket_body.engine_r.get(rk.stage_base).copied().unwrap_or(0.9);
 
+        // Ignition billow: the deflector throws an enormous ground cloud in the
+        // first seconds. `billow` is 1 at ignition and fades to 0 by ~6 s, scaling
+        // up the spawn rate, particle size, spread and lifetime so liftoff kicks
+        // off a big mushrooming cloud that then settles into the normal trail.
+        let billow = if on_pad {
+            (1.0 - rk.met as f32 / 6.0).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         // spawn rate: heavy at the pad (the ground billow), thinning with density.
-        let rate = thrust_frac * (8.0 + 120.0 * dens) * if on_pad { 2.5 } else { 1.0 };
+        let rate = thrust_frac * (8.0 + 120.0 * dens) * if on_pad { 2.5 + 9.0 * billow } else { 1.0 };
         self.smoke_accum += rate * dt;
         let n = self.smoke_accum.floor() as i32;
         self.smoke_accum -= n as f32;
@@ -1351,18 +2746,23 @@ impl World {
             (seed >> 8) as f32 / (1u32 << 24) as f32
         };
         let ground = Vec3::new(base.x, rocket::PAD_TOP, base.z);
-        for _ in 0..n.min(40) {
+        for _ in 0..n.min(110) {
             let jit = Vec3::new(rnd() - 0.5, rnd() - 0.5, rnd() - 0.5);
             if on_pad {
-                // exhaust deflects off the pad: billow outward + up from the ground
+                // exhaust deflects off the pad: billow outward + up from the ground.
+                // During the ignition billow the cloud spreads much wider, bigger
+                // and lingers longer (the iconic mushroom at liftoff).
                 let a = rnd() * std::f32::consts::TAU;
-                let out = Vec3::new(a.cos(), 0.12, a.sin());
+                let out = Vec3::new(a.cos(), 0.10 + 0.10 * rnd(), a.sin());
+                let spread = 3.0 + 8.0 * billow;
                 self.smoke.push(Smoke {
-                    pos: ground + Vec3::new(jit.x, jit.y.abs() * 0.5, jit.z) * 3.0,
-                    vel: out * (9.0 + rnd() * 12.0) + Vec3::Y * (2.0 + rnd() * 3.0),
+                    pos: ground + Vec3::new(jit.x, jit.y.abs() * 0.5, jit.z) * spread,
+                    // billow gas rolls out slowly (dense cloud) rather than blasting
+                    // away; the big size + lifetime make it read as a launch plume.
+                    vel: out * (8.0 + rnd() * 8.0 + 8.0 * billow) + Vec3::Y * (2.0 + rnd() * 3.0 + 4.0 * billow),
                     age: 0.0,
-                    life: 2.4 + rnd() * 1.8,
-                    size0: 3.0 + rnd() * 2.5,
+                    life: 2.4 + rnd() * 1.8 + 3.0 * billow,
+                    size0: (2.5 + rnd() * 2.0) * (1.0 + 1.8 * billow),
                     seed: rnd(),
                 });
             } else {
@@ -1376,10 +2776,128 @@ impl World {
                 });
             }
         }
-        // keep the particle count bounded
-        if self.smoke.len() > 900 {
-            let drop = self.smoke.len() - 900;
+        // keep the particle count bounded (headroom for the big launch billow)
+        if self.smoke.len() > 1800 {
+            let drop = self.smoke.len() - 1800;
             self.smoke.drain(0..drop);
+        }
+    }
+
+    /// Emit + advect re-entry sparks: tiny bright embers shed off the windward
+    /// shock that streak downstream through the wake while the plasma is hot.
+    fn advance_sparks(&mut self, dt: f32) {
+        if dt <= 0.0 {
+            return;
+        }
+        // Carry the embers along with the vehicle: in real flight the rocket is
+        // travelling at km/s, so a spark must inherit that bulk velocity or it gets
+        // left light-years behind in a single frame. `s.vel` holds only the small
+        // velocity RELATIVE to the airframe (the downwind drift that forms the
+        // wake); the rocket's own velocity is added here. The frozen test pins the
+        // vehicle in place, so there is nothing to inherit there.
+        let carry = match self.launch.as_ref() {
+            Some(rk) if !self.reentry_test => self.dir_to_local_vec(rk.v),
+            _ => Vec3::ZERO,
+        };
+        for s in self.sparks.iter_mut() {
+            s.age += dt;
+            s.vel *= 1.0 - (0.6 * dt).min(0.5); // drag on the relative drift only
+            s.pos += (carry + s.vel) * dt;
+        }
+        self.sparks.retain(|s| s.age < s.life);
+
+        let heat = self.plasma_heat();
+        let Some(rk) = self.launch.as_ref() else {
+            self.sparks.clear();
+            return;
+        };
+        if rk.destroyed || heat < 0.18 {
+            return; // embers only once it's genuinely hot (after the glow fades in)
+        }
+
+        // Airflow + windward point in the local frame (same derivation as the
+        // plasma mesh): sparks are born on the windward face and stream downwind.
+        let base = self.to_local(rk.r);
+        let axis = self.dir_to_local(rk.point_dir());
+        let vdir = self.dir_to_local(rk.v.normalize_or_zero());
+        let flow = if vdir.length_squared() > 1e-6 {
+            let axis_signed = if vdir.dot(axis) < 0.0 { -axis } else { axis };
+            let aoa = vdir.dot(axis_signed).clamp(-1.0, 1.0).acos();
+            let t = ((aoa - 0.21) / (0.96 - 0.21)).clamp(0.0, 1.0);
+            let blend = t * t * (3.0 - 2.0 * t);
+            axis_signed.lerp(vdir, blend).normalize_or_zero()
+        } else {
+            axis
+        };
+        // Pose the hull prims into the local frame (q = the SAME body orientation
+        // the rocket is drawn with, incl. roll), so the spawn rotates with the
+        // airframe's pitch/yaw/roll - the embers come off the rocket, aligned to it.
+        let q = self.rocket_quat(rk);
+        let downwind = -flow; // sparks stream downstream into the wake
+        let mut prims: Vec<(Vec3, f32, Vec3, f32)> = Vec::new();
+        for (si, pr) in &self.rocket_body.sdf_stage {
+            if *si >= rk.stage_base {
+                prims.push((base + q * Vec3::from(pr.a), pr.r1, base + q * Vec3::from(pr.b), pr.r2));
+            }
+        }
+        for pr in &self.rocket_body.sdf_payload {
+            prims.push((base + q * Vec3::from(pr.a), pr.r1, base + q * Vec3::from(pr.b), pr.r2));
+        }
+        if prims.is_empty() {
+            return;
+        }
+
+        let rate = 130.0 * heat;
+        self.spark_accum += rate * dt;
+        let n = self.spark_accum.floor() as i32;
+        self.spark_accum -= n as f32;
+        let mut seed = (self.anim * 1597.0).to_bits() ^ 0x9e37_79b9;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32
+        };
+        for _ in 0..n.min(24) {
+            // Shed an ember off a hull prim's WINDWARD surface (the side facing the
+            // oncoming wind `vdir`): on the flank when the wind hits the side, or
+            // off the leading end when it hits end-on (axial). Spawning on the real
+            // hull means the embers track the rocket's orientation.
+            let (a, r1, b, r2) = prims[(rnd() * prims.len() as f32) as usize % prims.len()];
+            let axv = b - a;
+            let axn = axv / axv.length().max(1e-3);
+            let vperp = vdir - axn * vdir.dot(axn);
+            let flank = vperp.length() > 0.2;
+            let tt = if flank {
+                rnd()
+            } else if vdir.dot(axn) > 0.0 {
+                0.7 + 0.3 * rnd() // windward end = b
+            } else {
+                0.3 * rnd() // windward end = a
+            };
+            let rr = r1 + (r2 - r1) * tt;
+            let wdir = if flank {
+                Quat::from_axis_angle(axn, (rnd() - 0.5) * 2.4) * vperp.normalize_or_zero()
+            } else {
+                let e1raw = if axn.dot(Vec3::Y).abs() > 0.9 { Vec3::X } else { Vec3::Y };
+                let e1 = axn.cross(e1raw).normalize_or_zero();
+                let e2 = axn.cross(e1).normalize_or_zero();
+                let ang = rnd() * std::f32::consts::TAU;
+                e1 * ang.cos() + e2 * ang.sin()
+            };
+            let surf = a + axv * tt + wdir * rr;
+            let tang = axn.cross(wdir).normalize_or_zero();
+            self.sparks.push(Spark {
+                pos: surf,
+                vel: downwind * (50.0 + rnd() * 90.0)
+                    + wdir * (4.0 + rnd() * 8.0)
+                    + tang * ((rnd() - 0.5) * 18.0),
+                age: 0.0,
+                life: 0.45 + rnd() * 0.95,
+                seed: rnd(),
+            });
+        }
+        if self.sparks.len() > 700 {
+            let drop = self.sparks.len() - 700;
+            self.sparks.drain(0..drop);
         }
     }
 
@@ -1391,6 +2909,18 @@ impl World {
             d.dot(self.launch_up) as f32,
             d.dot(self.launch_north) as f32,
         )
+    }
+
+    /// Body->local orientation of the rocket (f32), including the commanded ROLL.
+    /// The nose direction (pitch + yaw) comes from `point_dir()` exactly as before;
+    /// the roll about the nose axis is applied on top, so a roll command shows up
+    /// without disturbing the proven nose orientation. (We can't convert `orient`
+    /// through the launch-tangent basis - that frame is left-handed, so the matrix
+    /// route produces a reflected, invalid quaternion: the bug that flung the
+    /// rocket under the pad.)
+    fn rocket_quat(&self, rk: &launch::Rocket) -> Quat {
+        let nose = self.dir_to_local(rk.point_dir());
+        Quat::from_rotation_arc(Vec3::Y, nose) * Quat::from_rotation_y(rk.roll as f32)
     }
 
     /// World->local direction (no translation).
@@ -1406,7 +2936,18 @@ impl World {
     /// Rebuild the rocket-view geometry from the current VAB design (call after
     /// the player edits the build).
     fn rebuild_vehicle(&mut self) {
-        self.rocket_body = rocket::rocket_body(&self.vab.to_vehicle(), self.vab.payload().color, self.vab.payload().module);
+        let boosters: Vec<rocket::BoosterViz> = (0..self.vab.stages.len())
+            .map(|i| {
+                let (b, n) = self.vab.booster(i);
+                rocket::BoosterViz { count: n, prop: b.prop as f32, solid: b.solid }
+            })
+            .collect();
+        self.rocket_body = rocket::rocket_body(
+            &self.vab.to_vehicle(),
+            self.vab.payload().color,
+            self.vab.payload().module,
+            &boosters,
+        );
         self.rocket_focus_y = self.rocket_body.focus_y;
     }
 
@@ -1423,14 +2964,25 @@ impl World {
         let v = DVec3::ZERO;
         let mut rk = launch::Rocket::on_pad(&veh, r, v, self.launch_up, self.launch_east);
         rk.throttle = 1.0;
+        // Hand the authoritative rocket to the dedicated physics thread (live
+        // game); the inline path keeps integrating `self.launch` directly.
+        if let Some(sim) = self.sim.as_ref() {
+            sim.start(&rk, self.body);
+            self.sim_drives_launch = true;
+        }
         self.launch = Some(rk);
         self.sep = None;
+        self.debris.clear();
+        self.boom.clear();
+        self.exploded = false;
         self.smoke.clear();
         self.mission_captured = false;
+        self.reentry_test = false; // a real ignition flies; only the test freezes
         // you launch from the pad: ensure we're rolled out.
         self.vab_mode = false;
         self.rolling_out = false;
         self.rollout = 1.0;
+        self.warp = 1.0; // launch in real time so the ascent reads at its true pace
         log::info!("Ignition: {} - throttle up, pitch over, stage when dry", veh.name);
     }
 
@@ -1454,13 +3006,30 @@ impl World {
         let pd_local = self.dir_to_local(pd);
         let rot = Quat::from_rotation_arc(Vec3::Y, pd_local);
         let vel_local = self.dir_to_local_vec(v);
-        self.launch.as_mut().unwrap().jettison();
+        // True gravity at the separation point, in the local frame: magnitude
+        // mu/r^2 (so it is weak at altitude) pointing toward the planet centre.
+        let rmag = r.length().max(1.0);
+        let g_mag = (self.body.mu / (rmag * rmag)) as f32;
+        let grav = -self.dir_to_local_vec(r.normalize_or_zero()) * g_mag;
+        // A small, lateral nudge so the spent stage clears the climbing upper
+        // stage's nozzle instead of overlapping it.
+        let side = pd_local.cross(Vec3::Y).normalize_or_zero();
+        // Jettison on the authoritative side: the sim thread when it is flying
+        // the launch (the snapshot brings the staged state back), else inline.
+        if self.sim_thread_active() {
+            self.sim.as_ref().unwrap().stage();
+        } else {
+            self.launch.as_mut().unwrap().jettison();
+        }
         self.sep = Some(SepBooster {
             pos: base_local,
-            // a gentle retro push so it falls back below the climbing upper stage
-            vel: vel_local - pd_local * 12.0,
+            // Springs/retro-rockets give just a few m/s of separation: a soft
+            // retro push plus a touch of sideways drift so it floats clear and
+            // the upper stage thrusts away on its own.
+            vel: vel_local - pd_local * 3.0 + side * 1.2,
             rot,
-            spin: Vec3::new(0.7, 0.15, 1.1),
+            spin: Vec3::new(0.18, 0.05, 0.28), // slow, majestic tumble
+            grav,
             age: 0.0,
             range,
         });
@@ -1476,10 +3045,16 @@ impl World {
     }
 
     fn reset_launch(&mut self) {
+        self.detach_sim_launch();
         self.launch = None;
         self.sep = None;
+        self.debris.clear();
+        self.boom.clear();
+        self.exploded = false;
         self.smoke.clear();
+        self.sparks.clear();
         self.mission_captured = false;
+        self.reentry_test = false;
     }
 
     /// Whether the active launch has reached a stable parking orbit.
@@ -1557,7 +3132,7 @@ impl World {
         // local origin, refining as the camera (camera_eye_local) approaches.
         if let Some(elev) = self.ast_elev.as_ref() {
             let cam = self.camera_eye_local();
-            let m = rocket::asteroid_terrain(cam, self.ast_radius, elev, 15);
+            let m = rocket::asteroid_terrain(cam, self.ast_radius, elev, 15, self.lod_debug);
             self.terrain_count = (m.verts.len() as u64).min(TERRAIN_CAP) as u32;
             self.terrain_verts = m.verts;
             return;
@@ -1581,6 +3156,7 @@ impl World {
             self.launch_north,
             19,
             self.lunar,
+            self.lod_debug,
         );
         self.terrain_count = (m.verts.len() as u64).min(TERRAIN_CAP) as u32;
         self.terrain_verts = m.verts;
@@ -1605,8 +3181,17 @@ impl World {
     /// Per-frame dynamic rocket-view geometry, camera-relative (floating origin):
     /// the pad + mount, the rocket at its current pose, and any tumbling spent
     /// booster. The full planet terrain lives in its own (rebuilt-on-move) buffer.
-    fn build_dynamic_mesh(&self) -> Vec<rocket::MeshVertex> {
-        let rb = &self.rocket_body;
+    /// Static rocket-view scenery: the ground structures (access road, pad +
+    /// mount, assembly hangar, parts rack) and the city LOD set (full 3D buildings
+    /// within the build range, flat footprints out to the far range, plus the
+    /// night ground glow). None of it moves frame to frame, so it is rebuilt only
+    /// when the floating origin shifts or the visible LOD set changes (see
+    /// `static_mesh_sig` and `prepare`) rather than every frame - which is what
+    /// keeps a dense metro off the per-frame CPU/upload path. `eye` is the camera
+    /// eye in local metres, passed in so the camera boom is not recomputed here.
+    /// The asteroid / moon-base / lander preview modes return only their preview
+    /// mesh (the per-frame movers are skipped in those modes).
+    fn build_static_mesh(&self, eye: DVec3) -> Vec<rocket::MeshVertex> {
         let mut out: Vec<rocket::MeshVertex> = Vec::new();
 
         // Asteroid LOD body: the body itself is the terrain buffer; only draw the
@@ -1664,6 +3249,156 @@ impl World {
         push_static(&mut out, &self.hangar_mesh);
         push_static(&mut out, &self.rack_mesh);
 
+        // City level-of-detail, by camera-eye distance: full 3D buildings within
+        // the build range, flat block/road footprints beyond it (out to the far
+        // range), so the city still reads as blocks and roads from kilometres up
+        // or away. Keyed on the eye (not the look target) so it tracks where the
+        // camera actually is. Full 3D distance (includes altitude), squared, so a
+        // camera high above a city drops to the footprint LOD even when overhead.
+        let d2 = |p: Vec3| (p.as_dvec3() - eye).length_squared();
+        let build_r2 = CITY_BUILD_R * CITY_BUILD_R;
+        let foot_r2 = CITY_FOOT_R * CITY_FOOT_R;
+        for (center, mesh) in &self.city_meshes {
+            if d2(*center) < build_r2 {
+                push_static(&mut out, mesh);
+            }
+        }
+        // Warm ground lighting: only near (with the buildings) and only at night
+        // (its amber albedo would tint the day streets).
+        if self.night {
+            for (center, mesh) in &self.city_glow {
+                if d2(*center) < build_r2 {
+                    push_static(&mut out, mesh);
+                }
+            }
+        }
+        // Far footprints fill in past the build range.
+        for (center, mesh) in &self.city_footprints {
+            let dd = d2(*center);
+            if dd >= build_r2 && dd < foot_r2 {
+                push_static(&mut out, mesh);
+            }
+        }
+        // Road-network ribbons near the eye.
+        let near = |p: Vec3| d2(p) < foot_r2;
+        for (a, b, mesh) in &self.roads {
+            let mid = (*a + *b) * 0.5;
+            if near(*a) || near(*b) || near(mid) {
+                push_static(&mut out, mesh);
+            }
+        }
+
+        out
+    }
+
+    /// A cheap signature of the static-mesh selection: which cities are at which
+    /// LOD (full 3D / footprint), whether the night glow is on, and the active
+    /// preview mode. Recomputed each frame (just distance compares, no vertex
+    /// work) and compared against the last build so the heavy `build_static_mesh`
+    /// runs only when the selection actually changes. Does NOT fold in the
+    /// floating origin: a shift of `ref_local` is signalled separately via
+    /// `static_dirty` (same trigger as the terrain rebuild).
+    fn static_mesh_sig(&self, eye: DVec3) -> u64 {
+        use std::hash::Hasher;
+        // Preview modes each get a distinct constant (they ignore the city LOD).
+        if self.ast_elev.is_some() {
+            return 0xA57E_0000 ^ self.show_lander as u64;
+        }
+        if self.base_mesh.is_some() {
+            return 0xBA5E_0000 ^ self.show_lander as u64;
+        }
+        if self.show_lander {
+            return 0x1A9D_E500;
+        }
+        let d2 = |p: Vec3| (p.as_dvec3() - eye).length_squared();
+        let build_r2 = CITY_BUILD_R * CITY_BUILD_R;
+        let foot_r2 = CITY_FOOT_R * CITY_FOOT_R;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        h.write_u8(self.night as u8);
+        for (center, _) in &self.city_meshes {
+            h.write_u8((d2(*center) < build_r2) as u8);
+        }
+        for (center, _) in &self.city_footprints {
+            let dd = d2(*center);
+            h.write_u8((dd >= build_r2 && dd < foot_r2) as u8);
+        }
+        for (a, b, _) in &self.roads {
+            let mid = (*a + *b) * 0.5;
+            h.write_u8((d2(*a) < foot_r2 || d2(*b) < foot_r2 || d2(mid) < foot_r2) as u8);
+        }
+        h.finish()
+    }
+
+    /// Per-frame moving geometry for the rocket view: the player's car/character,
+    /// city traffic (NPC cars + pedestrians), the mobile launch platform, the
+    /// rocket stack (payload/fairing/parachute), explosion debris, the tumbling
+    /// spent stage, and the drag ghost. Static scenery (cities + ground
+    /// structures) lives in `build_static_mesh`; this returns empty in the
+    /// asteroid / moon-base / lander preview modes (they draw only the static
+    /// preview mesh).
+    fn build_dynamic_mesh(&self) -> Vec<rocket::MeshVertex> {
+        let rb = &self.rocket_body;
+        let mut out: Vec<rocket::MeshVertex> = Vec::new();
+        if self.ast_elev.is_some() || self.base_mesh.is_some() || self.show_lander {
+            return out;
+        }
+
+        // The player's car / character: rotate the local mesh by the heading about
+        // +Y and drop it at the player position.
+        {
+            let (s, c) = self.car_yaw.sin_cos();
+            for v in &self.car_mesh.verts {
+                let p = Vec3::from(v.pos);
+                let rp = Vec3::new(c * p.x - s * p.z, p.y, s * p.x + c * p.z);
+                let n = Vec3::from(v.normal);
+                let rn = Vec3::new(c * n.x - s * n.z, n.y, s * n.x + c * n.z);
+                let local = self.car_pos + rp.as_dvec3();
+                out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: rn.into(), color: v.color });
+            }
+        }
+        if self.walking {
+            let moving = (self.ped_speed.abs() / 1.5).clamp(0.0, 1.0);
+            let ped = rocket::character(self.walk_phase, moving, [0.20, 0.46, 0.78]);
+            let (s, c) = self.ped_yaw.sin_cos();
+            for v in &ped.verts {
+                let p = Vec3::from(v.pos);
+                let rp = Vec3::new(c * p.x - s * p.z, p.y, s * p.x + c * p.z);
+                let n = Vec3::from(v.normal);
+                let rn = Vec3::new(c * n.x - s * n.z, n.y, s * n.x + c * n.z);
+                let local = self.ped_pos + rp.as_dvec3();
+                out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: rn.into(), color: v.color });
+            }
+        }
+
+        // city traffic: NPC cars + pedestrians, for each active city crowd (the
+        // player is near it). A small helper poses a local mesh by a heading about
+        // +Y and drops it at a local position.
+        let mut posed = |out: &mut Vec<rocket::MeshVertex>, verts: &[rocket::MeshVertex], yaw: f32, at: DVec3| {
+            let (s, c) = yaw.sin_cos();
+            for v in verts {
+                let p = Vec3::from(v.pos);
+                let rp = Vec3::new(c * p.x - s * p.z, p.y, s * p.x + c * p.z);
+                let n = Vec3::from(v.normal);
+                let rn = Vec3::new(c * n.x - s * n.z, n.y, s * n.x + c * n.z);
+                let local = at + rp.as_dvec3();
+                out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: rn.into(), color: v.color });
+            }
+        };
+        for t in &self.traffic {
+            if !t.active {
+                continue;
+            }
+            let center = t.center();
+            for car in &t.cars {
+                let mesh = &t.car_meshes[car.color];
+                posed(&mut out, &mesh.verts, car.yaw(), car.pos(center));
+            }
+            for ped in &t.peds {
+                let mesh = rocket::character(ped.phase, 1.0, traffic::Traffic::ped_shirt(ped.shirt));
+                posed(&mut out, &mesh.verts, ped.yaw, ped.pos);
+            }
+        }
+
         // The mobile launch platform rides under the rocket from the hangar to
         // the pad. Drawn at the resting base (its X slides with rollout) only
         // while the rocket has not lifted off; once flying, it has left the deck.
@@ -1680,25 +3415,53 @@ impl World {
         let (base_local, quat, active) = match self.launch.as_ref() {
             Some(rk) => {
                 let base = self.to_local_d(rk.r);
-                let q = Quat::from_rotation_arc(Vec3::Y, self.dir_to_local(rk.point_dir()));
+                let q = self.rocket_quat(rk); // full attitude incl. roll
                 (base, q, rk.stage_base)
             }
             None => (self.resting_base_local(), Quat::IDENTITY, 0),
         };
 
-        // draw the payload. When the fairing is closed, the whole payload range
-        // (module + clamshell) draws as one. When opening, draw the module in
-        // place and swing the two fairing halves out along local +/-X.
-        if self.fairing_open > 0.01 {
-            let off = self.fairing_open * 4.0;
-            self.xform_into(&mut out, rb.module_range.clone(), quat, base_local);
-            self.xform_into_off(&mut out, rb.fairing_l.clone(), quat, base_local, Vec3::new(-off, 0.0, 0.0));
-            self.xform_into_off(&mut out, rb.fairing_r.clone(), quat, base_local, Vec3::new(off, 0.0, 0.0));
-        } else {
-            self.xform_into(&mut out, rb.payload_range.clone(), quat, base_local);
+        // A destroyed vehicle is drawn as scattered debris (see below) instead
+        // of the intact stack; while it's flying, draw the intact rocket.
+        let destroyed = self.launch.as_ref().map(|rk| rk.destroyed).unwrap_or(false);
+        if !destroyed {
+            // draw the payload. When the fairing is closed, the whole payload
+            // range draws as one; when opening, swing the two halves out.
+            if self.fairing_open > 0.01 {
+                let off = self.fairing_open * 4.0;
+                self.xform_into(&mut out, rb.module_range.clone(), quat, base_local);
+                self.xform_into_off(&mut out, rb.fairing_l.clone(), quat, base_local, Vec3::new(-off, 0.0, 0.0));
+                self.xform_into_off(&mut out, rb.fairing_r.clone(), quat, base_local, Vec3::new(off, 0.0, 0.0));
+            } else {
+                self.xform_into(&mut out, rb.payload_range.clone(), quat, base_local);
+            }
+            for r in rb.stage_ranges.iter().skip(active) {
+                self.xform_into(&mut out, r.clone(), quat, base_local);
+            }
+            // recovery parachute: a separate canopy mesh posed above the nose,
+            // inflating with the rocket's chute fraction.
+            if let Some(rk) = self.launch.as_ref() {
+                if rk.chute > 0.02 {
+                    let canopy = rocket::parachute_canopy(rb.height, rk.chute as f32);
+                    for v in &canopy.verts {
+                        let local = base_local + (quat * Vec3::from(v.pos)).as_dvec3();
+                        let n = quat * Vec3::from(v.normal);
+                        out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: n.into(), color: v.color });
+                    }
+                }
+            }
         }
-        for r in rb.stage_ranges.iter().skip(active) {
-            self.xform_into(&mut out, r.clone(), quat, base_local);
+
+        // explosion debris: each chunk at its own tumbling pose, charred dark.
+        for d in &self.debris {
+            for v in &rb.mesh.verts[d.range.clone()] {
+                let local = d.pos.as_dvec3() + (d.rot * Vec3::from(v.pos)).as_dvec3();
+                let n = d.rot * Vec3::from(v.normal);
+                // scorch the chunk: darken toward black as it ages
+                let s = (1.0 - 0.55 * (d.age / 16.0).clamp(0.0, 1.0)).max(0.2);
+                let c = [v.color[0] * s, v.color[1] * s, v.color[2] * s];
+                out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: n.into(), color: c });
+            }
         }
 
         // tumbling spent stage
@@ -1727,49 +3490,9 @@ impl World {
     /// particle trail (camera-facing puffs). `right`/`up` are the camera basis.
     fn build_fx(&self, eye: Vec3, right: Vec3, up: Vec3) -> Vec<FxVertex> {
         let mut out: Vec<FxVertex> = Vec::new();
-
-        // ---- exhaust flame at the active nozzle ----
-        if let Some(rk) = self.launch.as_ref() {
-            let tf = if rk.live_thrust() > 0.0 { rk.throttle as f32 } else { 0.0 };
-            if tf > 0.0 {
-                let booster = rk.stage_base == 0;
-                let down = -self.dir_to_local(rk.point_dir()); // flame opposes thrust
-                let er = self.rocket_body.engine_r.get(rk.stage_base).copied().unwrap_or(0.9)
-                    * 1.6;
-                // Anchor at the ACTIVE stage's engine: its nozzle sits up the mesh
-                // by `nozzle_y`, so after a stage drops the flame stays at the new
-                // active engine instead of the old base.
-                let q = Quat::from_rotation_arc(Vec3::Y, self.dir_to_local(rk.point_dir()));
-                let ny = self.rocket_body.nozzle_y.get(rk.stage_base).copied().unwrap_or(0.0);
-                let mount = self.to_local_d(rk.r) + (q * Vec3::new(0.0, ny - 1.2, 0.0)).as_dvec3();
-                let nozzle = self.rel(mount);
-                let len = (if booster { 17.0 } else { 10.5 }) * (0.55 + 0.45 * tf);
-                // axis billboard: width axis is perpendicular to the flame and to
-                // the view ray, so the card faces the camera.
-                let view = (nozzle - eye).normalize_or_zero();
-                let mut w_axis = down.cross(view).normalize_or_zero();
-                if w_axis.length_squared() < 1e-4 {
-                    w_axis = right;
-                }
-                let mut card = |length: f32, half_w: f32, seed: f32, inten: f32| {
-                    let tip = nozzle + down * length;
-                    let wn = w_axis * half_w;
-                    let wt = w_axis * (half_w * 0.22);
-                    let col = [seed, inten, 0.0, 0.0];
-                    let q = [
-                        (nozzle - wn, [0.0f32, 0.0]),
-                        (nozzle + wn, [1.0, 0.0]),
-                        (tip + wt, [1.0, 1.0]),
-                        (tip - wt, [0.0, 1.0]),
-                    ];
-                    for &i in &[0usize, 1, 2, 0, 2, 3] {
-                        out.push(FxVertex { pos: q[i].0.into(), uv: q[i].1, color: col, kind: 0.0 });
-                    }
-                };
-                card(len, er * 1.9, 0.10, tf); // wide orange body
-                card(len * 0.5, er * 1.0, 0.63, tf * 1.3); // white-hot core
-            }
-        }
+        // Re-entry plasma is a glow-mesh envelope (plasma_mesh.wgsl) and the
+        // engine exhaust plume is a volumetric pass (plume.wgsl). This builder
+        // emits only the smoke trail and the lander/RCS jets.
 
         // ---- lunar descent-engine plume (under the lander's bell) ----
         if self.show_lander && self.lander_firing {
@@ -1872,17 +3595,189 @@ impl World {
                 out.push(FxVertex { pos: q[i].0.into(), uv: q[i].1, color: col, kind: 1.0 });
             }
         }
+
+        // ---- explosion fireball particles (hot -> sooty, expanding) ----
+        for b in &self.boom {
+            let t = (b.age / b.life).clamp(0.0, 1.0);
+            // grow as it expands; fade out near end of life
+            let size = b.size0 * (0.6 + 1.9 * t);
+            let alpha = (1.0 - t).powf(0.7) * 0.9;
+            if alpha <= 0.01 {
+                continue;
+            }
+            // colour ramp: white-hot -> yellow -> orange -> dark smoke
+            let col = if t < 0.18 {
+                let k = t / 0.18;
+                [1.0, 0.95 - 0.1 * k, 0.7 - 0.4 * k]
+            } else if t < 0.5 {
+                let k = (t - 0.18) / 0.32;
+                [1.0, 0.6 - 0.35 * k, 0.18 - 0.12 * k]
+            } else {
+                let k = (t - 0.5) / 0.5;
+                let g = 0.32 - 0.24 * k;
+                [g + 0.06, g, g]
+            };
+            let r = right * size;
+            let u = up * size;
+            let c = self.rel(b.pos.as_dvec3());
+            let q = [
+                (c - r - u, [0.0f32, 0.0]),
+                (c + r - u, [1.0, 0.0]),
+                (c + r + u, [1.0, 1.0]),
+                (c - r + u, [0.0, 1.0]),
+            ];
+            // premultiplied-over smoke pipeline expects rgb*alpha in rgb.
+            let cm = [col[0] * alpha, col[1] * alpha, col[2] * alpha, alpha];
+            for &i in &[0usize, 1, 2, 0, 2, 3] {
+                out.push(FxVertex { pos: q[i].0.into(), uv: q[i].1, color: cm, kind: 1.0 });
+            }
+        }
+
+        // ---- re-entry sparks: bright additive embers shed off the shock ----
+        for s in &self.sparks {
+            let t = (s.age / s.life).clamp(0.0, 1.0);
+            let bright = (1.0 - t) * (s.age / 0.03).min(1.0); // quick birth, fade with age
+            if bright <= 0.02 {
+                continue;
+            }
+            let size = 0.6 * (0.5 + 0.5 * (1.0 - t));
+            let r = right * size;
+            let u = up * size;
+            let c = self.rel(s.pos.as_dvec3());
+            let col = [s.seed, bright, 0.0, 0.0];
+            let q = [
+                (c - r - u, [0.0f32, 0.0]),
+                (c + r - u, [1.0, 0.0]),
+                (c + r + u, [1.0, 1.0]),
+                (c - r + u, [0.0, 1.0]),
+            ];
+            for &i in &[0usize, 1, 2, 0, 2, 3] {
+                out.push(FxVertex { pos: q[i].0.into(), uv: q[i].1, color: col, kind: 4.0 });
+            }
+        }
         out
+    }
+
+    /// Break the destroyed vehicle into tumbling debris and spawn a fireball.
+    /// Each still-attached stage (and the payload) becomes a chunk flying out
+    /// from the centre of mass; a burst of hot particles forms the explosion.
+    fn spawn_explosion(&mut self) {
+        let Some(rk) = self.launch.as_ref() else { return };
+        let base = self.to_local(rk.r);
+        let pd_local = self.dir_to_local(rk.point_dir());
+        let rot = Quat::from_rotation_arc(Vec3::Y, pd_local);
+        let vel_local = self.dir_to_local_vec(rk.v);
+        let rmag = rk.r.length().max(1.0);
+        let g_mag = (self.body.mu / (rmag * rmag)) as f32;
+        let grav = -self.dir_to_local_vec(rk.r.normalize_or_zero()) * g_mag;
+        let stage_base = rk.stage_base;
+        // place the fireball where the camera is actually looking (up the stack),
+        // so the blast frames on-screen instead of sitting below centre.
+        let center_y = self.cam_focus_y.max(self.rocket_body.focus_y);
+
+        // deterministic-ish RNG seeded by the impact state
+        let mut seed = (rk.r.x.abs() * 13.0 + rk.met * 997.0).to_bits() ^ 0x9E3779B9;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32
+        };
+
+        // chunks: each remaining stage + the payload, kicked radially outward
+        let mut ranges: Vec<std::ops::Range<usize>> = self
+            .rocket_body
+            .stage_ranges
+            .iter()
+            .skip(stage_base)
+            .cloned()
+            .collect();
+        ranges.push(self.rocket_body.payload_range.clone());
+        self.debris.clear();
+        for range in ranges {
+            let kick = Vec3::new(rnd() - 0.5, rnd() - 0.5, rnd() - 0.5).normalize_or_zero()
+                * (8.0 + rnd() * 22.0);
+            let spin = Vec3::new(rnd() - 0.5, rnd() - 0.5, rnd() - 0.5) * 3.5;
+            self.debris.push(Debris {
+                pos: base,
+                vel: vel_local + kick,
+                rot,
+                spin,
+                grav,
+                age: 0.0,
+                range,
+            });
+        }
+
+        // fireball: a dense burst of hot particles from the centre of mass, with
+        // a few big slow cores for the heart of the blast and many fast embers.
+        let origin = base + pd_local * center_y;
+        self.boom.clear();
+        for k in 0..130 {
+            let dir = Vec3::new(rnd() - 0.5, rnd() - 0.5, rnd() - 0.5).normalize_or_zero();
+            let core = k < 30; // big, slow, central fire
+            let spd = if core { 2.0 + rnd() * 9.0 } else { 14.0 + rnd() * 52.0 };
+            let size0 = if core { 14.0 + rnd() * 14.0 } else { 5.0 + rnd() * 9.0 };
+            let life = if core { 2.6 + rnd() * 2.2 } else { 1.0 + rnd() * 2.0 };
+            self.boom.push(Boom {
+                pos: origin + dir * (rnd() * 6.0),
+                vel: vel_local * 0.35 + dir * spd,
+                age: 0.0,
+                life,
+                size0,
+                seed: rnd(),
+            });
+        }
+        self.exploded = true;
+    }
+
+    /// Integrate explosion debris chunks + fireball particles (local frame).
+    fn advance_debris(&mut self, dt: f32) {
+        for d in self.debris.iter_mut() {
+            d.age += dt;
+            d.vel += d.grav * dt;
+            d.pos += d.vel * dt;
+            d.rot = (Quat::from_scaled_axis(d.spin * dt) * d.rot).normalize();
+        }
+        self.debris.retain(|d| d.age < 16.0);
+        for b in self.boom.iter_mut() {
+            b.age += dt;
+            b.vel *= 1.0 - (1.6 * dt).min(0.9); // air-brake the blast
+            b.vel.y += 3.0 * dt; // hot gas rises
+            b.pos += b.vel * dt;
+        }
+        self.boom.retain(|b| b.age < b.life);
     }
 
     /// Integrate the jettisoned booster (local frame, ~9.2 m/s^2 down).
     fn advance_sep(&mut self, dt: f32) {
+        // Launch-frame basis (Copy) captured before the &mut borrow, so we can
+        // find the stage's altitude (hence air density) without borrowing self.
+        let radius = self.body.radius;
+        let (origin, east, up, north) =
+            (self.launch_origin, self.launch_east, self.launch_up, self.launch_north);
         if let Some(s) = self.sep.as_mut() {
             s.age += dt;
-            s.vel.y -= 9.2 * dt;
+            // air density at the stage's current altitude (sea level = 1, ~0 in
+            // space): a stage shed in vacuum coasts; one shed low brakes hard.
+            let world = origin
+                + east * s.pos.x as f64
+                + up * s.pos.y as f64
+                + north * s.pos.z as f64;
+            let alt = (world.length() - radius).max(0.0) as f32;
+            let rho = (-alt / 8500.0).exp();
+            // gravity (altitude-appropriate, captured at separation)
+            s.vel += s.grav * dt;
+            // atmospheric drag: F/m ~ rho * v^2 opposing motion, decelerating the
+            // stage toward a terminal velocity in dense air. Clamp the per-step
+            // impulse so a fast stage hitting thick air stays stable.
+            let speed = s.vel.length();
+            let drag_f = (0.0004 * rho * speed * dt).min(0.5);
+            s.vel -= s.vel * drag_f;
             s.pos += s.vel * dt;
-            s.rot = (Quat::from_scaled_axis(s.spin * dt) * s.rot).normalize();
-            if s.age > 9.0 {
+            // tumble: aerodynamic torque spins it faster the higher the dynamic
+            // pressure (rho*v^2); in vacuum it keeps its gentle hand-off spin.
+            let tumble = 1.0 + (rho * speed * speed * 1.0e-4).min(4.0);
+            s.rot = (Quat::from_scaled_axis(s.spin * tumble * dt) * s.rot).normalize();
+            if s.age > 25.0 {
                 self.sep = None;
             }
         }
@@ -1992,7 +3887,11 @@ impl World {
         polyline(&self.mission.pad_ring, [0.9, 0.6, 0.2], &mut out);
 
         if let Some(rk) = self.launch.as_ref() {
-            // the player launch's predicted conic (empty while still suborbital)
+            // The flown ascent path (cyan) so the live trajectory shows on the
+            // map during the sub-orbital climb, the forward conic prediction
+            // (amber) ahead of it, and the parking-orbit conic once bound.
+            polyline(&rk.trail_points(&self.body), [0.45, 0.9, 1.0], &mut out);
+            polyline(&rk.forward_arc(&self.body), [1.0, 0.62, 0.20], &mut out);
             let pred = rk.predicted_orbit(&self.body);
             polyline(&pred, [1.0, 0.7, 0.25], &mut out);
         } else if let Some(craft) = self.flight.as_ref() {
@@ -2144,15 +4043,27 @@ struct Gpu {
     mesh_bind_group: wgpu::BindGroup,
     /// Full-planet LOD terrain, rebuilt (camera-relative) when the camera moves.
     terrain_vbuf: wgpu::Buffer,
-    /// Dynamic rocket-view geometry (pad, rocket pose, spent booster), rebuilt
-    /// every frame.
+    /// Dynamic rocket-view geometry (the player car/character, NPC traffic, the
+    /// rocket pose + debris), rebuilt every frame. Small now that the city scenery
+    /// lives in `static_vbuf`.
     dyn_vbuf: wgpu::Buffer,
+    /// Static rocket-view scenery (the city LOD set + ground structures). Uploaded
+    /// once and rebuilt only when the floating origin shifts or the visible city
+    /// LOD set changes, so a dense metro never touches the per-frame upload path.
+    static_vbuf: wgpu::Buffer,
     /// Thruster FX billboards (flame + smoke particles).
     fx_pipeline: wgpu::RenderPipeline,
     fx_vbuf: wgpu::Buffer,
     sky_pipeline: wgpu::RenderPipeline,
     sky_uniform_buf: wgpu::Buffer,
     sky_bind_group: wgpu::BindGroup,
+    /// Re-entry plasma: the procedural glow-mesh envelope (depth-tested geometry).
+    plasma_mesh_pipeline: wgpu::RenderPipeline,
+    plasma_mesh_vbuf: wgpu::Buffer,
+    /// Volumetric exhaust plume (fullscreen raymarch, additive over the scene).
+    plume_pipeline: wgpu::RenderPipeline,
+    plume_uniform_buf: wgpu::Buffer,
+    plume_bind_group: wgpu::BindGroup,
 }
 
 impl Gpu {
@@ -2585,6 +4496,154 @@ impl Gpu {
             cache: None,
         });
 
+        // Plume pipeline: fullscreen volumetric exhaust, composited additively.
+        let plume_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("plume"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("plume.wgsl").into()),
+        });
+        let plume_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("plume-uniforms"),
+            size: std::mem::size_of::<PlumeUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let plume_bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("plume-bind-layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let plume_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("plume-bind-group"),
+            layout: &plume_bind_layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: plume_uniform_buf.as_entire_binding() }],
+        });
+        let plume_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("plume-layout"),
+            bind_group_layouts: &[Some(&plume_bind_layout)],
+            immediate_size: 0,
+        });
+        let plume_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("plume-pipeline"),
+            layout: Some(&plume_layout),
+            vertex: wgpu::VertexState {
+                module: &plume_shader,
+                entry_point: Some("vs"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &plume_shader,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    // additive: the emissive jet adds light to the scene.
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                // Occlude the plume behind closer geometry (the rocket body when it
+                // is between the camera and the exhaust). The shader writes the
+                // plume's near-surface depth; this tests it against the scene.
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        // PROTOTYPE: procedural glow-mesh plasma. Depth-tested geometry (so it
+        // occludes correctly), shaded with the same cooling ramp + turbulence.
+        // Reuses the mesh uniform (viewproj + log depth + time) and vertex layout.
+        let plasma_mesh_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("plasma-mesh"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("plasma_mesh.wgsl").into()),
+        });
+        let plasma_mesh_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("plasma-mesh-pipeline"),
+            layout: Some(&mesh_layout),
+            vertex: wgpu::VertexState {
+                module: &plasma_mesh_shader,
+                entry_point: Some("vs"),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<rocket::MeshVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 },
+                        wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 12, shader_location: 1 },
+                        wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 24, shader_location: 2 },
+                    ],
+                }],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &plasma_mesh_shader,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    // premultiplied-over: rgb already carries rgb*alpha.
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+            // Depth-test against the scene (so terrain/the vehicle occlude it), but
+            // do not write depth (it is translucent and self-overlapping).
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let plasma_mesh_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("plasma-mesh-vbuf"),
+            size: PLASMA_MESH_CAP * std::mem::size_of::<rocket::MeshVertex>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         // Full-planet terrain is a dynamic, camera-relative buffer rebuilt as the
         // camera moves (floating origin); the rocket/pad are in dyn_vbuf.
         let terrain_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -2596,6 +4655,12 @@ impl Gpu {
         let dyn_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("dyn-mesh-vbuf"),
             size: DYN_MESH_CAP * std::mem::size_of::<rocket::MeshVertex>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let static_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("static-mesh-vbuf"),
+            size: STATIC_MESH_CAP * std::mem::size_of::<rocket::MeshVertex>() as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -2613,11 +4678,17 @@ impl Gpu {
             mesh_bind_group,
             terrain_vbuf,
             dyn_vbuf,
+            static_vbuf,
             fx_pipeline,
             fx_vbuf,
             sky_pipeline,
             sky_uniform_buf,
             sky_bind_group,
+            plasma_mesh_pipeline,
+            plasma_mesh_vbuf,
+            plume_pipeline,
+            plume_uniform_buf,
+            plume_bind_group,
         }
     }
 
@@ -2630,10 +4701,12 @@ impl Gpu {
         w: u32,
         h: u32,
         time: f32,
-    ) -> (usize, usize, u32, u32) {
+    ) -> (usize, usize, u32, u32, bool, bool) {
         let res = [w as f32, h.max(1) as f32];
         let mut dyn_n = 0u32;
         let mut fx_n = 0u32;
+        let mut plasma_on = false;
+        let mut plume_on = false;
         match world.view {
             View::Map => {
                 let su = world.scene_uniforms(res, time);
@@ -2659,6 +4732,51 @@ impl Gpu {
                 queue.write_buffer(&self.mesh_uniform_buf, 0, bytemuck::bytes_of(&mu));
                 let sk = world.sky_uniforms(res);
                 queue.write_buffer(&self.sky_uniform_buf, 0, bytemuck::bytes_of(&sk));
+                // re-entry plasma: build the glow-mesh envelope once there is any
+                // meaningful heating. The mesh brightness then scales with the heat
+                // level (per-vertex), so the glow fades in low->high with friction
+                // instead of snapping on at a threshold.
+                world.plasma_mesh_n = 0;
+                if world.plasma_heat() > 0.04 {
+                    plasma_on = true;
+                    let mv = world.plasma_mesh();
+                    let mn = (mv.len() as u64).min(PLASMA_MESH_CAP) as u32;
+                    if mn > 0 {
+                        queue.write_buffer(
+                            &self.plasma_mesh_vbuf,
+                            0,
+                            bytemuck::cast_slice(&mv[..mn as usize]),
+                        );
+                    }
+                    world.plasma_mesh_n = mn;
+                }
+                // volumetric exhaust plume while the active engine is firing.
+                if world.plume_intensity() > 0.01 {
+                    let pu = world.plume_uniforms(res);
+                    queue.write_buffer(&self.plume_uniform_buf, 0, bytemuck::bytes_of(&pu));
+                    plume_on = true;
+                }
+                // Static scenery (cities + ground structures): rebuild + upload
+                // only when the floating origin shifts (static_dirty) or the
+                // visible city LOD selection changes (signature). Never per frame -
+                // rebuilding it every frame is what pegged the CPU/upload path on a
+                // dense metro (a whole city of buildings is ~1M verts / ~35 MB).
+                let eye = world.camera_eye_local();
+                let sig = world.static_mesh_sig(eye);
+                if world.static_dirty || sig != world.static_sig {
+                    let sv = world.build_static_mesh(eye);
+                    world.static_count = (sv.len() as u64).min(STATIC_MESH_CAP) as u32;
+                    if world.static_count > 0 {
+                        queue.write_buffer(
+                            &self.static_vbuf,
+                            0,
+                            bytemuck::cast_slice(&sv[..world.static_count as usize]),
+                        );
+                    }
+                    world.static_sig = sig;
+                    world.static_dirty = false;
+                }
+
                 let dyn_verts = world.build_dynamic_mesh();
                 dyn_n = (dyn_verts.len() as u64).min(DYN_MESH_CAP) as u32;
                 if dyn_n > 0 {
@@ -2688,7 +4806,7 @@ impl Gpu {
         if hn > 0 {
             queue.write_buffer(&self.hud_buf, 0, bytemuck::cast_slice(&hud_verts[..hn]));
         }
-        (n, hn, dyn_n, fx_n)
+        (n, hn, dyn_n, fx_n, plasma_on, plume_on)
     }
 
     /// Draw the thruster FX billboards (flame + smoke), in the mesh pass.
@@ -2727,12 +4845,16 @@ impl Gpu {
     }
 
     /// The 3D rocket/pad/terrain mesh (depth-tested). Used in its own pass.
-    fn draw_meshes(&self, pass: &mut wgpu::RenderPass, terrain_count: u32, dyn_count: u32) {
+    fn draw_meshes(&self, pass: &mut wgpu::RenderPass, terrain_count: u32, static_count: u32, dyn_count: u32) {
         pass.set_pipeline(&self.mesh_pipeline);
         pass.set_bind_group(0, &self.mesh_bind_group, &[]);
         if terrain_count > 0 {
             pass.set_vertex_buffer(0, self.terrain_vbuf.slice(..));
             pass.draw(0..terrain_count, 0..1);
+        }
+        if static_count > 0 {
+            pass.set_vertex_buffer(0, self.static_vbuf.slice(..));
+            pass.draw(0..static_count, 0..1);
         }
         if dyn_count > 0 {
             pass.set_vertex_buffer(0, self.dyn_vbuf.slice(..));
@@ -2745,6 +4867,25 @@ impl Gpu {
         pass.set_pipeline(&self.sky_pipeline);
         pass.set_bind_group(0, &self.sky_bind_group, &[]);
         pass.draw(0..3, 0..1);
+    }
+
+    /// Re-entry plasma: the procedural glow-mesh envelope (depth-tested geometry).
+    fn draw_plasma_mesh(&self, pass: &mut wgpu::RenderPass, count: u32) {
+        if count > 0 {
+            pass.set_pipeline(&self.plasma_mesh_pipeline);
+            pass.set_bind_group(0, &self.mesh_bind_group, &[]);
+            pass.set_vertex_buffer(0, self.plasma_mesh_vbuf.slice(..));
+            pass.draw(0..count, 0..1);
+        }
+    }
+
+    /// Volumetric exhaust plume, composited additively over the scene.
+    fn draw_plume(&self, pass: &mut wgpu::RenderPass, on: bool) {
+        if on {
+            pass.set_pipeline(&self.plume_pipeline);
+            pass.set_bind_group(0, &self.plume_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
     }
 }
 
@@ -2771,7 +4912,6 @@ fn push_filled_diamond(out: &mut Vec<OverlayVertex>, c: [f32; 2], hy: f32, aspec
         out.push(OverlayVertex { pos: p, color });
     }
 }
-
 
 fn render_pass<'a>(
     encoder: &'a mut wgpu::CommandEncoder,
@@ -2976,7 +5116,13 @@ impl State {
             config,
             depth_view,
             gpu,
-            world: World::new(),
+            world: {
+                // Live game: run the launch physics on its own dedicated thread,
+                // decoupled from the render frame rate.
+                let mut w = World::new();
+                w.enable_threaded_sim();
+                w
+            },
             start: instant_now::Instant::now(),
             last_t: 0.0,
             dragging: false,
@@ -3121,10 +5267,11 @@ impl State {
             self.fps_since = t;
         }
 
-        let (n, hn, dyn_n, fx_n) = self
+        let (n, hn, dyn_n, fx_n, plasma_on, plume_on) = self
             .gpu
             .prepare(&self.queue, &mut self.world, self.config.width, self.config.height, t);
         let terrain_n = self.world.terrain_count;
+        let static_n = self.world.static_count;
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
@@ -3166,11 +5313,13 @@ impl State {
         let (scene_tris, scene_draws) = if self.world.view == View::Rocket {
             let tris = 1 // sky fullscreen triangle
                 + terrain_n / 3
+                + static_n / 3
                 + dyn_n / 3
                 + fx_n / 3
                 + hn as u32 / 3;
             let draws = 1 // sky
                 + (terrain_n > 0) as u32
+                + (static_n > 0) as u32
                 + (dyn_n > 0) as u32
                 + (fx_n > 0) as u32
                 + (n > 0) as u32 // overlay (lines)
@@ -3195,10 +5344,17 @@ impl State {
             .update_buffers(&self.device, &self.queue, &mut encoder, &prims, &screen);
 
         if self.world.view == View::Rocket {
+            let plasma_mesh_n = self.world.plasma_mesh_n;
             {
                 let mut pass = mesh_pass(&mut encoder, &view, &self.depth_view);
                 self.gpu.draw_sky(&mut pass);
-                self.gpu.draw_meshes(&mut pass, terrain_n, dyn_n);
+                self.gpu.draw_meshes(&mut pass, terrain_n, static_n, dyn_n);
+                self.gpu.draw_plume(&mut pass, plume_on);
+                // re-entry plasma: depth-tested glow-mesh envelope, in the pass.
+                if plasma_on {
+                    self.gpu.draw_plasma_mesh(&mut pass, plasma_mesh_n);
+                }
+                // FX last, so additive sparks/embers sit on top of the plasma glow.
                 self.gpu.draw_fx(&mut pass, fx_n);
             }
             {
@@ -3257,6 +5413,97 @@ fn make_shot_device() -> (wgpu::Device, wgpu::Queue) {
         trace: wgpu::Trace::Off,
     }))
     .expect("device")
+}
+
+/// Measure the re-entry plasma cost on the real GPU. Loops the actual render
+/// passes K times in a single submit and blocks on the GPU (poll-wait), so wall
+/// time is dominated by GPU execution. Reports the isolated plasma pass and the
+/// whole rocket frame with plasma on vs off, so the plasma's share of the frame
+/// is a measured number rather than a guess.
+#[cfg(not(target_arch = "wasm32"))]
+fn bench_plasma(scenario: &str, width: u32, height: u32) {
+    use std::time::Instant;
+    let (device, queue) = make_shot_device();
+    let gpu = Gpu::new(&device, &queue, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let (mut world, time) = setup_world(scenario, width, height);
+    let (n, hn, dyn_n, fx_n, plasma_on, plume_on) =
+        gpu.prepare(&queue, &mut world, width, height, time);
+    if !plasma_on {
+        println!("plasma not active for scenario '{scenario}' - nothing to bench");
+        return;
+    }
+    let terrain_n = world.terrain_count;
+    let static_n = world.static_count;
+    let pmesh_n = world.plasma_mesh_n;
+    let tris = pmesh_n / 3;
+
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("bench-target"),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+    let depth = create_depth(&device, width, height);
+
+    // Encode the whole rocket-view frame (the same passes `render_shot` uses),
+    // optionally including the plasma glow-mesh draw.
+    let encode_frame = |enc: &mut wgpu::CommandEncoder, plasma: bool| {
+        {
+            let mut pass = mesh_pass(enc, &target_view, &depth);
+            gpu.draw_sky(&mut pass);
+            gpu.draw_meshes(&mut pass, terrain_n, static_n, dyn_n);
+            gpu.draw_plume(&mut pass, plume_on);
+            if plasma {
+                gpu.draw_plasma_mesh(&mut pass, pmesh_n);
+            }
+            gpu.draw_fx(&mut pass, fx_n);
+        }
+        {
+            let mut pass = overlay_pass(enc, &target_view);
+            gpu.draw_overlay(&mut pass, n, hn);
+        }
+    };
+
+    // Time `k` encodes (per repetition) of `encode`, GPU-synced; return best ms.
+    let time_k = |k: u32, reps: u32, encode: &dyn Fn(&mut wgpu::CommandEncoder)| -> f64 {
+        {
+            // warmup: shader compile, buffer upload, GPU clock ramp
+            let mut e = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            for _ in 0..32 {
+                encode(&mut e);
+            }
+            queue.submit([e.finish()]);
+            device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        }
+        let mut best = f64::INFINITY;
+        for _ in 0..reps {
+            let mut e = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            for _ in 0..k {
+                encode(&mut e);
+            }
+            let cb = e.finish();
+            let t0 = Instant::now();
+            queue.submit([cb]);
+            device.poll(wgpu::PollType::wait_indefinitely()).ok();
+            best = best.min(t0.elapsed().as_secs_f64() / k as f64 * 1000.0);
+        }
+        best
+    };
+
+    let frame_on = time_k(120, 6, &|e| encode_frame(e, true));
+    let frame_off = time_k(120, 6, &|e| encode_frame(e, false));
+
+    println!("re-entry plasma bench, scenario '{scenario}'");
+    println!("  {width}x{height}, glow-mesh envelope: {tris} triangles");
+    println!("  whole rocket frame, plasma ON:  {frame_on:.3} ms");
+    println!("  whole rocket frame, plasma OFF: {frame_off:.3} ms");
+    println!("  => plasma adds {:.3} ms to the frame", frame_on - frame_off);
 }
 
 /// Build the world + sun time for a named validation scenario.
@@ -3356,6 +5603,141 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
         w.sys_el = 0.32;
     };
     let time = match scenario {
+        "overlook" => {
+            // a high vantage west of the pad looking east over the coast to the
+            // ocean, to evaluate the landscape and water surface.
+            world.view = View::Rocket;
+            world.rocket_az = std::f32::consts::PI;
+            world.rocket_el = 0.16;
+            world.rocket_dist = 6000.0;
+            for _ in 0..40 {
+                world.advance(0.1);
+            }
+            0.0
+        }
+        "cities" => {
+            // an elevated look across the main metro: a dense cluster of downtowns
+            // packed into one big sprawl, linked by avenues.
+            world.view = View::Rocket;
+            world.enter_drive();
+            world.car_pos = CITY_CENTER.as_dvec3();
+            for _ in 0..20 {
+                world.advance(0.1);
+            }
+            world.rocket_az = 2.3;
+            world.rocket_el = 0.42;
+            world.rocket_dist = 1500.0;
+            0.0
+        }
+        "descent" => {
+            // mid descent: a closer pass over the night side, the city-light
+            // clusters filling more of the frame on the way down.
+            frame_map(&mut world);
+            world.sys_dist = 9.5;
+            world.sys_az = 4.3;
+            world.sys_el = 0.14;
+            6.0
+        }
+        "cityrise" => {
+            // Camera rising straight up over the metro, tilting down to keep it
+            // framed, for a ground-to-altitude ascent sequence. Height (km) and
+            // day/night come from env vars so one scenario drives the whole run.
+            world.view = View::Rocket;
+            let km: f64 = std::env::var("ASCENT_KM").ok().and_then(|s| s.parse().ok()).unwrap_or(2.0);
+            let night = std::env::var("ASCENT_NIGHT").ok().map(|s| s == "1").unwrap_or(false);
+            world.night = night;
+            world.enter_drive();
+            world.car_pos = CITY_CENTER.as_dvec3();
+            for _ in 0..30 {
+                world.advance(0.1); // settle terrain LOD + wake the crowd
+            }
+            // Fixed horizontal standoff; the camera climbs to height `h` and tilts
+            // down (elevation grows with height), focused on the city centre.
+            let h = km * 1000.0;
+            // ASCENT_L sets the horizontal standoff (default 2500 m); a large
+            // standoff + low height gives a low-angle oblique view, handy for
+            // seeing the flat footprint LOD edge-on.
+            let l: f64 = std::env::var("ASCENT_L").ok().and_then(|s| s.parse().ok()).unwrap_or(2500.0);
+            world.rocket_dist = (l * l + h * h).sqrt() as f32;
+            world.rocket_el = h.atan2(l) as f32;
+            world.rocket_az = std::f32::consts::FRAC_PI_2;
+            0.0
+        }
+        "nightcity" => {
+            // street level in the metro at night: the sky is dark and the
+            // emissive windows + traffic carry the scene.
+            world.view = View::Rocket;
+            world.night = true;
+            world.enter_drive();
+            // sit the car just south of downtown facing north into the lit city,
+            // so the camera trails it with the glowing skyline ahead.
+            world.car_pos = (CITY_CENTER + Vec3::new(0.0, 0.0, -250.0)).as_dvec3();
+            world.car_yaw = std::f32::consts::FRAC_PI_2; // face +Z (toward the city)
+            for _ in 0..45 {
+                world.advance(0.1);
+            }
+            world.car_yaw = std::f32::consts::FRAC_PI_2;
+            world.rocket_az = world.car_yaw + std::f32::consts::PI;
+            world.rocket_el = 0.16;
+            world.rocket_dist = 26.0;
+            0.0
+        }
+        "citylife" => {
+            // the city brought to life: drive in, step the sim so NPC cars and
+            // pedestrians spawn and disperse, then frame the street.
+            world.view = View::Rocket;
+            world.enter_drive();
+            // sit on a north-south street lane near the south edge, facing north up
+            // the avenue, with a slightly raised chase camera so the traffic on
+            // the street and at the cross-street intersections reads.
+            let lane_x = (CITY_CENTER.x - 210.0 + 3.0 * 60.0) as f64;
+            world.car_pos = DVec3::new(lane_x, 0.0, (CITY_CENTER.z - 175.0) as f64);
+            world.car_yaw = std::f32::consts::FRAC_PI_2;
+            for _ in 0..45 {
+                world.advance(0.1); // spawn + move the crowd a few seconds
+            }
+            world.car_yaw = std::f32::consts::FRAC_PI_2;
+            world.rocket_az = world.car_yaw + std::f32::consts::PI;
+            world.rocket_el = 0.30;
+            world.rocket_dist = 46.0;
+            0.0
+        }
+        "walk" => {
+            // the third-person character on foot by the car, mid-stride.
+            world.view = View::Rocket;
+            world.enter_walk();
+            world.ped_pos = DVec3::new(28.0, 0.0, 6.0);
+            world.ped_yaw = 0.5;
+            world.ped_speed = 3.5; // pose the walk cycle (idle would stand still)
+            world.walk_phase = std::env::var("WALK_PHASE").ok().and_then(|s| s.parse().ok()).unwrap_or(1.2);
+            // 3/4 front view so the face + swept fringe read against the back hair.
+            world.rocket_az = world.ped_yaw - 0.7;
+            world.rocket_el = 0.10;
+            world.rocket_dist = 5.5;
+            0.0
+        }
+        "drive" => {
+            // the car on the road just south of the city, third-person chase
+            // camera trailing it as it faces into the downtown grid.
+            world.view = View::Rocket;
+            world.enter_drive();
+            world.car_pos = (CITY_CENTER + Vec3::new(0.0, 0.0, -250.0)).as_dvec3();
+            world.car_yaw = std::f32::consts::FRAC_PI_2; // face +Z (toward the city)
+            world.rocket_az = world.car_yaw + std::f32::consts::PI;
+            world.rocket_el = 0.20;
+            world.rocket_dist = 26.0;
+            0.0
+        }
+        "cityview" => {
+            // a high overview framing the whole downtown
+            world.view = View::Rocket;
+            world.enter_drive();
+            world.car_pos = CITY_CENTER.as_dvec3();
+            world.rocket_az = 0.9;
+            world.rocket_el = 0.55;
+            world.rocket_dist = 620.0;
+            0.0
+        }
         "rocket" | "pad" => {
             // rolled out, standing on the pad
             world.view = View::Rocket;
@@ -3407,10 +5789,13 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             0.0
         }
         "rollout" => {
-            // mid roll-out: the rocket part-way between hangar and pad
+            // mid roll-out: the rocket part-way between hangar and pad, with the
+            // assembly panel showing roll-out progress + the crawler-speed control
             world.view = View::Rocket;
-            world.vab_mode = false;
+            world.vab_mode = true;
+            world.rolling_out = true;
             world.rollout = 0.84; // just clear of the building, nearing the pad
+            world.rollout_speed = 8.0; // fast-forwarded by the player
             world.rocket_az = 5.2;
             world.rocket_el = 0.16;
             world.rocket_dist = 120.0;
@@ -3419,11 +5804,11 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
         "liftoff" => {
             world.view = View::Rocket;
             world.rocket_az = 4.97;
-            world.rocket_el = 0.07;
-            world.rocket_dist = 60.0;
-            world.rocket_el = 0.12;
+            world.rocket_el = 0.20;
+            world.rocket_dist = 150.0;
+            world.rocket_focus_y = 28.0; // frame the rocket rising out of the cloud
             world.ignite_launch();
-            fly(&mut world, 1.4); // ignition: plume + billowing pad smoke
+            fly(&mut world, 2.8); // climbing out of the big ignition billow
             0.0
         }
         "liftoff2" => {
@@ -3435,6 +5820,34 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             fly(&mut world, 22.0); // pitched into the gravity turn, smoke trailing
             0.0
         }
+        "loddebug" => {
+            // On the pad with LOD-debug colouring on and the camera pulled back
+            // and up, so the cube-sphere quadtree split rings spread out from the
+            // launch site, one flat colour per depth. The floating origin is
+            // stable here (no in-flight rebuild), so the rings centre cleanly on
+            // the camera the way they do interactively.
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.rocket_az = 4.97;
+            world.rocket_el = 0.42;
+            world.rocket_dist = 4200.0;
+            world.lod_debug = true;
+            world.rebuild_terrain();
+            0.0
+        }
+        "loddebugmap" => {
+            // a launch shown on the orbital map, zoomed to the launch site: the
+            // cyan flown trail and the amber forward conic make the trajectory
+            // readable mid-ascent (before a parking orbit exists).
+            world.ignite_launch();
+            fly(&mut world, 150.0);
+            frame_map(&mut world);
+            world.sys_dist = 11.0;
+            world.sys_az = 4.7;
+            world.sys_el = 0.18;
+            6.0
+        }
         "staging" => {
             world.view = View::Rocket;
             world.rocket_az = 3.6;
@@ -3442,6 +5855,153 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.rocket_dist = 130.0;
             world.ignite_launch();
             fly_to_staging(&mut world); // spent booster tumbling away
+            0.0
+        }
+        "boosters" => {
+            // a core stage ringed with radial solid rocket boosters, on the pad.
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.vab.stages[0].boosters = 6;
+            world.vab.stages[0].booster = 1; // SRB-Heavy
+            world.rebuild_vehicle();
+            world.rocket_az = 4.6;
+            world.rocket_el = 0.14;
+            world.rocket_dist = 95.0;
+            0.0
+        }
+        "boosterlaunch" => {
+            // a boostered stack lifting off: core + 6 SRBs all firing.
+            world.view = View::Rocket;
+            world.vab.stages[0].boosters = 6;
+            world.vab.stages[0].booster = 1;
+            world.rebuild_vehicle();
+            world.rocket_az = 4.6;
+            world.rocket_el = 0.12;
+            world.rocket_dist = 120.0;
+            world.ignite_launch();
+            fly(&mut world, 4.0);
+            0.0
+        }
+        "crash" => {
+            // a structural failure mid-air: the vehicle bursts into tumbling
+            // debris + a fireball (same path a ground crash or burn-through takes).
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.rocket_az = 4.97;
+            world.rocket_el = 0.05;
+            world.rocket_dist = 30.0;
+            world.ignite_launch();
+            world.advance(0.05); // let the camera focus settle on the stack
+            if let Some(rk) = world.launch.as_mut() {
+                rk.health = 0.0; // force the break-up
+            }
+            for _ in 0..5 {
+                world.advance(0.1); // spawn + bloom the fireball (~0.5 s)
+            }
+            0.0
+        }
+        "reentry" => {
+            // a vehicle screaming back into the upper atmosphere: the reentry
+            // plasma bow shock + streaks at full heat (nose-first).
+            world.setup_reentry(0);
+            0.0
+        }
+        "plumetest" => {
+            // A firing rocket viewed from above the nose, so the BODY is between
+            // the camera and the exhaust: the plume must be occluded by the body,
+            // not drawn through it. Used to verify plume depth occlusion.
+            world.view = View::Rocket;
+            world.ignite_launch();
+            let (radius, up) = (world.body.radius, world.launch_up);
+            if let Some(rk) = world.launch.as_mut() {
+                rk.r = up * (radius + 20_000.0); // 20 km up, no ground in frame
+                rk.throttle = 1.0;
+                rk.spool = 1.0; // full thrust so the plume is lit
+            }
+            world.advance(0.05); // build the plume
+            world.rocket_az = 0.6;
+            world.rocket_el = 1.32; // look nearly straight DOWN the body's axis
+            world.rocket_dist = 30.0; // ...so the body covers the exhaust behind it
+            0.0
+        }
+        "reentry_lowheat" => {
+            // low friction: the FX should be a faint dull-red wisp (verifies the
+            // glow fades in low->high rather than snapping on).
+            world.setup_reentry(0);
+            if let Some(rk) = world.launch.as_mut() {
+                rk.heat = 0.22;
+            }
+            0.0
+        }
+        "reentry_midheat" => {
+            // mid friction: orange body building toward yellow, no white-hot yet.
+            world.setup_reentry(0);
+            if let Some(rk) = world.launch.as_mut() {
+                rk.heat = 0.55;
+            }
+            0.0
+        }
+        "reentry_boost" => {
+            // a heavily boostered stack (6 strap-ons => ~16 SDF prims) at full
+            // heat: the worst case for the plasma SDF cost, used by `bench`.
+            world.vab.stages[0].boosters = 6;
+            world.vab.stages[0].booster = 1; // SRB-Heavy
+            world.setup_reentry(0);
+            0.0
+        }
+        "reentry_roll" => {
+            // boostered + pitched + rolled about the nose: verifies a roll command
+            // is actually rendered (the strap-ons rotate about the axis), now that
+            // the drawn pose carries the full attitude and not just the nose.
+            world.vab.stages[0].boosters = 6;
+            world.vab.stages[0].booster = 1; // SRB-Heavy
+            world.setup_reentry(1); // pitched-over entry
+            if let Some(rk) = world.launch.as_mut() {
+                rk.roll = 1.1; // ~63 deg roll about the nose axis
+                rk.place_attitude();
+            }
+            0.0
+        }
+        "reentry_tilt" => {
+            // Same fireball but with a steeply pitched-over airframe and a big
+            // angle of attack (velocity well off the body axis): verifies the
+            // wake hugs the rocket's own axis instead of skewing off downwind.
+            world.setup_reentry(1);
+            0.0
+        }
+        "reentry_side" => {
+            // belly-first: nose vertical, velocity purely horizontal (~90 deg
+            // angle of attack), so the windward side is the flank and the wake
+            // trails straight back along the airstream.
+            world.setup_reentry(2);
+            0.0
+        }
+        "parachute" => {
+            // a crew capsule descending under a deployed recovery parachute.
+            world.setup_parachute();
+            0.0
+        }
+        "poweredland" => {
+            // a compact stage doing a powered (suicide-burn) descent to landing.
+            world.setup_powered_descent();
+            0.0
+        }
+        "sepfloat" => {
+            // a couple of seconds after staging, zoomed in, so the spent booster
+            // is visibly floating clear just below the climbing upper stage as the
+            // gap opens (soft push + slow tumble).
+            world.view = View::Rocket;
+            world.rocket_az = 3.4;
+            world.rocket_el = 0.16;
+            world.rocket_dist = 70.0;
+            world.rocket_focus_y = -14.0; // look down toward the drifting booster
+            world.ignite_launch();
+            fly_to_staging(&mut world);
+            for _ in 0..25 {
+                world.advance(0.1); // ~2.5 s of drift after separation
+            }
             0.0
         }
         "upperflame" => {
@@ -3513,6 +6073,24 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             // home + its moon
             frame_map(&mut world);
             world.sys_dist = 60.0;
+            6.0
+        }
+        "citylights" => {
+            // the home world's night side, filling the frame, to show the
+            // detailed city lights on the dark hemisphere.
+            frame_map(&mut world);
+            world.sys_dist = 14.0;
+            world.sys_az = 4.3;
+            world.sys_el = 0.12;
+            6.0
+        }
+        "homeworld" => {
+            // the home planet from orbit on its day side: drifting cloud shells,
+            // ocean sun-glint, and a terminator sliver showing the city lights.
+            frame_map(&mut world);
+            world.sys_dist = 17.0;
+            world.sys_az = 1.05;
+            world.sys_el = 0.26;
             6.0
         }
         "moons" => {
@@ -3780,6 +6358,36 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.rocket_dist = 15.0;
             0.0
         }
+        "crewcap" => {
+            // a rocket on the pad with the fairing open, revealing the crew capsule.
+            world.vab.payload = 10; // Crew Capsule
+            world.rebuild_vehicle();
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.fairing_open = 0.6;
+            let top = world.rocket_body.height;
+            world.rocket_az = 5.05;
+            world.rocket_el = 0.06;
+            world.rocket_focus_y = top - 7.0;
+            world.rocket_dist = 16.0;
+            0.0
+        }
+        "servicemod" => {
+            // a rocket on the pad with the fairing open, revealing the service module.
+            world.vab.payload = 11; // Service Module
+            world.rebuild_vehicle();
+            world.view = View::Rocket;
+            world.vab_mode = false;
+            world.rollout = 1.0;
+            world.fairing_open = 0.6;
+            let top = world.rocket_body.height;
+            world.rocket_az = 5.05;
+            world.rocket_el = 0.06;
+            world.rocket_focus_y = top - 7.0;
+            world.rocket_dist = 16.0;
+            0.0
+        }
         "cargoparts" => {
             // the fairing-packed module catalog, unpacked in a row on the moon.
             world.view = View::Rocket;
@@ -3789,7 +6397,7 @@ fn setup_world(scenario: &str, width: u32, height: u32) -> (World, f32) {
             world.base_mesh = Some(rocket::cargo_catalog());
             world.rocket_az = 4.71;
             world.rocket_el = 0.14;
-            world.rocket_dist = 26.0;
+            world.rocket_dist = 34.0;
             world.rocket_focus_y = 2.6;
             0.0
         }
@@ -4051,8 +6659,9 @@ fn render_shot(
     });
     let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
-    let (n, hn, dyn_n, fx_n) = gpu.prepare(queue, &mut world, width, height, time);
+    let (n, hn, dyn_n, fx_n, plasma_on, plume_on) = gpu.prepare(queue, &mut world, width, height, time);
     let terrain_n = world.terrain_count;
+    let static_n = world.static_count;
 
     // 256-byte aligned row pitch for the readback copy.
     let unpadded = width * 4;
@@ -4069,10 +6678,16 @@ fn render_shot(
         device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("shot-enc") });
     if world.view == View::Rocket {
         let depth = create_depth(device, width, height);
+        let plasma_mesh_n = world.plasma_mesh_n;
         {
             let mut pass = mesh_pass(&mut encoder, &target_view, &depth);
             gpu.draw_sky(&mut pass);
-            gpu.draw_meshes(&mut pass, terrain_n, dyn_n);
+            gpu.draw_meshes(&mut pass, terrain_n, static_n, dyn_n);
+            gpu.draw_plume(&mut pass, plume_on);
+            if plasma_on {
+                gpu.draw_plasma_mesh(&mut pass, plasma_mesh_n);
+            }
+            // FX last, so additive sparks/embers sit on top of the plasma glow.
             gpu.draw_fx(&mut pass, fx_n);
         }
         {
@@ -4161,6 +6776,112 @@ fn render_shot(
     }
     img.save(path).expect("write png");
     println!("wrote {path} ({width}x{height})");
+}
+
+/// Render a horizontal "filmstrip" animation of a rocket-view scenario: render
+/// `frames` frames at `fw`x`fh`, advancing the sim by `dt` between each (so the
+/// vehicle falls and the volumetric FX boil), and tile them left-to-right into a
+/// single PNG. No GIF dependency needed.
+#[cfg(not(target_arch = "wasm32"))]
+fn render_anim(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    gpu: &Gpu,
+    scenario: &str,
+    path: &str,
+    fw: u32,
+    fh: u32,
+    frames: u32,
+    dt: f32,
+) {
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let (mut world, _time) = setup_world(scenario, fw, fh);
+
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("anim-target"),
+        size: wgpu::Extent3d { width: fw, height: fh, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+    let depth = create_depth(device, fw, fh);
+
+    let unpadded = fw * 4;
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded = unpadded.div_ceil(align) * align;
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("anim-readback"),
+        size: (padded * fh) as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let mut strip = image::RgbaImage::new(fw * frames, fh);
+    for f in 0..frames {
+        let anim = world.anim;
+        let (n, hn, dyn_n, fx_n, plasma_on, plume_on) =
+            gpu.prepare(queue, &mut world, fw, fh, anim);
+        let terrain_n = world.terrain_count;
+        let static_n = world.static_count;
+        let mut enc =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("anim-enc") });
+        {
+            let mut pass = mesh_pass(&mut enc, &target_view, &depth);
+            gpu.draw_sky(&mut pass);
+            gpu.draw_meshes(&mut pass, terrain_n, static_n, dyn_n);
+            gpu.draw_plume(&mut pass, plume_on);
+            gpu.draw_fx(&mut pass, fx_n);
+            if plasma_on {
+                gpu.draw_plasma_mesh(&mut pass, world.plasma_mesh_n);
+            }
+        }
+        {
+            let mut pass = overlay_pass(&mut enc, &target_view);
+            gpu.draw_overlay(&mut pass, n, hn);
+        }
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(fh),
+                },
+            },
+            wgpu::Extent3d { width: fw, height: fh, depth_or_array_layers: 1 },
+        );
+        queue.submit(Some(enc.finish()));
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |r| r.expect("map"));
+        device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        {
+            let data = slice.get_mapped_range();
+            for row in 0..fh {
+                let start = (row * padded) as usize;
+                for col in 0..fw {
+                    let i = start + (col * 4) as usize;
+                    strip.put_pixel(f * fw + col, row, image::Rgba([data[i], data[i + 1], data[i + 2], 255]));
+                }
+            }
+        }
+        readback.unmap();
+        world.advance(dt); // fall + boil for the next frame
+    }
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    strip.save(path).expect("write png");
+    println!("wrote {path} ({}x{fh}, {frames} frames)", fw * frames);
 }
 
 // ---------------------------------------------------------------------------
@@ -4361,6 +7082,30 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::KeyboardInput { event: key_event, .. } => {
+                // Car driving / on foot: held WASD/arrows steer the car or move the
+                // character. Handle press AND release here (so keys can be held)
+                // and skip the other controls.
+                if state.world.driving || state.world.walking {
+                    let kc = match key_event.physical_key {
+                        PhysicalKey::Code(c) => c,
+                        _ => return,
+                    };
+                    let down = key_event.state == ElementState::Pressed;
+                    let inp = if state.world.driving {
+                        &mut state.world.drive_in
+                    } else {
+                        &mut state.world.walk_in
+                    };
+                    match kc {
+                        KeyCode::KeyW | KeyCode::ArrowUp => inp[0] = down,
+                        KeyCode::KeyS | KeyCode::ArrowDown => inp[1] = down,
+                        KeyCode::KeyA | KeyCode::ArrowLeft => inp[2] = down,
+                        KeyCode::KeyD | KeyCode::ArrowRight => inp[3] = down,
+                        _ => {}
+                    }
+                    state.window.request_redraw();
+                    return;
+                }
                 if key_event.state == ElementState::Pressed {
                     let code = match key_event.physical_key {
                         PhysicalKey::Code(c) => c,
@@ -4374,25 +7119,40 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                     // player-controlled launch: pitch (W/S), throttle (Shift/Ctrl,
-                    // Z full / X cut). These repeat while held.
+                    // Z full / X cut). In the frozen re-entry test, the same WASDQE
+                    // freely rotate the airframe in 3 axes (pitch/yaw/roll) so you
+                    // can inspect re-entry from any orientation. These repeat held.
+                    let test = state.world.reentry_test;
                     if let Some(rk) = state.world.launch.as_mut() {
                         let step = 2f64.to_radians();
-                        match code {
-                            KeyCode::KeyW | KeyCode::ArrowUp => {
-                                rk.pitch = (rk.pitch + step).min(110f64.to_radians())
+                        if test {
+                            match code {
+                                KeyCode::KeyW | KeyCode::ArrowUp => rk.pitch += step,
+                                KeyCode::KeyS | KeyCode::ArrowDown => rk.pitch -= step,
+                                KeyCode::KeyA | KeyCode::ArrowLeft => rk.yaw += step,
+                                KeyCode::KeyD | KeyCode::ArrowRight => rk.yaw -= step,
+                                KeyCode::KeyQ => rk.roll += step,
+                                KeyCode::KeyE => rk.roll -= step,
+                                _ => {}
                             }
-                            KeyCode::KeyS | KeyCode::ArrowDown => {
-                                rk.pitch = (rk.pitch - step).max(0.0)
+                        } else {
+                            match code {
+                                KeyCode::KeyW | KeyCode::ArrowUp => {
+                                    rk.pitch = (rk.pitch + step).min(110f64.to_radians())
+                                }
+                                KeyCode::KeyS | KeyCode::ArrowDown => {
+                                    rk.pitch = (rk.pitch - step).max(0.0)
+                                }
+                                KeyCode::ShiftLeft | KeyCode::ShiftRight => {
+                                    rk.throttle = (rk.throttle + 0.06).min(1.0)
+                                }
+                                KeyCode::ControlLeft | KeyCode::ControlRight => {
+                                    rk.throttle = (rk.throttle - 0.06).max(0.0)
+                                }
+                                KeyCode::KeyZ => rk.throttle = 1.0,
+                                KeyCode::KeyX => rk.throttle = 0.0,
+                                _ => {}
                             }
-                            KeyCode::ShiftLeft | KeyCode::ShiftRight => {
-                                rk.throttle = (rk.throttle + 0.06).min(1.0)
-                            }
-                            KeyCode::ControlLeft | KeyCode::ControlRight => {
-                                rk.throttle = (rk.throttle - 0.06).max(0.0)
-                            }
-                            KeyCode::KeyZ => rk.throttle = 1.0,
-                            KeyCode::KeyX => rk.throttle = 0.0,
-                            _ => {}
                         }
                     }
                     if key_event.repeat {
@@ -4421,11 +7181,21 @@ impl ApplicationHandler<UserEvent> for App {
                         KeyCode::KeyR if state.world.view == View::Rocket => {
                             state.world.back_to_vab()
                         }
+                        KeyCode::KeyL => state.world.toggle_lod_debug(),
+                        // [ ] are always time compression (sim time scale).
                         KeyCode::BracketRight => {
                             state.world.warp = (state.world.warp * 2.0).min(10000.0);
                         }
                         KeyCode::BracketLeft => {
                             state.world.warp = (state.world.warp * 0.5).max(1.0);
+                        }
+                        // , . are the separate crawler-speed control, only while
+                        // rolling out to the pad (they do not touch sim time).
+                        KeyCode::Period if state.world.rolling_out => {
+                            state.world.bump_rollout_speed(true);
+                        }
+                        KeyCode::Comma if state.world.rolling_out => {
+                            state.world.bump_rollout_speed(false);
                         }
                         KeyCode::Digit1
                         | KeyCode::Digit2
@@ -4486,6 +7256,21 @@ fn main() {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let args: Vec<String> = std::env::args().collect();
+
+        // Unified city store: load the baked world city index and warm the
+        // on-disk layout cache. Each city's blocks/buildings are generated once
+        // at world load and stored under cache/cities; later runs read them back.
+        // At render time a world address (camera lon/lat) looks up nearby cities
+        // in the index, then pulls their cached layouts.
+        if let Some(idx) = worldcity::CityIndex::from_bytes(include_bytes!("../assets/cities.bin")) {
+            let cache = worldcity::CityCache::new("cache/cities");
+            let generated = cache.warm(idx.cities());
+            eprintln!(
+                "world cities: {} indexed, {generated} layouts generated this run (rest cached in cache/cities/)",
+                idx.len()
+            );
+        }
+
         if args.iter().any(|a| a == "catalog") {
             let w = World::new();
             let md = w.universe.catalog_markdown();
@@ -4498,13 +7283,124 @@ fn main() {
             println!("wrote {path}");
             return;
         }
+        // `ascentcsv`: fly the default vehicle to orbit (open-loop gravity turn)
+        // and print the ascent profile as CSV to stdout, for plotting.
+        if args.iter().any(|a| a == "ascentcsv") {
+            use sim::orbit::orbit_from_state;
+            let body = CentralBody::home();
+            let veh = build::Vab::default_build().to_vehicle();
+            let up = DVec3::new(1.0, 0.0, 0.0);
+            let heading = DVec3::Y.cross(up).normalize();
+            let mut rk = launch::Rocket::on_pad(&veh, up * body.radius, DVec3::ZERO, up, heading);
+            rk.throttle = 1.0;
+            let dt = 0.2f64;
+            let mut prev = 0.0f64;
+            let pad_r = body.radius;
+            println!("t,alt_km,speed,vspeed,net_a,crew_g,twr,stage,apo_km,peri_km");
+            let mut t = 0.0f64;
+            for _ in 0..4000 {
+                // open-loop gravity turn: hold vertical ~12 s then ease over.
+                rk.pitch = (((rk.met - 11.0) / 145.0).clamp(0.0, 1.0) * 80f64.to_radians()).min(1.45);
+                if rk.prop_frac() <= 0.0 && rk.stages.len() > 1 {
+                    rk.jettison();
+                }
+                rk.integrate(&body, dt);
+                t += dt;
+                let sp = rk.speed();
+                let net_a = (sp - prev) / dt;
+                prev = sp;
+                let up_r = rk.r.normalize_or_zero();
+                let vspeed = rk.v.dot(up_r);
+                let g_local = body.mu / (rk.r.length() * rk.r.length());
+                let twr = rk.live_thrust() / (rk.mass() * g_local);
+                let orb = orbit_from_state(rk.r, rk.v, body.mu);
+                let (apo, peri) = if orb.e < 1.0 && orb.a > 0.0 {
+                    ((orb.ra - pad_r) / 1000.0, (orb.rp - pad_r) / 1000.0)
+                } else {
+                    ((orb.ra - pad_r) / 1000.0, f64::NAN)
+                };
+                println!(
+                    "{:.2},{:.4},{:.2},{:.2},{:.3},{:.3},{:.3},{},{:.1},{:.1}",
+                    t,
+                    rk.altitude(&body) / 1000.0,
+                    sp,
+                    vspeed,
+                    net_a,
+                    rk.crew_g(),
+                    twr,
+                    rk.stage_base,
+                    apo,
+                    peri
+                );
+                if rk.crashed {
+                    break;
+                }
+                if rk.orbit_reached && t > rk.met {
+                    break;
+                }
+            }
+            return;
+        }
+        // `bench [scenario] [WxH]`: time the re-entry plasma glow-mesh pass on the
+        // real GPU (loop the actual pipeline in one submit, GPU-synced), so its
+        // cost is a measured number instead of a guess.
+        if args.iter().any(|a| a == "bench") {
+            env_logger::init();
+            let scenario = args
+                .iter()
+                .position(|a| a == "bench")
+                .and_then(|i| args.get(i + 1))
+                .filter(|a| a.starts_with("reentry"))
+                .cloned()
+                .unwrap_or_else(|| "reentry".to_string());
+            let (w, h) = args
+                .iter()
+                .find_map(|a| {
+                    let (ws, hs) = a.split_once('x')?;
+                    Some((ws.parse::<u32>().ok()?, hs.parse::<u32>().ok()?))
+                })
+                .unwrap_or((1280, 800));
+            bench_plasma(&scenario, w, h);
+            return;
+        }
+        // `anim <scenario> [out.png]`: a horizontal filmstrip of the scenario
+        // playing out (the rocket falling + the volumetric FX boiling).
+        if args.iter().any(|a| a == "anim") {
+            env_logger::init();
+            let scenario = args
+                .iter()
+                .position(|a| a == "anim")
+                .and_then(|i| args.get(i + 1))
+                .filter(|a| !a.ends_with(".png"))
+                .cloned()
+                .unwrap_or_else(|| "reentry".to_string());
+            let path = args
+                .iter()
+                .find(|a| a.ends_with(".png"))
+                .cloned()
+                .unwrap_or_else(|| format!("out/{scenario}_anim.png"));
+            let (device, queue) = make_shot_device();
+            let gpu = Gpu::new(&device, &queue, wgpu::TextureFormat::Rgba8UnormSrgb);
+            render_anim(&device, &queue, &gpu, &scenario, &path, 420, 320, 6, 0.12);
+            return;
+        }
         if args.iter().any(|a| a == "shot" || a == "--shot") {
             env_logger::init();
             if args.iter().any(|a| a == "all") {
                 screenshot_all(1280, 800);
                 return;
             }
-            let scenario = if args.iter().any(|a| a == "m1_vab") {
+            let scenario = if args.iter().any(|a| a == "cities") {
+                "cities"
+            } else if args.iter().any(|a| a == "citylife") {
+                "citylife"
+            } else if args.iter().any(|a| a == "cityview") {
+                "cityview"
+            } else if args.iter().any(|a| a == "walk") {
+                "walk"
+            } else if args.iter().any(|a| a == "drive") {
+                "drive"
+            } else if args.iter().any(|a| a == "m1_vab") {
                 "m1_vab"
             } else if args.iter().any(|a| a == "m2_liftoff") {
                 "m2_liftoff"
@@ -4544,6 +7440,10 @@ fn main() {
                 "ast_surf"
             } else if args.iter().any(|a| a == "cargoparts") {
                 "cargoparts"
+            } else if args.iter().any(|a| a == "crewcap") {
+                "crewcap"
+            } else if args.iter().any(|a| a == "servicemod") {
+                "servicemod"
             } else if args.iter().any(|a| a == "cargo") {
                 "cargo"
             } else if args.iter().any(|a| a == "delivery") {
@@ -4556,6 +7456,18 @@ fn main() {
                 "baseparts"
             } else if args.iter().any(|a| a == "moons") {
                 "moons"
+            } else if args.iter().any(|a| a == "citylights") {
+                "citylights"
+            } else if args.iter().any(|a| a == "homeworld") {
+                "homeworld"
+            } else if args.iter().any(|a| a == "overlook") {
+                "overlook"
+            } else if args.iter().any(|a| a == "descent") {
+                "descent"
+            } else if args.iter().any(|a| a == "cityrise") {
+                "cityrise"
+            } else if args.iter().any(|a| a == "nightcity") {
+                "nightcity"
             } else if args.iter().any(|a| a == "moon") {
                 "moon"
             } else if args.iter().any(|a| a == "rocket") {
@@ -4576,10 +7488,42 @@ fn main() {
                 "rollout"
             } else if args.iter().any(|a| a == "pad") {
                 "pad"
+            } else if args.iter().any(|a| a == "loddebugmap") {
+                "loddebugmap"
+            } else if args.iter().any(|a| a == "loddebug") {
+                "loddebug"
             } else if args.iter().any(|a| a == "liftoff2") {
                 "liftoff2"
             } else if args.iter().any(|a| a == "liftoff") {
                 "liftoff"
+            } else if args.iter().any(|a| a == "boosterlaunch") {
+                "boosterlaunch"
+            } else if args.iter().any(|a| a == "boosters") {
+                "boosters"
+            } else if args.iter().any(|a| a == "crash") {
+                "crash"
+            } else if args.iter().any(|a| a == "reentry_tilt") {
+                "reentry_tilt"
+            } else if args.iter().any(|a| a == "reentry_side") {
+                "reentry_side"
+            } else if args.iter().any(|a| a == "reentry_roll") {
+                "reentry_roll"
+            } else if args.iter().any(|a| a == "reentry_boost") {
+                "reentry_boost"
+            } else if args.iter().any(|a| a == "plumetest") {
+                "plumetest"
+            } else if args.iter().any(|a| a == "reentry_lowheat") {
+                "reentry_lowheat"
+            } else if args.iter().any(|a| a == "reentry_midheat") {
+                "reentry_midheat"
+            } else if args.iter().any(|a| a == "reentry") {
+                "reentry"
+            } else if args.iter().any(|a| a == "parachute") {
+                "parachute"
+            } else if args.iter().any(|a| a == "poweredland") {
+                "poweredland"
+            } else if args.iter().any(|a| a == "sepfloat") {
+                "sepfloat"
             } else if args.iter().any(|a| a == "staging") {
                 "staging"
             } else if args.iter().any(|a| a == "launchmap") {
@@ -4629,12 +7573,31 @@ fn main() {
                 "baseparts" => "out/baseparts.png",
                 "moons" => "out/moons.png",
                 "moon" => "out/moon.png",
+                "citylights" => "out/citylights.png",
+                "homeworld" => "out/homeworld.png",
+                "overlook" => "out/overlook.png",
+                "descent" => "out/descent.png",
+                "nightcity" => "out/nightcity.png",
+                "cityrise" => "out/cityrise.png",
                 "rocket" => "out/rocket.png",
                 "system" => "out/system.png",
                 "pad" => "out/pad.png",
                 "liftoff" => "out/liftoff.png",
                 "liftoff2" => "out/liftoff2.png",
+                "loddebug" => "out/loddebug.png",
+                "loddebugmap" => "out/loddebugmap.png",
                 "staging" => "out/staging.png",
+                "sepfloat" => "out/sepfloat.png",
+                "reentry" => "out/reentry.png",
+                "reentry_tilt" => "out/reentry_tilt.png",
+                "reentry_roll" => "out/reentry_roll.png",
+                "reentry_boost" => "out/reentry_boost.png",
+                "reentry_lowheat" => "out/reentry_lowheat.png",
+                "reentry_midheat" => "out/reentry_midheat.png",
+                "plumetest" => "out/plumetest.png",
+                "crash" => "out/crash.png",
+                "boosters" => "out/boosters.png",
+                "boosterlaunch" => "out/boosterlaunch.png",
                 "launchmap" => "out/launchmap.png",
                 "ascent" => "out/ascent.png",
                 "flight" => "out/flight.png",
@@ -4646,7 +7609,17 @@ fn main() {
                 .find(|a| a.ends_with(".png"))
                 .cloned()
                 .unwrap_or_else(|| default.to_string());
-            screenshot(&path, 1280, 800, scenario);
+            // Optional `WIDTHxHEIGHT` token (e.g. `1280x1200`) to size the shot;
+            // handy for verifying tall panels that overflow the default frame.
+            let (w, h) = args
+                .iter()
+                .skip(1)
+                .find_map(|a| {
+                    let (ws, hs) = a.split_once('x')?;
+                    Some((ws.parse::<u32>().ok()?, hs.parse::<u32>().ok()?))
+                })
+                .unwrap_or((1280, 800));
+            screenshot(&path, w, h, scenario);
             return;
         }
     }
@@ -4708,5 +7681,118 @@ mod instant_now {
             .and_then(|w| w.performance())
             .map(|p| p.now())
             .unwrap_or(0.0)
+    }
+}
+
+#[cfg(test)]
+mod reentry_test_scene {
+    use super::*;
+
+    /// The frozen re-entry test scene must hold the vehicle still at full heat
+    /// indefinitely: no motion, no heat damage, never destroyed - so the plasma
+    /// FX can be inspected at leisure (this is the whole point of the test menu).
+    #[test]
+    fn frozen_scene_survives_a_long_run_without_moving() {
+        let mut w = World::new();
+        w.setup_reentry(0);
+        assert!(w.reentry_test, "scene should be frozen after setup");
+        let (r0, heat0) = {
+            let rk = w.launch.as_ref().expect("vehicle present");
+            (rk.r, rk.heat)
+        };
+        assert!(heat0 > 0.3, "plasma should have bloomed (heat={heat0})");
+
+        // Far longer than the few seconds it used to last before burning up.
+        for _ in 0..1200 {
+            w.advance(0.1); // 120 s at 1x
+        }
+
+        let rk = w.launch.as_ref().expect("still present - never destroyed");
+        assert!(!rk.destroyed, "frozen test vehicle must never break up");
+        assert!(!rk.crashed, "frozen test vehicle must never crash");
+        assert_eq!(rk.health, 100.0, "airframe stays pristine");
+        assert!(rk.heat > 0.3, "stays hot so the FX keep playing (heat={})", rk.heat);
+        assert_eq!(rk.r, r0, "vehicle must not move while frozen");
+    }
+
+    /// Re-aiming with the pitch command rotates the airframe instantly while
+    /// frozen (so you can inspect the shock from any attitude), without it ever
+    /// starting to move or take damage.
+    #[test]
+    fn frozen_scene_lets_you_re_aim_the_airframe() {
+        let mut w = World::new();
+        w.setup_reentry(0);
+        let r0 = w.launch.as_ref().unwrap().r;
+        if let Some(rk) = w.launch.as_mut() {
+            rk.pitch = 0.6; // command a new attitude (what W/S does)
+        }
+        w.advance(0.1);
+        let rk = w.launch.as_ref().unwrap();
+        assert!((rk.pitch_act - 0.6).abs() < 1e-9, "attitude tracks the command");
+        assert_eq!(rk.r, r0, "re-aiming must not move the vehicle");
+    }
+
+    /// In the frozen test you can yaw and roll the airframe (not just pitch), so
+    /// re-entry can be inspected from any 3-axis orientation. Yaw swings the nose;
+    /// roll spins about the nose (nose direction unchanged) - neither moves it.
+    #[test]
+    fn frozen_scene_yaw_and_roll_rotate_the_airframe() {
+        let mut w = World::new();
+        w.setup_reentry(0);
+        let r0 = w.launch.as_ref().unwrap().r;
+        let nose0 = w.launch.as_ref().unwrap().point_dir();
+
+        // Yaw swings the nose off its current direction.
+        if let Some(rk) = w.launch.as_mut() {
+            rk.yaw = 0.6;
+        }
+        w.advance(0.1);
+        let (nose1, orient1) = {
+            let rk = w.launch.as_ref().unwrap();
+            (rk.point_dir(), rk.orient)
+        };
+        assert!(nose0.dot(nose1) < 0.99, "yaw should rotate the nose off-axis");
+
+        // Roll spins about the nose axis: the nose stays put, the orientation turns.
+        if let Some(rk) = w.launch.as_mut() {
+            rk.roll = 0.8;
+        }
+        w.advance(0.1);
+        let rk = w.launch.as_ref().unwrap();
+        assert!(rk.point_dir().dot(nose1) > 0.999, "roll must keep the nose fixed");
+        assert!(rk.orient.angle_between(orient1) > 1e-3, "roll must change the orientation");
+        assert_eq!(rk.r, r0, "rotating must not move the vehicle");
+    }
+
+    /// A real ignition is never frozen - it flies normally.
+    #[test]
+    fn normal_ignition_is_not_frozen() {
+        let mut w = World::new();
+        w.setup_reentry(0);
+        assert!(w.reentry_test);
+        w.ignite_launch(); // a genuine launch clears the test freeze
+        assert!(!w.reentry_test);
+    }
+
+    /// The rocket must never sink through the pad during the engine spool-up: it
+    /// is held down until thrust exceeds weight, then lifts off and climbs.
+    #[test]
+    fn launch_does_not_sink_into_the_pad() {
+        let mut w = World::new();
+        w.ignite_launch();
+        let pad_alt = w.launch.as_ref().unwrap().altitude(&w.body);
+        let mut min_alt = pad_alt;
+        for _ in 0..160 {
+            w.advance(0.05); // ~8 s through spool-up + early ascent
+            if let Some(rk) = w.launch.as_ref() {
+                min_alt = min_alt.min(rk.altitude(&w.body));
+            }
+        }
+        assert!(
+            min_alt >= pad_alt - 0.5,
+            "rocket sank below the pad during launch: min_alt={min_alt:.2} pad={pad_alt:.2}"
+        );
+        let end_alt = w.launch.as_ref().unwrap().altitude(&w.body);
+        assert!(end_alt > pad_alt + 1.0, "rocket failed to lift off: end={end_alt:.2} pad={pad_alt:.2}");
     }
 }
