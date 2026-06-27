@@ -136,9 +136,15 @@ const OVERLAY_CAP: u64 = 8192;
 const HUD_CAP: u64 = 40000;
 /// Thruster-FX billboards (flame + smoke particles).
 const FX_CAP: u64 = 60000;
-/// Dynamic rocket-view geometry (pad + rocket + spent booster, or a surface
-/// mesh: moon base / cargo module / a full procedural asteroid ~66k verts).
+/// Dynamic rocket-view geometry: the per-frame movers only (player car/character,
+/// NPC traffic, the rocket stack + debris). The static city/ground scenery moved
+/// to its own buffer (see `STATIC_MESH_CAP`), so this stays small.
 const DYN_MESH_CAP: u64 = 560_000;
+/// Static rocket-view scenery (the city LOD set + ground structures), uploaded
+/// once and rebuilt only when the floating origin shifts or the visible LOD set
+/// changes - never per frame. Sized for a whole metro of full 3D buildings in the
+/// build range at once (~1M verts measured), with headroom.
+const STATIC_MESH_CAP: u64 = 2_400_000;
 /// Procedural re-entry plasma glow mesh (prototype mesh approach): an isosurface
 /// shell hugging the vehicle SDF (surface nets), so it can run to tens of
 /// thousands of verts on a boostered stack.
@@ -737,6 +743,14 @@ struct World {
     terrain_dirty: bool,
     terrain_verts: Vec<rocket::MeshVertex>,
     terrain_count: u32,
+    /// Static rocket-view scenery (cities + ground structures): vertex count in
+    /// the static buffer, a dirty flag set when the floating origin shifts, and a
+    /// signature of the current LOD selection (which cities at which detail +
+    /// night) so a changed selection triggers exactly one rebuild. Rebuilt only on
+    /// those events, never per frame - see `build_static_mesh` / `static_mesh_sig`.
+    static_count: u32,
+    static_dirty: bool,
+    static_sig: u64,
     /// LOD-debug overlay: colour the terrain by quadtree depth (toggle with `L`
     /// in the rocket view) so the split rings are visible and tunable.
     lod_debug: bool,
@@ -940,6 +954,9 @@ impl World {
             test_friction: 0.9,
             terrain_verts: Vec::new(),
             terrain_count: 0,
+            static_count: 0,
+            static_dirty: true,
+            static_sig: 0,
             terrain_svc: terrain_job::TerrainService::new(),
             view: View::Rocket,
             sys_az: 1.4,
@@ -2057,6 +2074,7 @@ impl World {
                     self.ref_local = eye;
                     self.rebuild_terrain();
                     self.terrain_dirty = true;
+                    self.static_dirty = true; // origin moved: rebuild static scenery
                 }
             }
 
@@ -2122,6 +2140,7 @@ impl World {
             self.ref_local = anchor;
             self.rebuild_terrain();
             self.terrain_dirty = true;
+            self.static_dirty = true; // origin moved: rebuild static scenery
         } else if anchor != self.ref_local && !self.terrain_svc.busy() {
             self.terrain_svc.request(terrain_job::PlanetJob {
                 cam_world: self.cam_world(anchor),
@@ -2143,6 +2162,7 @@ impl World {
             self.terrain_count = (res.verts.len() as u64).min(TERRAIN_CAP) as u32;
             self.terrain_verts = res.verts;
             self.terrain_dirty = true; // upload pending
+            self.static_dirty = true; // origin moved: rebuild static scenery
         }
     }
 
@@ -3161,8 +3181,17 @@ impl World {
     /// Per-frame dynamic rocket-view geometry, camera-relative (floating origin):
     /// the pad + mount, the rocket at its current pose, and any tumbling spent
     /// booster. The full planet terrain lives in its own (rebuilt-on-move) buffer.
-    fn build_dynamic_mesh(&self) -> Vec<rocket::MeshVertex> {
-        let rb = &self.rocket_body;
+    /// Static rocket-view scenery: the ground structures (access road, pad +
+    /// mount, assembly hangar, parts rack) and the city LOD set (full 3D buildings
+    /// within the build range, flat footprints out to the far range, plus the
+    /// night ground glow). None of it moves frame to frame, so it is rebuilt only
+    /// when the floating origin shifts or the visible LOD set changes (see
+    /// `static_mesh_sig` and `prepare`) rather than every frame - which is what
+    /// keeps a dense metro off the per-frame CPU/upload path. `eye` is the camera
+    /// eye in local metres, passed in so the camera boom is not recomputed here.
+    /// The asteroid / moon-base / lander preview modes return only their preview
+    /// mesh (the per-frame movers are skipped in those modes).
+    fn build_static_mesh(&self, eye: DVec3) -> Vec<rocket::MeshVertex> {
         let mut out: Vec<rocket::MeshVertex> = Vec::new();
 
         // Asteroid LOD body: the body itself is the terrain buffer; only draw the
@@ -3220,42 +3249,12 @@ impl World {
         push_static(&mut out, &self.hangar_mesh);
         push_static(&mut out, &self.rack_mesh);
 
-        // The player's car / character are pushed BEFORE the cities so the dynamic
-        // mesh cap (a dense metro can fill it) never truncates the thing the camera
-        // is following. Rotate the local mesh by the heading about +Y.
-        {
-            let (s, c) = self.car_yaw.sin_cos();
-            for v in &self.car_mesh.verts {
-                let p = Vec3::from(v.pos);
-                let rp = Vec3::new(c * p.x - s * p.z, p.y, s * p.x + c * p.z);
-                let n = Vec3::from(v.normal);
-                let rn = Vec3::new(c * n.x - s * n.z, n.y, s * n.x + c * n.z);
-                let local = self.car_pos + rp.as_dvec3();
-                out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: rn.into(), color: v.color });
-            }
-        }
-        if self.walking {
-            let moving = (self.ped_speed.abs() / 1.5).clamp(0.0, 1.0);
-            let ped = rocket::character(self.walk_phase, moving, [0.20, 0.46, 0.78]);
-            let (s, c) = self.ped_yaw.sin_cos();
-            for v in &ped.verts {
-                let p = Vec3::from(v.pos);
-                let rp = Vec3::new(c * p.x - s * p.z, p.y, s * p.x + c * p.z);
-                let n = Vec3::from(v.normal);
-                let rn = Vec3::new(c * n.x - s * n.z, n.y, s * n.x + c * n.z);
-                let local = self.ped_pos + rp.as_dvec3();
-                out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: rn.into(), color: v.color });
-            }
-        }
-
         // City level-of-detail, by camera-eye distance: full 3D buildings within
         // the build range, flat block/road footprints beyond it (out to the far
         // range), so the city still reads as blocks and roads from kilometres up
         // or away. Keyed on the eye (not the look target) so it tracks where the
-        // camera actually is. Horizontal distance, squared.
-        let eye = self.camera_eye_local();
-        // Full 3D distance (includes altitude), so a camera high above a city
-        // drops to the footprint LOD even though it is overhead.
+        // camera actually is. Full 3D distance (includes altitude), squared, so a
+        // camera high above a city drops to the footprint LOD even when overhead.
         let d2 = |p: Vec3| (p.as_dvec3() - eye).length_squared();
         let build_r2 = CITY_BUILD_R * CITY_BUILD_R;
         let foot_r2 = CITY_FOOT_R * CITY_FOOT_R;
@@ -3280,11 +3279,94 @@ impl World {
                 push_static(&mut out, mesh);
             }
         }
+        // Road-network ribbons near the eye.
         let near = |p: Vec3| d2(p) < foot_r2;
         for (a, b, mesh) in &self.roads {
             let mid = (*a + *b) * 0.5;
             if near(*a) || near(*b) || near(mid) {
                 push_static(&mut out, mesh);
+            }
+        }
+
+        out
+    }
+
+    /// A cheap signature of the static-mesh selection: which cities are at which
+    /// LOD (full 3D / footprint), whether the night glow is on, and the active
+    /// preview mode. Recomputed each frame (just distance compares, no vertex
+    /// work) and compared against the last build so the heavy `build_static_mesh`
+    /// runs only when the selection actually changes. Does NOT fold in the
+    /// floating origin: a shift of `ref_local` is signalled separately via
+    /// `static_dirty` (same trigger as the terrain rebuild).
+    fn static_mesh_sig(&self, eye: DVec3) -> u64 {
+        use std::hash::Hasher;
+        // Preview modes each get a distinct constant (they ignore the city LOD).
+        if self.ast_elev.is_some() {
+            return 0xA57E_0000 ^ self.show_lander as u64;
+        }
+        if self.base_mesh.is_some() {
+            return 0xBA5E_0000 ^ self.show_lander as u64;
+        }
+        if self.show_lander {
+            return 0x1A9D_E500;
+        }
+        let d2 = |p: Vec3| (p.as_dvec3() - eye).length_squared();
+        let build_r2 = CITY_BUILD_R * CITY_BUILD_R;
+        let foot_r2 = CITY_FOOT_R * CITY_FOOT_R;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        h.write_u8(self.night as u8);
+        for (center, _) in &self.city_meshes {
+            h.write_u8((d2(*center) < build_r2) as u8);
+        }
+        for (center, _) in &self.city_footprints {
+            let dd = d2(*center);
+            h.write_u8((dd >= build_r2 && dd < foot_r2) as u8);
+        }
+        for (a, b, _) in &self.roads {
+            let mid = (*a + *b) * 0.5;
+            h.write_u8((d2(*a) < foot_r2 || d2(*b) < foot_r2 || d2(mid) < foot_r2) as u8);
+        }
+        h.finish()
+    }
+
+    /// Per-frame moving geometry for the rocket view: the player's car/character,
+    /// city traffic (NPC cars + pedestrians), the mobile launch platform, the
+    /// rocket stack (payload/fairing/parachute), explosion debris, the tumbling
+    /// spent stage, and the drag ghost. Static scenery (cities + ground
+    /// structures) lives in `build_static_mesh`; this returns empty in the
+    /// asteroid / moon-base / lander preview modes (they draw only the static
+    /// preview mesh).
+    fn build_dynamic_mesh(&self) -> Vec<rocket::MeshVertex> {
+        let rb = &self.rocket_body;
+        let mut out: Vec<rocket::MeshVertex> = Vec::new();
+        if self.ast_elev.is_some() || self.base_mesh.is_some() || self.show_lander {
+            return out;
+        }
+
+        // The player's car / character: rotate the local mesh by the heading about
+        // +Y and drop it at the player position.
+        {
+            let (s, c) = self.car_yaw.sin_cos();
+            for v in &self.car_mesh.verts {
+                let p = Vec3::from(v.pos);
+                let rp = Vec3::new(c * p.x - s * p.z, p.y, s * p.x + c * p.z);
+                let n = Vec3::from(v.normal);
+                let rn = Vec3::new(c * n.x - s * n.z, n.y, s * n.x + c * n.z);
+                let local = self.car_pos + rp.as_dvec3();
+                out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: rn.into(), color: v.color });
+            }
+        }
+        if self.walking {
+            let moving = (self.ped_speed.abs() / 1.5).clamp(0.0, 1.0);
+            let ped = rocket::character(self.walk_phase, moving, [0.20, 0.46, 0.78]);
+            let (s, c) = self.ped_yaw.sin_cos();
+            for v in &ped.verts {
+                let p = Vec3::from(v.pos);
+                let rp = Vec3::new(c * p.x - s * p.z, p.y, s * p.x + c * p.z);
+                let n = Vec3::from(v.normal);
+                let rn = Vec3::new(c * n.x - s * n.z, n.y, s * n.x + c * n.z);
+                let local = self.ped_pos + rp.as_dvec3();
+                out.push(rocket::MeshVertex { pos: self.rel(local).into(), normal: rn.into(), color: v.color });
             }
         }
 
@@ -3961,9 +4043,14 @@ struct Gpu {
     mesh_bind_group: wgpu::BindGroup,
     /// Full-planet LOD terrain, rebuilt (camera-relative) when the camera moves.
     terrain_vbuf: wgpu::Buffer,
-    /// Dynamic rocket-view geometry (pad, rocket pose, spent booster), rebuilt
-    /// every frame.
+    /// Dynamic rocket-view geometry (the player car/character, NPC traffic, the
+    /// rocket pose + debris), rebuilt every frame. Small now that the city scenery
+    /// lives in `static_vbuf`.
     dyn_vbuf: wgpu::Buffer,
+    /// Static rocket-view scenery (the city LOD set + ground structures). Uploaded
+    /// once and rebuilt only when the floating origin shifts or the visible city
+    /// LOD set changes, so a dense metro never touches the per-frame upload path.
+    static_vbuf: wgpu::Buffer,
     /// Thruster FX billboards (flame + smoke particles).
     fx_pipeline: wgpu::RenderPipeline,
     fx_vbuf: wgpu::Buffer,
@@ -4571,6 +4658,12 @@ impl Gpu {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let static_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("static-mesh-vbuf"),
+            size: STATIC_MESH_CAP * std::mem::size_of::<rocket::MeshVertex>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         Gpu {
             scene_pipeline,
@@ -4585,6 +4678,7 @@ impl Gpu {
             mesh_bind_group,
             terrain_vbuf,
             dyn_vbuf,
+            static_vbuf,
             fx_pipeline,
             fx_vbuf,
             sky_pipeline,
@@ -4662,6 +4756,27 @@ impl Gpu {
                     queue.write_buffer(&self.plume_uniform_buf, 0, bytemuck::bytes_of(&pu));
                     plume_on = true;
                 }
+                // Static scenery (cities + ground structures): rebuild + upload
+                // only when the floating origin shifts (static_dirty) or the
+                // visible city LOD selection changes (signature). Never per frame -
+                // rebuilding it every frame is what pegged the CPU/upload path on a
+                // dense metro (a whole city of buildings is ~1M verts / ~35 MB).
+                let eye = world.camera_eye_local();
+                let sig = world.static_mesh_sig(eye);
+                if world.static_dirty || sig != world.static_sig {
+                    let sv = world.build_static_mesh(eye);
+                    world.static_count = (sv.len() as u64).min(STATIC_MESH_CAP) as u32;
+                    if world.static_count > 0 {
+                        queue.write_buffer(
+                            &self.static_vbuf,
+                            0,
+                            bytemuck::cast_slice(&sv[..world.static_count as usize]),
+                        );
+                    }
+                    world.static_sig = sig;
+                    world.static_dirty = false;
+                }
+
                 let dyn_verts = world.build_dynamic_mesh();
                 dyn_n = (dyn_verts.len() as u64).min(DYN_MESH_CAP) as u32;
                 if dyn_n > 0 {
@@ -4730,12 +4845,16 @@ impl Gpu {
     }
 
     /// The 3D rocket/pad/terrain mesh (depth-tested). Used in its own pass.
-    fn draw_meshes(&self, pass: &mut wgpu::RenderPass, terrain_count: u32, dyn_count: u32) {
+    fn draw_meshes(&self, pass: &mut wgpu::RenderPass, terrain_count: u32, static_count: u32, dyn_count: u32) {
         pass.set_pipeline(&self.mesh_pipeline);
         pass.set_bind_group(0, &self.mesh_bind_group, &[]);
         if terrain_count > 0 {
             pass.set_vertex_buffer(0, self.terrain_vbuf.slice(..));
             pass.draw(0..terrain_count, 0..1);
+        }
+        if static_count > 0 {
+            pass.set_vertex_buffer(0, self.static_vbuf.slice(..));
+            pass.draw(0..static_count, 0..1);
         }
         if dyn_count > 0 {
             pass.set_vertex_buffer(0, self.dyn_vbuf.slice(..));
@@ -5152,6 +5271,7 @@ impl State {
             .gpu
             .prepare(&self.queue, &mut self.world, self.config.width, self.config.height, t);
         let terrain_n = self.world.terrain_count;
+        let static_n = self.world.static_count;
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
@@ -5193,11 +5313,13 @@ impl State {
         let (scene_tris, scene_draws) = if self.world.view == View::Rocket {
             let tris = 1 // sky fullscreen triangle
                 + terrain_n / 3
+                + static_n / 3
                 + dyn_n / 3
                 + fx_n / 3
                 + hn as u32 / 3;
             let draws = 1 // sky
                 + (terrain_n > 0) as u32
+                + (static_n > 0) as u32
                 + (dyn_n > 0) as u32
                 + (fx_n > 0) as u32
                 + (n > 0) as u32 // overlay (lines)
@@ -5226,7 +5348,7 @@ impl State {
             {
                 let mut pass = mesh_pass(&mut encoder, &view, &self.depth_view);
                 self.gpu.draw_sky(&mut pass);
-                self.gpu.draw_meshes(&mut pass, terrain_n, dyn_n);
+                self.gpu.draw_meshes(&mut pass, terrain_n, static_n, dyn_n);
                 self.gpu.draw_plume(&mut pass, plume_on);
                 // re-entry plasma: depth-tested glow-mesh envelope, in the pass.
                 if plasma_on {
@@ -5311,6 +5433,7 @@ fn bench_plasma(scenario: &str, width: u32, height: u32) {
         return;
     }
     let terrain_n = world.terrain_count;
+    let static_n = world.static_count;
     let pmesh_n = world.plasma_mesh_n;
     let tris = pmesh_n / 3;
 
@@ -5334,7 +5457,7 @@ fn bench_plasma(scenario: &str, width: u32, height: u32) {
         {
             let mut pass = mesh_pass(enc, &target_view, &depth);
             gpu.draw_sky(&mut pass);
-            gpu.draw_meshes(&mut pass, terrain_n, dyn_n);
+            gpu.draw_meshes(&mut pass, terrain_n, static_n, dyn_n);
             gpu.draw_plume(&mut pass, plume_on);
             if plasma {
                 gpu.draw_plasma_mesh(&mut pass, pmesh_n);
@@ -6538,6 +6661,7 @@ fn render_shot(
 
     let (n, hn, dyn_n, fx_n, plasma_on, plume_on) = gpu.prepare(queue, &mut world, width, height, time);
     let terrain_n = world.terrain_count;
+    let static_n = world.static_count;
 
     // 256-byte aligned row pitch for the readback copy.
     let unpadded = width * 4;
@@ -6558,7 +6682,7 @@ fn render_shot(
         {
             let mut pass = mesh_pass(&mut encoder, &target_view, &depth);
             gpu.draw_sky(&mut pass);
-            gpu.draw_meshes(&mut pass, terrain_n, dyn_n);
+            gpu.draw_meshes(&mut pass, terrain_n, static_n, dyn_n);
             gpu.draw_plume(&mut pass, plume_on);
             if plasma_on {
                 gpu.draw_plasma_mesh(&mut pass, plasma_mesh_n);
@@ -6702,12 +6826,13 @@ fn render_anim(
         let (n, hn, dyn_n, fx_n, plasma_on, plume_on) =
             gpu.prepare(queue, &mut world, fw, fh, anim);
         let terrain_n = world.terrain_count;
+        let static_n = world.static_count;
         let mut enc =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("anim-enc") });
         {
             let mut pass = mesh_pass(&mut enc, &target_view, &depth);
             gpu.draw_sky(&mut pass);
-            gpu.draw_meshes(&mut pass, terrain_n, dyn_n);
+            gpu.draw_meshes(&mut pass, terrain_n, static_n, dyn_n);
             gpu.draw_plume(&mut pass, plume_on);
             gpu.draw_fx(&mut pass, fx_n);
             if plasma_on {
