@@ -618,8 +618,109 @@ fn mod_drill(m: &mut Mesh) {
     }
 }
 
+/// A crewed re-entry capsule: an Apollo-style "gumdrop" cone on an ablative heat
+/// shield, with a window band, a forward recovery (parachute) bay and a docking
+/// probe. This is the payload that the parachute-descent test recovers.
+fn mod_crew_capsule(m: &mut Mesh) {
+    mod_collar(m);
+    // ablative heat-shield rim flaring out to the capsule's widest point
+    m.frustum(0.0, 0.0, 0.6, 0.85, 0.62, 0.84, 20, BB_DARK, true, false);
+    // crew cabin: wide base tapering to a narrow forward shoulder (the cone)
+    m.frustum(0.0, 0.0, 0.85, 2.55, 0.84, 0.40, 20, BB_WHITE, false, false);
+    // wrap-around window band
+    m.frustum(0.0, 0.0, 1.25, 1.5, 0.66, 0.61, 20, BB_WIN, false, false);
+    // forward pressure-hatch ring
+    m.frustum(0.0, 0.0, 2.55, 2.75, 0.40, 0.38, 16, BB_TRIM, false, false);
+    // recovery / parachute bay (a stowed drum) + docking probe on top
+    m.frustum(0.0, 0.0, 2.75, 3.45, 0.38, 0.30, 16, BB_STEEL, false, true);
+    m.frustum(0.0, 0.0, 3.45, 3.95, 0.10, 0.05, 8, BB_TRIM, false, true);
+    // four RCS thruster nubs around the cone
+    for k in 0..4 {
+        let a = (k as f32 + 0.5) * std::f32::consts::FRAC_PI_2;
+        m.bx(Vec3::new(0.56 * a.cos(), 2.15, 0.56 * a.sin()), Vec3::new(0.08, 0.09, 0.08), BB_DARK);
+    }
+}
+
+/// A service module: the unpressurised bus that flies behind the capsule -
+/// propulsion (a single big engine bell), gold thermal blanketing, flat radiator
+/// wings, RCS quads and a high-gain dish. Used to test the service+crew stack and
+/// powered descent.
+fn mod_service_module(m: &mut Mesh) {
+    mod_collar(m);
+    // equipment drum with a gold thermal-blanket band
+    m.frustum(0.0, 0.0, 0.6, 3.2, 0.74, 0.74, 18, BB_STEEL, true, false);
+    m.frustum(0.0, 0.0, 1.0, 2.6, 0.76, 0.76, 18, BB_GOLD, false, false);
+    // main propulsion bell at the forward end (stacks engine-up in the fairing)
+    m.frustum(0.0, 0.0, 3.2, 4.1, 0.30, 0.62, 16, BB_DARK, false, true);
+    // two flat radiator wings
+    for s in [-1.0f32, 1.0] {
+        m.bx(Vec3::new(s * 0.96, 1.9, 0.0), Vec3::new(0.03, 1.0, 0.6), BB_TRIM);
+    }
+    // four RCS thruster quads near the base
+    for k in 0..4 {
+        let a = (k as f32 + 0.5) * std::f32::consts::FRAC_PI_2;
+        m.bx(Vec3::new(0.78 * a.cos(), 1.0, 0.78 * a.sin()), Vec3::new(0.11, 0.11, 0.11), BB_DARK);
+    }
+    // high-gain dish on a short boom
+    m.strut(Vec3::new(0.0, 2.4, 0.74), Vec3::new(0.0, 2.4, 1.05), 0.04, BB_TRIM);
+    m.dome(0.0, 1.05, 2.4, 0.28, 0.12, 12, 2, BB_WHITE);
+}
+
+/// A recovery parachute canopy, built in the vehicle's local model space so the
+/// rocket's pose transform carries it. `attach_y` is the model-space height of
+/// the vehicle's top (where the risers attach); `open` is the inflation fraction
+/// 0..1 (the canopy grows and lifts as it fills). Drawn as a gored hemisphere on
+/// suspension lines down to the attach point.
+pub fn parachute_canopy(attach_y: f32, open: f32) -> Mesh {
+    let mut m = Mesh::default();
+    if open <= 0.02 {
+        return m;
+    }
+    let orange = [0.95, 0.45, 0.12];
+    let white = [0.92, 0.93, 0.96];
+    let line = [0.85, 0.86, 0.90];
+    let r = 1.0 + open * 6.5; // canopy radius as it inflates
+    let lift = 3.0 + open * 9.0; // gap between the vehicle top and the rim
+    let rim_y = attach_y + lift;
+    let bulge = r * 0.7; // canopy height (apex above the rim)
+    let segs = 18usize;
+    let rings = 4usize;
+    // Gored hemisphere: alternate panel colours for the classic parachute look.
+    for s in 0..segs {
+        let a0 = s as f32 / segs as f32 * TAU;
+        let a1 = (s + 1) as f32 / segs as f32 * TAU;
+        let col = if s % 2 == 0 { orange } else { white };
+        for ri in 0..rings {
+            // phi sweeps from the apex (0) to the rim (PI/2)
+            let p0 = ri as f32 / rings as f32 * std::f32::consts::FRAC_PI_2;
+            let p1 = (ri + 1) as f32 / rings as f32 * std::f32::consts::FRAC_PI_2;
+            let pt = |ph: f32, an: f32| {
+                Vec3::new(r * ph.sin() * an.cos(), rim_y + bulge * ph.cos(), r * ph.sin() * an.sin())
+            };
+            let v00 = pt(p0, a0);
+            let v01 = pt(p0, a1);
+            let v10 = pt(p1, a0);
+            let v11 = pt(p1, a1);
+            // outward-ish normals (radial from the canopy centre)
+            let c = Vec3::new(0.0, rim_y, 0.0);
+            let n = (0.25 * (v00 + v01 + v10 + v11) - c).normalize_or_zero();
+            m.tri(v00, v01, v11, n, col);
+            m.tri(v00, v11, v10, n, col);
+        }
+    }
+    // suspension lines from the rim down to the attach point
+    let att = Vec3::new(0.0, attach_y, 0.0);
+    for i in 0..12 {
+        let a = i as f32 / 12.0 * TAU;
+        let rim = Vec3::new(r * a.cos(), rim_y, r * a.sin());
+        m.strut(rim, att, 0.03, line);
+    }
+    m
+}
+
 /// A fairing-packed cargo module (index matches the `module` field in the
-/// payload catalog: 0 refinery, 1 reactor, 2 generator, 3 habitat, 4 drill).
+/// payload catalog: 0 refinery, 1 reactor, 2 generator, 3 habitat, 4 drill,
+/// 5 crew capsule, 6 service module).
 pub fn cargo_module(idx: usize) -> Mesh {
     let mut m = Mesh::default();
     match idx {
@@ -627,7 +728,9 @@ pub fn cargo_module(idx: usize) -> Mesh {
         1 => mod_reactor(&mut m),
         2 => mod_generator(&mut m),
         3 => mod_habitat(&mut m),
-        _ => mod_drill(&mut m),
+        4 => mod_drill(&mut m),
+        5 => mod_crew_capsule(&mut m),
+        _ => mod_service_module(&mut m),
     }
     m
 }
@@ -817,8 +920,9 @@ pub const ASTEROID_NAMES: &[&str] = &["Hebe", "Pallas", "Itokara", "Eron"];
 pub fn cargo_catalog() -> Mesh {
     let mut m = Mesh::default();
     let spacing = 4.0f32;
-    for i in 0..5usize {
-        let cx = (i as f32 - 2.0) * spacing;
+    let n = 7usize; // refinery, reactor, generator, habitat, drill, crew, service
+    for i in 0..n {
+        let cx = (i as f32 - (n as f32 - 1.0) * 0.5) * spacing;
         let cm = cargo_module(i);
         for v in &cm.verts {
             let p = Vec3::new(v.pos[0] + cx, v.pos[1], v.pos[2]);
@@ -852,6 +956,32 @@ pub struct RocketBody {
     /// The two clamshell fairing halves (each swings out along local +/-X).
     pub fairing_l: std::ops::Range<usize>,
     pub fairing_r: std::ops::Range<usize>,
+    /// Radial-booster ring per stage: (count, ring radius). Drives the extra
+    /// exhaust plumes at the strap-on nozzles while that stage burns.
+    pub booster_rings: Vec<(u32, f32)>,
+    /// Per-part SDF primitives (round cones) in the model frame, tagged by the
+    /// stage they belong to (so they drop with it). Their union, plus
+    /// `sdf_payload`, is the vehicle SDF the re-entry plasma glow mesh hugs.
+    pub sdf_stage: Vec<(usize, SdfPrim)>,
+    /// Payload/nose SDF primitives (always attached).
+    pub sdf_payload: Vec<SdfPrim>,
+}
+
+/// A round-cone SDF primitive: end caps of radius `r1`/`r2` at `a`/`b` with a
+/// conical hull (covers cylinders, cones, capsules and spheres). Packed so each
+/// primitive is two vec4s (a.xyz+r1, b.xyz+r2) for the plasma shader.
+#[derive(Clone, Copy)]
+pub struct SdfPrim {
+    pub a: [f32; 3],
+    pub r1: f32,
+    pub b: [f32; 3],
+    pub r2: f32,
+}
+
+impl SdfPrim {
+    fn round_cone(a: Vec3, b: Vec3, r1: f32, r2: f32) -> Self {
+        SdfPrim { a: a.into(), r1, b: b.into(), r2 }
+    }
 }
 
 pub const PAD_TOP: f32 = 1.2;
@@ -994,6 +1124,394 @@ pub fn hangar(c: Vec3, light_offsets: &[Vec3]) -> Mesh {
     m
 }
 
+/// Small deterministic hash (0..1) from two integer cell coords, so the city
+/// meshes identically every time without storing a seed.
+fn hash01(i: i32, j: i32) -> f32 {
+    let mut h = (i as u32)
+        .wrapping_mul(0x1657_4d2b)
+        .wrapping_add((j as u32).wrapping_mul(0x9e37_79b1))
+        .wrapping_add(0x85eb_ca6b);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x2c1b_3c6d);
+    h ^= h >> 12;
+    h = h.wrapping_mul(0x297a_2d39);
+    h ^= h >> 15;
+    (h & 0x00ff_ffff) as f32 / 0x0100_0000 as f32
+}
+
+/// A flat, axis-aligned road slab (thin box, just proud of the ground) running
+/// between two ground points that share an X or a Z. Curbs optional.
+/// A flat road ribbon between two arbitrary points (any angle), as a quad lying
+/// on the ground at height `y`. Used for the organic city streets, whose
+/// segments are not axis-aligned. The quad is extended a little past each end so
+/// neighbouring segments overlap at the intersections instead of leaving gaps.
+fn road_ribbon(m: &mut Mesh, a: Vec3, b: Vec3, half_w: f32, y: f32, color: [f32; 3]) {
+    let a = Vec3::new(a.x, 0.0, a.z);
+    let b = Vec3::new(b.x, 0.0, b.z);
+    let along = b - a;
+    let len = along.length();
+    if len < 1e-3 {
+        return;
+    }
+    let dir = along / len;
+    let perp = Vec3::new(-dir.z, 0.0, dir.x) * half_w; // ground-plane normal of dir
+    let ext = dir * half_w; // overrun so corners knit together
+    let a = a - ext;
+    let b = b + ext;
+    let p0 = Vec3::new(a.x - perp.x, y, a.z - perp.z);
+    let p1 = Vec3::new(a.x + perp.x, y, a.z + perp.z);
+    let p2 = Vec3::new(b.x + perp.x, y, b.z + perp.z);
+    let p3 = Vec3::new(b.x - perp.x, y, b.z - perp.z);
+    let up = Vec3::Y;
+    m.tri3([p0, p1, p2], [up, up, up], [color, color, color]);
+    m.tri3([p0, p2, p3], [up, up, up], [color, color, color]);
+}
+
+/// A road that follows the terrain: a ribbon along the polyline `pts`, each leg
+/// subdivided and every vertex's height sampled from `ground`, so the strip
+/// drapes over hills instead of floating above or cutting through the curved
+/// terrain (which the old flat-slab roads did). Width is `2 * half_w`; `curbs`
+/// adds light shoulders along both edges. Used for the inter-city roads.
+pub fn road_strip(pts: &[Vec3], half_w: f32, curbs: bool, ground: &dyn Fn(f32, f32) -> f32) -> Mesh {
+    let mut m = Mesh::default();
+    let road = [0.27, 0.27, 0.30];
+    let curb = [0.40, 0.40, 0.36];
+    let up = Vec3::Y;
+    let lift = 0.12; // sit just proud of the ground it samples
+    // height-sampled point `off` metres to the side of cross-section centre `c`
+    let sample = |c: Vec3, perp: Vec3, off: f32, extra: f32| -> Vec3 {
+        let p = c + perp * off;
+        Vec3::new(p.x, ground(p.x, p.z) + lift + extra, p.z)
+    };
+    for w in pts.windows(2) {
+        let a = Vec3::new(w[0].x, 0.0, w[0].z);
+        let b = Vec3::new(w[1].x, 0.0, w[1].z);
+        let seg = b - a;
+        let len = seg.length();
+        if len < 1e-3 {
+            continue;
+        }
+        let dir = seg / len;
+        let perp = Vec3::new(-dir.z, 0.0, dir.x);
+        // overrun each end by half a width so the legs knit at the corners
+        let a = a - dir * half_w;
+        let total = len + half_w * 2.0;
+        let steps = (total / 18.0).ceil().max(1.0) as i32; // drape resolution
+        for s in 0..steps {
+            let c0 = a + dir * (total * s as f32 / steps as f32);
+            let c1 = a + dir * (total * (s + 1) as f32 / steps as f32);
+            let l0 = sample(c0, perp, -half_w, 0.0);
+            let r0 = sample(c0, perp, half_w, 0.0);
+            let l1 = sample(c1, perp, -half_w, 0.0);
+            let r1 = sample(c1, perp, half_w, 0.0);
+            m.tri3([l0, r0, r1], [up, up, up], [road, road, road]);
+            m.tri3([l0, r1, l1], [up, up, up], [road, road, road]);
+            if curbs {
+                for sgn in [-1.0f32, 1.0] {
+                    let e = half_w - 0.35;
+                    let a0 = sample(c0, perp, sgn * e, 0.08);
+                    let b0 = sample(c0, perp, sgn * (e + 0.6), 0.08);
+                    let a1 = sample(c1, perp, sgn * e, 0.08);
+                    let b1 = sample(c1, perp, sgn * (e + 0.6), 0.08);
+                    m.tri3([a0, b0, b1], [up, up, up], [curb, curb, curb]);
+                    m.tri3([a0, b1, a1], [up, up, up], [curb, curb, curb]);
+                }
+            }
+        }
+    }
+    m
+}
+
+/// A filled ground disc (triangle fan) with a hashed-ragged rim, so a city's
+/// paved area reads as an organic blob from above rather than a square pad.
+fn ground_disc(m: &mut Mesh, center: Vec3, radius: f32, seed: i32, color: [f32; 3], y: f32) {
+    let n = 56;
+    let up = Vec3::Y;
+    let rim = |i: i32| -> Vec3 {
+        let a = (i.rem_euclid(n) as f32 / n as f32) * std::f32::consts::TAU;
+        let r = radius * (0.86 + 0.14 * hash01(i.rem_euclid(n) * 13 + seed, seed * 7 + 3));
+        Vec3::new(center.x + a.cos() * r, y, center.z + a.sin() * r)
+    };
+    let c = Vec3::new(center.x, y, center.z);
+    for i in 0..n {
+        m.tri3([c, rim(i), rim(i + 1)], [up, up, up], [color, color, color]);
+    }
+}
+
+/// A procedural downtown: a street grid of blocks, each packed with a few
+/// buildings of varying height and colour, taller toward the centre, on a paved
+/// ground plane. Centred at `center` (local metres, ground at y=0). `variant`
+/// reseeds the layout so different cities look distinct, which is what makes a
+/// Streetlight head positions (local metres, head at ~5 m) for a city centred at
+/// `center`: a pair at every street-grid intersection on opposite kerbs (the
+/// SW and NE corners), so every road is lit from both sides rather than down the
+/// middle. Shared by the mesh builder (lamp posts + baked gradient) and the
+/// renderer (to drive a few as realtime point lights for moving NPCs).
+pub fn city_lamps(layout: &worldcity::CityLayout, center: Vec3) -> Vec<Vec3> {
+    layout
+        .intersections()
+        .into_iter()
+        .map(|p| Vec3::new(center.x + p.x, 5.0, center.z + p.y))
+        .collect()
+}
+
+/// cluster of these read as one big sprawl of separate downtowns. Built from the
+/// city's [`worldcity::CityLayout`] (the single organic source shared with the
+/// far footprint and orbital glow), so the streets curve and the blocks are
+/// irregular wedges rather than a square grid. Fully deterministic so it meshes
+/// the same every frame.
+pub fn city(layout: &worldcity::CityLayout, center: Vec3) -> Mesh {
+    let mut m = Mesh::default();
+
+    // Paved ground: an organic disc covering the built-up area, so no grass shows
+    // through and the outline reads as a blob, not a square pad.
+    let ground = [0.345, 0.35, 0.37];
+    ground_disc(&mut m, center, layout.radius, layout.seed as i32, ground, -0.05);
+
+    // Streets: a flat ribbon along every road segment of the network.
+    let road = [0.27, 0.27, 0.30];
+    for r in &layout.roads {
+        let a = Vec3::new(center.x + r.ax, 0.0, center.z + r.az);
+        let b = Vec3::new(center.x + r.bx, 0.0, center.z + r.bz);
+        road_ribbon(&mut m, a, b, r.width * 0.5, 0.12, road);
+    }
+
+    // building palette: concrete, tan, glass-blue, light, dark, plus a warm roof.
+    let pal = worldcity::PALETTE;
+    let roof = [0.30, 0.30, 0.33];
+    // Emissive window colours (summed > ~3.1 so the shader treats them as lit).
+    // The shader boosts emission at night, so these stay subtle by day and glow
+    // after dark.
+    let warm = [1.7, 1.42, 0.85];
+    let cool = [0.92, 1.12, 1.7];
+
+    for b in &layout.buildings {
+        let cx = center.x + b.cx;
+        let cz = center.z + b.cz;
+        let (fw, fd, height) = (b.fw, b.fd, b.height);
+        let col = pal[(b.pal as usize).min(pal.len() - 1)];
+        m.bx(Vec3::new(cx, height * 0.5, cz), Vec3::new(fw, height * 0.5, fd), col);
+        // a flat roof cap + a small rooftop unit, for silhouette interest.
+        m.bx(Vec3::new(cx, height + 0.5, cz), Vec3::new(fw * 0.96, 0.5, fd * 0.96), roof);
+        if b.warm != 0 {
+            m.bx(Vec3::new(cx + fw * 0.3, height + 1.6, cz - fd * 0.3), Vec3::new(fw * 0.25, 1.1, fd * 0.25), roof);
+        }
+
+        // Lit windows: thin emissive bands up the four faces of lit buildings, so
+        // the city glows like an occupied skyline at night. Capped to keep the
+        // vertex count down.
+        if b.lit != 0 {
+            let win = if b.warm != 0 { warm } else { cool };
+            let bands = ((height / 7.0) as i32).clamp(1, 6);
+            for bnd in 0..bands {
+                let wy = 3.0 + bnd as f32 * 7.0;
+                if wy > height - 1.5 {
+                    break;
+                }
+                m.bx(Vec3::new(cx + fw, wy, cz), Vec3::new(0.06, 0.9, fd * 0.82), win);
+                m.bx(Vec3::new(cx - fw, wy, cz), Vec3::new(0.06, 0.9, fd * 0.82), win);
+                m.bx(Vec3::new(cx, wy, cz + fd), Vec3::new(fw * 0.82, 0.9, 0.06), win);
+                m.bx(Vec3::new(cx, wy, cz - fd), Vec3::new(fw * 0.82, 0.9, 0.06), win);
+            }
+        }
+    }
+
+    // Streetlight poles + emissive heads at the intersections (these read fine by
+    // day; the warm ground wash that actually lights the streets at night lives
+    // in the separate `city_night_glow` mesh, drawn only at night).
+    let pole = [0.20, 0.20, 0.23];
+    let head = [2.0, 1.5, 0.85]; // emissive warm sodium head
+    for lp in city_lamps(layout, center) {
+        m.bx(Vec3::new(lp.x, 2.5, lp.z), Vec3::new(0.16, 2.5, 0.16), pole);
+        m.bx(Vec3::new(lp.x, lp.y, lp.z), Vec3::new(0.5, 0.28, 0.5), head);
+    }
+    m
+}
+
+/// The night-only warm ground lighting for a city, as a smooth gradient: a
+/// tessellated ground mesh whose per-vertex warmth is the summed light falloff
+/// from every nearby streetlight, so the road glows brightest at the kerbs under
+/// the lamps and fades into the dark between them (rather than flat pools). Kept
+/// separate from the day city mesh because its warm albedo would tint the streets
+/// by day; the renderer draws it only at night, where the night-boosted emissive
+/// term makes it glow. Lifted clear of the paved ground so the logarithmic depth
+/// resolves against the cell-tessellated ground.
+pub fn city_night_glow(layout: &worldcity::CityLayout, center: Vec3) -> Mesh {
+    let mut m = Mesh::default();
+    let lamps = city_lamps(layout, center);
+    let half = layout.radius; // city half-extent
+    let margin = 30.0f32; // spill a little onto the surrounding land
+    let lo_x = center.x - half - margin;
+    let lo_z = center.z - half - margin;
+    let extent = 2.0 * (half + margin);
+    let cellm = 11.0f32; // grid resolution (smaller = smoother gradient)
+    let n = (extent / cellm).ceil() as usize + 1;
+    let warm = [1.0f32, 0.72, 0.42];
+    let wsum = warm[0] + warm[1] + warm[2];
+    let r = 42.0f32; // lamp reach (m): a smoothstep falloff to zero so only nearby
+    let y = 0.30f32; // lamps contribute (no distant-lamp buildup across the city)
+
+    let mut pos: Vec<Vec3> = Vec::with_capacity(n * n);
+    let mut col: Vec<[f32; 3]> = Vec::with_capacity(n * n);
+    for j in 0..n {
+        let z = lo_z + j as f32 * cellm;
+        for i in 0..n {
+            let x = lo_x + i as f32 * cellm;
+            let mut inten = 0.0f32;
+            for lp in &lamps {
+                let dx = x - lp.x;
+                let dz = z - lp.z;
+                let t = ((dx * dx + dz * dz).sqrt() / r).min(1.0);
+                inten += 1.0 - t * t * (3.0 - 2.0 * t); // smoothstep pool, 0 at reach
+            }
+            // Map intensity to a colour sum spanning the emissive knee (~2.3), so
+            // dark gaps stay below it and lit kerbs ramp up - a smooth gradient.
+            let s = 1.92 + 0.32 * inten.min(3.2);
+            let f = s / wsum;
+            pos.push(Vec3::new(x, y, z));
+            col.push([warm[0] * f, warm[1] * f, warm[2] * f]);
+        }
+    }
+
+    let up = Vec3::Y;
+    for j in 0..n - 1 {
+        for i in 0..n - 1 {
+            let a = j * n + i;
+            let b = a + 1;
+            let c = a + n;
+            let d = c + 1;
+            m.tri3([pos[a], pos[c], pos[b]], [up, up, up], [col[a], col[c], col[b]]);
+            m.tri3([pos[b], pos[c], pos[d]], [up, up, up], [col[b], col[c], col[d]]);
+        }
+    }
+    m
+}
+
+/// The far level-of-detail for a city: a flat footprint - the dark street grid,
+/// lighter concrete block pads, and palette-coloured building footprints - with
+/// no 3D massing, drawn beyond the building range so the city still reads as
+/// blocks and roads from kilometres away. Generated from the SAME `CityLayout`
+/// as the near buildings (`worldcity::generate`), so the two line up exactly.
+/// Tessellated per cell so the logarithmic depth resolves at distance.
+pub fn city_footprint(layout: &worldcity::CityLayout, center: Vec3) -> Mesh {
+    let mut m = Mesh::default();
+    let road = [0.20, 0.205, 0.225]; // asphalt
+    let concrete = [0.40, 0.40, 0.42]; // paved blocks under the buildings
+    // Concrete pad (organic disc) for the whole built-up area, then the road
+    // ribbons over it - so from far the city reads as paved blocks cut by a
+    // curving street network, matching the near massing.
+    ground_disc(&mut m, center, layout.radius, layout.seed as i32, concrete, 0.05);
+    for r in &layout.roads {
+        let a = Vec3::new(center.x + r.ax, 0.0, center.z + r.az);
+        let b = Vec3::new(center.x + r.bx, 0.0, center.z + r.bz);
+        road_ribbon(&mut m, a, b, r.width * 0.5, 0.09, road);
+    }
+    // Building footprints: lit ones use an emissive warm/cool tile so the city
+    // also glows from far at night (the same `lit` data drives the near windows),
+    // unlit ones use the concrete palette. Night-boosted emissive keeps them
+    // subtle by day.
+    let warm = [1.7, 1.35, 0.8];
+    let cool = [0.95, 1.1, 1.6];
+    for b in &layout.buildings {
+        let col = if b.lit != 0 {
+            if b.warm != 0 { warm } else { cool }
+        } else {
+            worldcity::PALETTE[(b.pal as usize).min(worldcity::PALETTE.len() - 1)]
+        };
+        m.bx(Vec3::new(center.x + b.cx, 0.12, center.z + b.cz), Vec3::new(b.fw, 0.04, b.fd), col);
+    }
+    m
+}
+pub fn car(body: [f32; 3]) -> Mesh {
+    let mut m = Mesh::default();
+    let cabin = [0.30, 0.33, 0.40]; // tinted glass
+    let trim = [0.10, 0.10, 0.11];
+    let wheel = [0.06, 0.06, 0.07];
+    let light = [1.0, 0.92, 0.6]; // headlamps (front), brighter so the front reads
+    // chassis: ~4.2 m long (X), 1.9 m wide (Z), sitting ~0.45 m off the ground
+    m.bx(Vec3::new(0.0, 0.65, 0.0), Vec3::new(2.1, 0.32, 0.95), body);
+    // cabin / greenhouse, set back a little
+    m.bx(Vec3::new(-0.15, 1.12, 0.0), Vec3::new(1.0, 0.32, 0.82), cabin);
+    // front + rear bumpers
+    m.bx(Vec3::new(2.05, 0.55, 0.0), Vec3::new(0.12, 0.22, 0.95), trim);
+    m.bx(Vec3::new(-2.05, 0.55, 0.0), Vec3::new(0.12, 0.22, 0.95), trim);
+    // headlamps on the front (+X) so the facing reads at a glance
+    for sz in [0.62f32, -0.62] {
+        m.bx(Vec3::new(2.12, 0.62, sz), Vec3::new(0.06, 0.10, 0.18), light);
+    }
+    // four wheels (short cylinders about the Z axis, via boxes for simplicity)
+    for sx in [1.3f32, -1.3] {
+        for sz in [1.0f32, -1.0] {
+            m.bx(Vec3::new(sx, 0.4, sz * 0.92), Vec3::new(0.42, 0.4, 0.18), wheel);
+        }
+    }
+    m
+}
+
+/// A third-person character, modelled facing +X and standing on the ground at
+/// y=0, posed for a walk cycle. `phase` advances the stride; `moving` (0..1)
+/// scales the limb swing so the figure is still when idle and strides when
+/// walking; `shirt` tints the top so a crowd has variety. The front (+X) carries
+/// a face and a swept fringe and the back (-X) a mass of hair, so the heading is
+/// unmistakable (people are not symmetric front-to-back).
+pub fn character(phase: f32, moving: f32, shirt: [f32; 3]) -> Mesh {
+    use std::f32::consts::PI;
+    let mut m = Mesh::default();
+    let skin = [0.86, 0.66, 0.52];
+    let pants = [0.24, 0.26, 0.32];
+    let shoe = [0.10, 0.10, 0.11];
+    let hair = [0.18, 0.12, 0.08];
+    let eye = [0.08, 0.07, 0.07];
+
+    // Trunk: shoulders are wider side-to-side (z) than the body is deep (x), so it
+    // reads as a person from the front. Faces +X. Parts abut rather than overlap.
+    m.bx(Vec3::new(0.0, 1.20, 0.0), Vec3::new(0.13, 0.27, 0.19), shirt); // torso
+    m.bx(Vec3::new(0.0, 0.86, 0.0), Vec3::new(0.14, 0.11, 0.16), pants); // hips
+    m.bx(Vec3::new(0.0, 1.49, 0.0), Vec3::new(0.06, 0.06, 0.06), skin); // neck
+    m.bx(Vec3::new(0.02, 1.65, 0.0), Vec3::new(0.115, 0.13, 0.115), skin); // head
+
+    // Hair: a cap over the whole crown, brought down into a hairline on the
+    // forehead (no bald patch), short around the back and sides (no mullet).
+    m.bx(Vec3::new(0.01, 1.77, 0.0), Vec3::new(0.125, 0.05, 0.13), hair); // crown
+    m.bx(Vec3::new(0.115, 1.745, 0.0), Vec3::new(0.028, 0.035, 0.12), hair); // front hairline
+    m.bx(Vec3::new(-0.085, 1.66, 0.0), Vec3::new(0.05, 0.11, 0.125), hair); // back + sides
+
+    // face on the front (+X)
+    for sz in [0.055f32, -0.055] {
+        m.bx(Vec3::new(0.135, 1.68, sz), Vec3::new(0.012, 0.02, 0.022), eye);
+    }
+    m.bx(Vec3::new(0.14, 1.63, 0.0), Vec3::new(0.02, 0.025, 0.022), skin); // nose
+
+    // Legs: a real walk cycle - the foot lifts off the ground and the knee bends
+    // through the swing, plants at the front, then drives back through the stance
+    // (no foot-on-the-floor shuffling). Right leg is half a cycle behind.
+    for (sz, ph) in [(-1.0f32, 0.0f32), (1.0, PI)] {
+        let a = phase + ph;
+        let stride = 0.34 * moving;
+        let fx = a.sin() * stride; // fore/aft foot position
+        // The foot lifts clearly off the ground through the swing (back -> front)
+        // and is planted flat through the stance, so it steps instead of shuffling.
+        let lift = a.cos().max(0.0).powf(0.7) * 0.22 * moving;
+        let hip = Vec3::new(0.0, 0.80, sz * 0.10);
+        let foot = Vec3::new(fx, 0.06 + lift, sz * 0.10);
+        // knee drives forward + up while the foot is lifted, so the leg bends.
+        let knee = Vec3::new(fx * 0.45 + lift * 1.0, 0.45 + lift * 0.1, sz * 0.10);
+        m.strut(hip, knee, 0.085, pants);
+        m.strut(knee, foot, 0.075, pants);
+        m.bx(foot + Vec3::new(0.05, 0.0, 0.0), Vec3::new(0.13, 0.045, 0.085), shoe);
+    }
+    // Arms: swing fore-aft opposite the legs, with a slight elbow bend.
+    for (sz, ph) in [(-1.0f32, PI), (1.0, 0.0)] {
+        let sw = (phase + ph).sin() * 0.28 * moving;
+        let sh = Vec3::new(0.0, 1.42, sz * 0.22);
+        let elbow = Vec3::new(sw * 0.6, 1.16, sz * 0.23);
+        let hand = Vec3::new(sw, 0.92, sz * 0.235);
+        m.strut(sh, elbow, 0.058, shirt);
+        m.strut(elbow, hand, 0.052, skin);
+    }
+    m
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum PartKind {
     Engine,
@@ -1024,10 +1542,24 @@ pub fn append_part(m: &mut Mesh, kind: PartKind, c: Vec3, col: [f32; 3]) {
     }
 }
 
+/// Per-stage radial-booster description for the body builder (the sim vehicle
+/// folds boosters into the stage, so their visual count/size is passed here).
+#[derive(Clone, Copy, Default)]
+pub struct BoosterViz {
+    pub count: u32,
+    pub prop: f32, // per-booster propellant, sizes the strap-on
+    pub solid: bool,
+}
+
 /// Build the rocket body for `veh` about its base at y=0, proportional to each
 /// stage's tank (radius/height) and engine (cluster). `payload_col` tints the
-/// payload section.
-pub fn rocket_body(veh: &Vehicle, payload_col: [f32; 3], module_id: i32) -> RocketBody {
+/// payload section. `boosters[i]` rings stage `i` with radial strap-ons.
+pub fn rocket_body(
+    veh: &Vehicle,
+    payload_col: [f32; 3],
+    module_id: i32,
+    boosters: &[BoosterViz],
+) -> RocketBody {
     let mut m = Mesh::default();
     let n = veh.stages.len().max(1);
     let radii: Vec<f32> = veh.stages.iter().map(|s| stage_radius(s.prop)).collect();
@@ -1036,6 +1568,9 @@ pub fn rocket_body(veh: &Vehicle, payload_col: [f32; 3], module_id: i32) -> Rock
     let mut stage_ranges = Vec::new();
     let mut nozzle_y = Vec::new();
     let mut engine_r = Vec::new();
+    let mut booster_rings: Vec<(u32, f32)> = Vec::new();
+    let mut sdf_stage: Vec<(usize, SdfPrim)> = Vec::new();
+    let mut sdf_payload: Vec<SdfPrim> = Vec::new();
     let mut y = 0.0f32;
     for (i, stage) in veh.stages.iter().enumerate() {
         let start = m.verts.len();
@@ -1044,6 +1579,8 @@ pub fn rocket_body(veh: &Vehicle, payload_col: [f32; 3], module_id: i32) -> Rock
         let vol = stage.prop as f32 / PROP_DENSITY;
         let h = (vol / (std::f32::consts::PI * r * r)).max(2.5);
         nozzle_y.push(y);
+        // stage body as an SDF round cone (cylinder), tagged to this stage.
+        sdf_stage.push((i, SdfPrim::round_cone(Vec3::new(0.0, y, 0.0), Vec3::new(0.0, y + h, 0.0), r, r)));
 
         // body + a couple of dark bands for scale
         m.frustum(0.0, 0.0, y, y + h, r, r, 24, col, false, false);
@@ -1075,6 +1612,38 @@ pub fn rocket_body(veh: &Vehicle, payload_col: [f32; 3], module_id: i32) -> Rock
             }
         }
 
+        // radial strap-on boosters ringing this stage (drawn into the stage's own
+        // vertex range so they jettison / break up with it).
+        let mut ring = (0u32, 0.0f32);
+        if let Some(bv) = boosters.get(i) {
+            if bv.count > 0 {
+                let nb = bv.count as usize;
+                let bvol = bv.prop / PROP_DENSITY;
+                let br = ((bv.prop / 100_000.0).cbrt() * 1.05).clamp(0.45, 1.7);
+                // height from propellant volume, but capped to the core stage.
+                let bh = (bvol / (std::f32::consts::PI * br * br)).clamp(h * 0.4, h * 0.92);
+                let rr = r + br + 0.15; // ring radius: just outside the core
+                ring = (bv.count, rr);
+                let bcol = if bv.solid { [0.86, 0.85, 0.82] } else { [0.80, 0.83, 0.88] };
+                for k in 0..nb {
+                    let a = k as f32 / nb as f32 * std::f32::consts::TAU;
+                    let (cx, cz) = (a.cos() * rr, a.sin() * rr);
+                    // strap-on body + ogive nose as SDF round cones (this stage).
+                    sdf_stage.push((i, SdfPrim::round_cone(Vec3::new(cx, y, cz), Vec3::new(cx, y + bh, cz), br, br)));
+                    sdf_stage.push((i, SdfPrim::round_cone(Vec3::new(cx, y + bh, cz), Vec3::new(cx, y + bh + br * 2.2, cz), br, 0.05)));
+                    // motor body
+                    m.frustum(cx, cz, y, y + bh, br, br, 12, bcol, false, false);
+                    // a dark band for scale
+                    m.frustum(cx, cz, y + bh * 0.4, y + bh * 0.4 + 0.2, br * 1.02, br * 1.02, 12, [0.16, 0.16, 0.18], false, false);
+                    // ogive nose cap
+                    m.frustum(cx, cz, y + bh, y + bh + br * 2.2, br, 0.0, 12, [0.55, 0.12, 0.10], false, false);
+                    // nozzle below
+                    m.frustum(cx, cz, y - 1.3, y, br * 0.45, br * 0.7, 10, [0.13, 0.13, 0.15], false, true);
+                }
+            }
+        }
+        booster_rings.push(ring);
+
         y += h;
         // interstage tapering to the next stage's radius (or toward the payload)
         let next_r = radii.get(i + 1).copied().unwrap_or(r * 0.85);
@@ -1095,6 +1664,9 @@ pub fn rocket_body(veh: &Vehicle, payload_col: [f32; 3], module_id: i32) -> Rock
     let nose_h = 4.0;
     let fy1 = fy0 + cyl_h; // shoulder
     let ny = fy1 + nose_h; // nose tip
+    // payload fairing: cylinder up to the shoulder, then an ogive to the tip.
+    sdf_payload.push(SdfPrim::round_cone(Vec3::new(0.0, fy0, 0.0), Vec3::new(0.0, fy1, 0.0), pr, pr));
+    sdf_payload.push(SdfPrim::round_cone(Vec3::new(0.0, fy1, 0.0), Vec3::new(0.0, ny, 0.0), pr, 0.05));
 
     // 1) the payload itself, sitting on the upper-stage forward dome
     let mstart = m.verts.len();
@@ -1158,6 +1730,9 @@ pub fn rocket_body(veh: &Vehicle, payload_col: [f32; 3], module_id: i32) -> Rock
         module_range,
         fairing_l,
         fairing_r,
+        booster_rings,
+        sdf_stage,
+        sdf_payload,
     }
 }
 
@@ -1172,12 +1747,29 @@ pub fn rocket_body(veh: &Vehicle, payload_col: [f32; 3], module_id: i32) -> Rock
 // ---------------------------------------------------------------------------
 
 use glam::DVec3;
-use terrain::{build_mesh, select, Elevation, Planet};
+use terrain::{build_mesh, select, Elevation, Lod, Planet};
 
 /// Spaceport (matches sim / worldgen seed 47).
 const SPACEPORT_LAT_DEG: f64 = -1.7;
 const SPACEPORT_LON_DEG: f64 = -102.9;
 pub const PLANET_RADIUS: f64 = 6.2e6;
+
+/// Quadtree split factor used for the planet terrain LOD: split a patch while
+/// the camera is within `edge * factor` of it. Shared by the mesh build and the
+/// LOD-debug stats so the HUD and the geometry always agree. Larger = the fine
+/// LOD zone reaches much further out (more, bigger detail rings).
+pub const PLANET_SPLIT_FACTOR: f64 = 3.2;
+
+/// Vertices per side of each leaf-patch mesh. Higher = denser terrain (more
+/// triangles per patch). Native can comfortably push 1-2M terrain triangles.
+pub const PLANET_PATCH_N: usize = 17;
+
+/// Run only the planet LOD selection (no meshing) for the debug HUD: returns the
+/// active patch set + per-depth counts for `cam_world`.
+pub fn planet_lod(cam_world: DVec3, max_depth: u32) -> Lod {
+    let planet = Planet { radius: PLANET_RADIUS };
+    select(&planet, cam_world, PLANET_SPLIT_FACTOR, max_depth)
+}
 
 /// The launch-site direction (unit), honouring the MTS_TERRAIN_LATLON override.
 fn spaceport_dir() -> DVec3 {
@@ -1195,7 +1787,7 @@ fn spaceport_dir() -> DVec3 {
 
 /// The planet elevation field with the launch-pad flat zone applied (unless
 /// MTS_TERRAIN_NOFLAT). Shared by the launch frame and the terrain mesh.
-fn launch_elevation() -> Elevation {
+pub fn launch_elevation() -> Elevation {
     let mut elev = Elevation::new(47);
     if std::env::var("MTS_TERRAIN_NOFLAT").is_err() {
         // flat out far enough to hold the pad, the assembly building ~5 km away,
@@ -1243,6 +1835,26 @@ fn hashf(p: Vec3) -> f32 {
     let mut h = (p.x * 127.1 + p.y * 311.7 + p.z * 74.7).sin() * 43758.547;
     h -= h.floor();
     h
+}
+
+/// LOD-debug palette: a saturated colour per quadtree depth, cycling so that
+/// adjacent LOD levels always contrast. Drawn over the terrain when LOD debug is
+/// on so the split rings (where one depth meets the next) are obvious. The same
+/// table backs the HUD legend, so the colours match.
+pub fn lod_color(depth: u32) -> [f32; 3] {
+    const PALETTE: [[f32; 3]; 10] = [
+        [0.85, 0.15, 0.15], // 0 red (coarsest visible)
+        [0.95, 0.55, 0.10], // 1 orange
+        [0.95, 0.90, 0.15], // 2 yellow
+        [0.30, 0.85, 0.25], // 3 green
+        [0.15, 0.85, 0.70], // 4 teal
+        [0.20, 0.65, 0.95], // 5 blue
+        [0.40, 0.40, 0.95], // 6 indigo
+        [0.75, 0.35, 0.95], // 7 violet
+        [0.95, 0.35, 0.75], // 8 magenta
+        [0.92, 0.92, 0.95], // 9 white (finest)
+    ];
+    PALETTE[(depth as usize) % PALETTE.len()]
 }
 
 fn terrain_color(signed_h: f64, slope: f32, jitter: f32, abs_lat: f64, lunar: bool) -> [f32; 3] {
@@ -1301,6 +1913,7 @@ pub fn planet_terrain(
     north: DVec3,
     max_depth: u32,
     lunar: bool,
+    lod_debug: bool,
 ) -> Mesh {
     let planet = Planet { radius: PLANET_RADIUS };
     let elev = if lunar { lunar_elevation() } else { launch_elevation() };
@@ -1312,9 +1925,9 @@ pub fn planet_terrain(
         Vec3::new(d.dot(east) as f32, d.dot(up) as f32, d.dot(north) as f32)
     };
 
-    let lod = select(&planet, cam_world, 1.5, max_depth);
+    let lod = select(&planet, cam_world, PLANET_SPLIT_FACTOR, max_depth);
     let mut m = Mesh::default();
-    let n = 9;
+    let n = PLANET_PATCH_N;
     let grid = n * n; // first `grid` positions are the surface; the rest are skirts
     for patch in &lod.patches {
         // Skirt depth scales with the patch so coarse far patches still seal.
@@ -1362,8 +1975,12 @@ pub fn planet_terrain(
 
         // Per-vertex colour (height/slope/lat), with a small position-hashed
         // jitter that now interpolates smoothly instead of per-triangle.
+        let dbg = lod_debug.then(|| lod_color(patch.depth));
         let col: Vec<[f32; 3]> = (0..nv)
             .map(|i| {
+                if let Some(c) = dbg {
+                    return c; // flat per-depth colour; the surface normal still shades it
+                }
                 let cdir = pm.positions[i].normalize();
                 let slope = (1.0 - nrm[i].dot(radial[i])).clamp(0.0, 1.0);
                 let abs_lat = cdir.y.clamp(-1.0, 1.0).asin().abs();
@@ -1388,7 +2005,13 @@ pub fn planet_terrain(
 /// position in the asteroid frame; `radius` is the base sphere radius and the
 /// `elev` asteroid field adds the lobes/craters on top. Returns local-space
 /// vertices (the body sits at the origin, so no floating-origin offset).
-pub fn asteroid_terrain(cam_local: DVec3, radius: f64, elev: &Elevation, max_depth: u32) -> Mesh {
+pub fn asteroid_terrain(
+    cam_local: DVec3,
+    radius: f64,
+    elev: &Elevation,
+    max_depth: u32,
+    lod_debug: bool,
+) -> Mesh {
     let planet = Planet { radius };
     let amp = (radius * 0.34) as f32; // colour scale (matches the field amplitude)
     let lod = select(&planet, cam_local, 1.6, max_depth);
@@ -1425,8 +2048,12 @@ pub fn asteroid_terrain(cam_local: DVec3, radius: f64, elev: &Elevation, max_dep
         let local: Vec<Vec3> = pm.positions.iter().map(|&w| w.as_vec3()).collect();
         let radial: Vec<Vec3> = pm.positions.iter().map(|&w| w.normalize_or_zero().as_vec3()).collect();
         let nrm: Vec<Vec3> = pm.positions.iter().map(|&w| normal_at(w.normalize(), eps)).collect();
+        let dbg = lod_debug.then(|| lod_color(patch.depth));
         let col: Vec<[f32; 3]> = (0..nv)
             .map(|i| {
+                if let Some(c) = dbg {
+                    return c;
+                }
                 let h_frac = ((local[i].length() - radius as f32) / amp).clamp(0.0, 1.0);
                 let base = mix3([0.17, 0.14, 0.12], [0.40, 0.36, 0.31], h_frac);
                 let slope = (1.0 - nrm[i].dot(radial[i])).clamp(0.0, 1.0);

@@ -2,6 +2,15 @@
 
 Guidance for Claude Code when working in this repository.
 
+## Don'ts
+
+- Never rebuild an existing feature from scratch. Before writing something that
+  sounds like it might already exist (a generator, a renderer, a UI panel, a
+  math helper), search the codebase and find it first. Then extend or
+  parameterize the existing code - add an argument, a variant, a strategy - so
+  there is one implementation, not two parallel ones that can drift. If the
+  current code genuinely cannot be adapted, say why before replacing it.
+
 ## Writing conventions
 
 - Never use em-dashes (the "—" character) anywhere in this repo: not in docs,
@@ -42,6 +51,22 @@ integrate with wgpu + winit:
 New UI should be built with egui rather than more hand-rolled text-quad drawing,
 and the existing HUD/menus should migrate to egui as they grow. Keep UI code out
 of the render hot path (egui composits over the wgpu frame).
+
+### UI-first controls (no hotkeys for menus/tests)
+
+Everything the player or developer can do must be reachable through the egui UI.
+Do not add a keyboard shortcut as the only (or primary) way to trigger an
+action.
+
+- Keyboard shortcuts are reserved for controlling the active vehicle (throttle,
+  pitch, staging, camera) and for complementing an existing on-screen UI control.
+  A key may mirror a button, but never replace it.
+- Test/debug scenes and dev toggles (e.g. jumping into a re-entry test,
+  switching the plasma renderer) belong in a dedicated egui menu - never bound to
+  a hotkey. Put them in the "Test Scenes" panel (`test_menu` in `ui.rs`) and add
+  new test scenarios there as buttons, not key bindings.
+- When in doubt, add the UI control first; only add a complementary hotkey
+  afterwards if it genuinely helps flying.
 
 ## Verifying rendering headlessly (software GPU)
 

@@ -23,6 +23,7 @@ pub struct PlanetJob {
     pub north: DVec3,
     pub depth: u32,
     pub lunar: bool,
+    pub lod_debug: bool,
 }
 
 impl PlanetJob {
@@ -36,6 +37,7 @@ impl PlanetJob {
             self.north,
             self.depth,
             self.lunar,
+            self.lod_debug,
         )
         .verts
     }

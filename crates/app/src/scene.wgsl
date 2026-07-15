@@ -73,6 +73,51 @@ fn vnoise(p: vec3<f32>) -> f32 {
     return mix(y0, y1, w.z);
 }
 
+// Scattered jitter vector in 0..1 for a Voronoi cell, so feature points sit at
+// irregular positions inside their integer cells.
+fn hash33(p: vec3<f32>) -> vec3<f32> {
+    let q = vec3<f32>(
+        dot(p, vec3<f32>(127.1, 311.7, 74.7)),
+        dot(p, vec3<f32>(269.5, 183.3, 246.1)),
+        dot(p, vec3<f32>(113.5, 271.9, 124.6)),
+    );
+    return fract(sin(q) * 43758.5453);
+}
+
+// Brightness of a single light point at squared distance `d2` (cell units),
+// reaching zero past `radius` so points stay small and separated.
+fn dot_bright(d2: f32, radius: f32) -> f32 {
+    let d = sqrt(d2);
+    return pow(clamp(1.0 - d / radius, 0.0, 1.0), 1.8);
+}
+
+// Gated Voronoi point field. Each cell holds one feature point ("a town"), but it
+// is only lit if the cell's random rank falls below the local `density`. So a
+// dense core (density >= 1) lights every point and reads as a packed cluster,
+// while a low-density fringe lights only a scattered few - isolated dots with
+// dark gaps between them, like real city lights from orbit. Returns the
+// brightness of the nearest lit point to `p`.
+fn scatter_points(p: vec3<f32>, density: f32, radius: f32) -> f32 {
+    let ip = floor(p);
+    let fp = fract(p);
+    var best = 1.0e9;
+    for (var z = -1; z <= 1; z = z + 1) {
+        for (var y = -1; y <= 1; y = y + 1) {
+            for (var x = -1; x <= 1; x = x + 1) {
+                let g = vec3<f32>(f32(x), f32(y), f32(z));
+                let cell = ip + g;
+                let rank = hash3(cell + vec3<f32>(0.7, 2.3, 4.1));
+                if (rank < density) {
+                    let o = hash33(cell);
+                    let r = g + o - fp;
+                    best = min(best, dot(r, r));
+                }
+            }
+        }
+    }
+    return dot_bright(best, radius);
+}
+
 // Nearest positive root of the ray/sphere intersection, or -1.0 on a miss.
 fn hit_sphere(ro: vec3<f32>, rd: vec3<f32>, center: vec3<f32>, radius: f32) -> f32 {
     let oc = center - ro;
@@ -103,6 +148,37 @@ fn shade_planet(p: vec3<f32>, center: vec3<f32>, color: vec3<f32>) -> vec3<f32> 
     return color * band * (0.05 + 0.95 * ndl);
 }
 
+// Night-side city lights. The baked emission map (texel.a) is treated as a
+// POPULATION DENSITY, not a glow: it gates a gated Voronoi point field so the
+// surface lights up as discrete settlements - packed clusters in the dense
+// cores fading to scattered isolated dots toward the fringes, with dark country
+// between - rather than a blurry blob. Two scales give big-city dots plus a
+// finer scatter of small towns. Highways (their own faint density) read as
+// dotted strings of light between the cities.
+fn city_lights(n: vec3<f32>, emission: f32, time: f32) -> vec3<f32> {
+    if (emission < 0.004) {
+        return vec3<f32>(0.0);
+    }
+    // local density drives how many feature points light up (cores >= 1 fill in;
+    // fringes light only a scattered few).
+    let density = clamp(emission * 1.4, 0.0, 1.45);
+    // small, separated points at two scales so even dense cores read as many
+    // distinct dots rather than a solid cloud.
+    let coarse = scatter_points(n * 170.0, density, 0.42);
+    let fine = scatter_points(n * 470.0 + vec3<f32>(11.3, 4.1, 7.7), density, 0.32);
+    let dots = max(coarse, 0.85 * fine);
+    // warm/cool district variation + a gentle twinkle on the points.
+    let wc = vnoise(n * 200.0 + vec3<f32>(7.3, 1.1, 4.2));
+    let tw = 0.82 + 0.18 * sin(time * 2.2 + wc * 120.0);
+    // no connective bloom: brightness is purely the discrete points, so the
+    // field stays point-like instead of smearing into a cloudy shape.
+    let inten = dots * (0.55 + 0.95 * emission) * tw;
+    let cool = smoothstep(0.72, 0.94, wc);
+    let warm = vec3<f32>(1.0, 0.72, 0.38);
+    let white = vec3<f32>(0.85, 0.90, 1.0);
+    return mix(warm, white, cool * 0.6) * inten;
+}
+
 fn shade_home(p: vec3<f32>, rd: vec3<f32>) -> vec3<f32> {
     let n = normalize(p - s.home.xyz);
     let sun = normalize(s.sun.xyz - p);
@@ -119,12 +195,22 @@ fn shade_home(p: vec3<f32>, rd: vec3<f32>) -> vec3<f32> {
     let diffuse = day * (0.12 + 0.88 * max(ndl, 0.0));
     var col = albedo * vec3<f32>(1.05, 1.02, 0.95) * diffuse;
 
-    // city lights on the dark side
+    // ocean sun-glint: oceans read as blue-dominant, darker albedo in the baked
+    // map; give them a tight specular highlight where the sun mirrors to the
+    // camera, the classic bright glint of water seen from orbit.
+    let lum = dot(albedo, vec3<f32>(0.33, 0.34, 0.33));
+    let oceanness = clamp((albedo.b - albedo.r * 0.85) * 7.0, 0.0, 1.0)
+        * (1.0 - smoothstep(0.20, 0.42, lum));
+    let viewdir = -rd;
+    let halfv = normalize(sun + viewdir);
+    let glint = pow(max(dot(n, halfv), 0.0), 220.0) * day * oceanness;
+    col = col + vec3<f32>(1.0, 0.97, 0.88) * glint * 1.4;
+
+    // detailed city lights on the dark side (fade in through the terminator)
     let night = 1.0 - day;
-    col = col + vec3<f32>(1.0, 0.82, 0.5) * emission * night * 1.7;
+    col = col + city_lights(n, emission, s.params.z) * night * 2.6;
 
     // atmospheric limb (rim toward the camera)
-    let viewdir = -rd;
     let rim = pow(1.0 - max(dot(n, viewdir), 0.0), 3.0);
     col = col + vec3<f32>(0.3, 0.5, 1.0) * rim * (0.7 * day + 0.05);
     return col;
@@ -139,6 +225,36 @@ fn shade_moon_at(p: vec3<f32>, center: vec3<f32>) -> vec3<f32> {
     let ndl = max(dot(n, sun), 0.0);
     let amb = 0.04;
     return vec3<f32>(base) * (amb + ndl);
+}
+
+// A thin cloud shell around the home planet at `radius`. Returns lit cloud
+// colour + coverage alpha for the near intersection of the shell, or zero if the
+// shell is missed or sits behind the nearest body hit (`best`). Coverage is an
+// animated fbm so the layers drift slowly; clouds are bright white on the day
+// side and dim at night.
+fn cloud_shell(
+    ro: vec3<f32>, rd: vec3<f32>, radius: f32, best: f32,
+    freq: f32, seedv: vec3<f32>, cover: f32, time: f32,
+) -> vec4<f32> {
+    let t = hit_sphere(ro, rd, s.home.xyz, radius);
+    if (t <= 0.0 || t >= best) {
+        return vec4<f32>(0.0);
+    }
+    let p = ro + rd * t;
+    let nc = normalize(p - s.home.xyz);
+    let drift = vec3<f32>(time * 0.004, 0.0, time * 0.0025);
+    let q = nc * freq + seedv + drift;
+    let f = 0.55 * vnoise(q) + 0.30 * vnoise(q * 2.4 + 3.1) + 0.15 * vnoise(q * 5.3 + 7.7);
+    let c = smoothstep(cover, cover + 0.22, f);
+    if (c <= 0.001) {
+        return vec4<f32>(0.0);
+    }
+    let sun = normalize(s.sun.xyz - p);
+    let ndl = dot(nc, sun);
+    let day = smoothstep(-0.1, 0.2, ndl);
+    let lit = 0.06 + 1.05 * max(ndl, 0.0);
+    let rgb = vec3<f32>(1.0, 0.99, 0.97) * lit;
+    return vec4<f32>(rgb, c * (0.3 + 0.7 * day));
 }
 
 @fragment
@@ -213,6 +329,14 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
             col = col + vec3<f32>(0.3, 0.5, 1.0) * halo * lit * 0.9;
         }
     }
+
+    // Two thin cloud shells drifting above the home planet (composited inner
+    // then outer, so the nearer outer layer sits on top), over the surface and
+    // out across the limb.
+    let cl1 = cloud_shell(ro, rd, s.home.w * 1.010, best, 4.0, vec3<f32>(0.0), 0.46, s.params.z);
+    col = mix(col, cl1.rgb, cl1.a);
+    let cl2 = cloud_shell(ro, rd, s.home.w * 1.020, best, 6.5, vec3<f32>(13.1, 5.7, 2.3), 0.55, s.params.z);
+    col = mix(col, cl2.rgb, cl2.a);
 
     col = vec3<f32>(1.0) - exp(-col * 1.2);
     return vec4<f32>(col, 1.0);

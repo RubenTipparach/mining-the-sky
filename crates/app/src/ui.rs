@@ -16,7 +16,11 @@ pub fn build(ctx: &egui::Context, world: &mut World) {
     apply_theme(ctx);
     match world.view {
         View::Rocket => {
-            if world.space {
+            if world.driving {
+                drive_panel(ctx, world); // out driving the car
+            } else if world.walking {
+                walk_panel(ctx, world); // on foot
+            } else if world.space {
                 asteroid_panel(ctx, world); // inspecting an asteroid
             } else if world.base_mesh.is_some() && world.base_panel {
                 moonbase_panel(ctx, world); // surveying the colony
@@ -26,10 +30,15 @@ pub fn build(ctx: &egui::Context, world: &mut World) {
                 lander_panel(ctx, world); // on the lunar surface
             } else if world.launch.is_some() {
                 launch_panel(ctx, world);
+            } else if world.rolling_out {
+                rollout_panel(ctx, world); // crawling out to the pad
             } else if world.vab_mode {
                 vehicle_panel(ctx, world); // assembling in the building
             } else {
                 pad_panel(ctx, world); // rolled out, ready to launch
+            }
+            if world.lod_debug && !world.space && world.ast_elev.is_none() {
+                lod_debug_panel(ctx, world);
             }
         }
         View::Map => {
@@ -37,6 +46,157 @@ pub fn build(ctx: &egui::Context, world: &mut World) {
             status_panel(ctx, world);
             maneuver_node_panel(ctx, world);
         }
+    }
+    test_menu(ctx, world);
+    time_panel(ctx, world);
+}
+
+/// Seconds -> HH:MM:SS for the mission clock.
+fn fmt_hms(secs: f64) -> String {
+    let s = secs.max(0.0) as u64;
+    format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+}
+
+/// Top-centre time panel: the mission-elapsed timer plus a time-compression
+/// (warp) control. Warp drives the on-rails orbital sim; it is reset to 1x on a
+/// fresh ignition so the ascent always flies in real time. Shown in every view.
+fn time_panel(ctx: &egui::Context, world: &mut World) {
+    // Mission-elapsed time: the flown rocket's MET if launching, else the scripted
+    // mission clock (0 on the pad / in the VAB).
+    let met = world
+        .launch
+        .as_ref()
+        .map(|rk| rk.met)
+        .unwrap_or(world.clock as f64);
+    let mut warp = world.warp;
+
+    egui::Window::new("TIME")
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 10.0))
+        .title_bar(false)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("T+").color(DIM).monospace());
+                ui.label(egui::RichText::new(fmt_hms(met)).color(AMBER).monospace().size(16.0));
+                ui.separator();
+                ui.label(egui::RichText::new("WARP").color(DIM).small());
+                for &w in &[1.0f32, 10.0, 100.0, 1000.0, 10000.0] {
+                    let on = (warp - w).abs() < w * 0.25;
+                    let label = if w >= 1000.0 {
+                        format!("{:.0}k", w / 1000.0)
+                    } else {
+                        format!("{w:.0}x")
+                    };
+                    if ui.selectable_label(on, label).clicked() {
+                        warp = w;
+                    }
+                }
+                if ui.button("-").on_hover_text("halve").clicked() {
+                    warp = (warp * 0.5).max(1.0);
+                }
+                if ui.button("+").on_hover_text("double").clicked() {
+                    warp = (warp * 2.0).min(10000.0);
+                }
+            });
+        });
+
+    world.warp = warp;
+}
+
+/// Dedicated dev/test menu: jump into test scenes and flip dev toggles from the
+/// UI (no hotkeys - see CLAUDE.md "UI-first controls"). Collapsible, top-right,
+/// available in every view. Add new test scenarios here as buttons.
+fn test_menu(ctx: &egui::Context, world: &mut World) {
+    #[derive(Clone, Copy)]
+    enum T {
+        Reentry(u8),
+        Parachute,
+        Powered,
+        Payload(usize),
+        Drive,
+        Walk,
+    }
+    let mut act: Option<T> = None;
+    let mut friction = world.test_friction;
+    let in_test = world.reentry_test;
+
+    egui::Window::new("TEST SCENES")
+        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 12.0))
+        .default_open(false)
+        .default_width(220.0)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.label(egui::RichText::new("RE-ENTRY").color(DIM));
+            ui.horizontal(|ui| {
+                if ui.button("Axial").clicked() {
+                    act = Some(T::Reentry(0));
+                }
+                if ui.button("Pitched").clicked() {
+                    act = Some(T::Reentry(1));
+                }
+                if ui.button("Broadside").clicked() {
+                    act = Some(T::Reentry(2));
+                }
+            });
+            // Friction (heating) slider: drives the heat glow in the test so the
+            // re-entry FX can be swept from cold to white-hot and verified smooth.
+            ui.add(
+                egui::Slider::new(&mut friction, 0.0..=1.0)
+                    .text("friction")
+                    .show_value(true),
+            );
+            if in_test {
+                ui.label(egui::RichText::new("drag to ramp the heat FX").color(DIM).small());
+            }
+            ui.separator();
+            ui.label(egui::RichText::new("DESCENT").color(DIM));
+            ui.horizontal(|ui| {
+                if ui.button("Parachute").clicked() {
+                    act = Some(T::Parachute);
+                }
+                if ui.button("Powered").clicked() {
+                    act = Some(T::Powered);
+                }
+            });
+            ui.separator();
+            ui.label(egui::RichText::new("PAYLOAD PREVIEW").color(DIM));
+            ui.horizontal(|ui| {
+                if ui.button("Crew Capsule").clicked() {
+                    act = Some(T::Payload(10));
+                }
+                if ui.button("Service Module").clicked() {
+                    act = Some(T::Payload(11));
+                }
+            });
+            ui.separator();
+            ui.label(egui::RichText::new("CITY").color(DIM));
+            ui.horizontal(|ui| {
+                if ui
+                    .button("Walk around")
+                    .on_hover_text("Explore the launch complex on foot")
+                    .clicked()
+                {
+                    act = Some(T::Walk);
+                }
+                if ui
+                    .button("Drive car")
+                    .on_hover_text("Take the car out and drive into town")
+                    .clicked()
+                {
+                    act = Some(T::Drive);
+                }
+            });
+        });
+
+    world.test_friction = friction;
+    match act {
+        Some(T::Reentry(k)) => world.setup_reentry(k),
+        Some(T::Parachute) => world.setup_parachute(),
+        Some(T::Powered) => world.setup_powered_descent(),
+        Some(T::Payload(p)) => world.setup_payload_preview(p),
+        Some(T::Drive) => world.enter_drive(),
+        Some(T::Walk) => world.enter_walk(),
+        None => {}
     }
 }
 
@@ -102,11 +262,33 @@ fn vehicle_panel(ctx: &egui::Context, world: &mut World) {
 
     egui::Window::new("VEHICLE ASSEMBLY")
         .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 12.0))
-        .default_width(330.0)
+        .default_width(320.0)
+        // Cap the window width so the parts palettes wrap to new rows instead of
+        // auto-sizing the panel across the screen (covering the time widget).
+        .max_width(330.0)
         .resizable(false)
         .show(ctx, |ui| {
             ui.label(egui::RichText::new("VEHICLE ASSEMBLY").heading().color(AMBER));
             ui.label(egui::RichText::new("Drag parts onto the stack").color(DIM));
+            ui.add_space(2.0);
+
+            // ---- one-click presets: load a ready-made vehicle to fly or tweak ----
+            egui::CollapsingHeader::new("Quick-load preset")
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        for p in build::presets() {
+                            if ui
+                                .button(p.name)
+                                .on_hover_text(p.desc)
+                                .clicked()
+                            {
+                                vab = p.vab;
+                                changed = true;
+                            }
+                        }
+                    });
+                });
             ui.add_space(2.0);
 
             // ---- the stack: a drop slot per stage (engine + tank), top first ----
@@ -141,6 +323,31 @@ fn vehicle_panel(ctx: &egui::Context, world: &mut World) {
                         act = Some(Act::Remove(i));
                     }
                 });
+                // radial-booster controls for this stage: count stepper + type.
+                ui.horizontal(|ui| {
+                    let bn = vab.stages[i].boosters;
+                    let bt = vab.stages[i].booster;
+                    ui.label(egui::RichText::new("   radial").color(DIM).monospace().small());
+                    if ui.small_button("-").clicked() && bn > 0 {
+                        vab.stages[i].boosters = bn - 1;
+                        changed = true;
+                    }
+                    ui.label(egui::RichText::new(format!("{bn}x")).color(if bn > 0 { GOOD } else { DIM }).monospace());
+                    if ui.small_button("+").clicked() && bn < build::MAX_BOOSTERS {
+                        vab.stages[i].boosters = bn + 1;
+                        changed = true;
+                    }
+                    let b = build::BOOSTERS[bt];
+                    let tag = if b.solid { "SRB" } else { "Liq" };
+                    if ui
+                        .button(egui::RichText::new(format!("{} [{}]", b.name, tag)).small())
+                        .on_hover_text("click to cycle booster type")
+                        .clicked()
+                    {
+                        vab.stages[i].booster = (bt + 1) % build::BOOSTERS.len();
+                        changed = true;
+                    }
+                });
             }
             // payload slot
             ui.horizontal(|ui| {
@@ -160,28 +367,6 @@ fn vehicle_panel(ctx: &egui::Context, world: &mut World) {
             if ui.button("+ stage").clicked() {
                 act = Some(Act::Add);
             }
-
-            ui.separator();
-            // ---- parts palette: draggable chips ----
-            ui.label(egui::RichText::new("ENGINES").color(DIM).small());
-            ui.horizontal_wrapped(|ui| {
-                for (k, e) in build::ENGINES.iter().enumerate() {
-                    drag_chip(ui, egui::Id::new(("eng", k)), Drag::Engine(k), e.name, GOOD);
-                }
-            });
-            ui.label(egui::RichText::new("TANKS").color(DIM).small());
-            ui.horizontal_wrapped(|ui| {
-                for (k, t) in build::TANKS.iter().enumerate() {
-                    drag_chip(ui, egui::Id::new(("tank", k)), Drag::Tank(k), t.name, egui::Color32::from_rgb(150, 200, 255));
-                }
-            });
-            ui.label(egui::RichText::new("PAYLOADS").color(DIM).small());
-            ui.horizontal_wrapped(|ui| {
-                for (k, p) in build::PAYLOADS.iter().enumerate() {
-                    drag_chip(ui, egui::Id::new(("pl", k)), Drag::Payload(k), p.name, AMBER);
-                }
-            });
-
             ui.separator();
             let veh = vab.to_vehicle();
             let mass_t = veh.liftoff_mass() / 1000.0;
@@ -190,15 +375,78 @@ fn vehicle_panel(ctx: &egui::Context, world: &mut World) {
                 (0..veh.stages.len()).map(|i| veh.stages[i].dv(veh.mass_above(i))).sum();
             egui::Grid::new("vab_stats").num_columns(2).show(ui, |ui| {
                 kv(ui, "Liftoff mass", &format!("{mass_t:.0} t"));
-                ui.label(egui::RichText::new("Liftoff TWR").color(DIM));
-                ui.label(egui::RichText::new(format!("{twr:.2}")).color(if twr < 1.0 { WARN } else { GOOD }));
-                ui.end_row();
                 kv(ui, "Total delta-v", &format!("{total_dv:.0} m/s"));
                 kv(ui, "Payload", &format!("{:.0} kg", vab.payload().mass));
             });
+            // Liftoff thrust-to-weight gauge - the headline "will it fly" number.
+            // Green ~1.15-2.2 (real launchers sit ~1.2-1.5); red < 1 won't lift.
+            let twr_col = if twr < 1.0 {
+                WARN
+            } else if twr < 1.15 || twr > 2.2 {
+                AMBER
+            } else {
+                GOOD
+            };
+            ui.label(egui::RichText::new("Liftoff thrust-to-weight").color(DIM));
+            ui.add(
+                egui::ProgressBar::new((twr as f32 / 2.5).clamp(0.0, 1.0))
+                    .fill(twr_col)
+                    .desired_height(16.0)
+                    .text(format!("{twr:.2}  (need > 1.0)")),
+            );
             if twr < 1.0 {
-                ui.label(egui::RichText::new("TWR < 1: add engines or drop tankage").color(WARN));
+                ui.label(egui::RichText::new("won't lift off - add boosters or drop tankage").color(WARN));
+            } else if twr > 2.5 {
+                ui.label(egui::RichText::new("very punchy liftoff (high g)").color(AMBER));
             }
+            // Per-stage TWR: ignition vs burnout. Burnout TWR ~ the peak g that
+            // stage pulls at full throttle (thrust stays put as the tank empties),
+            // so it flags where you'll need to throttle back for the crew.
+            egui::CollapsingHeader::new("Per-stage TWR / peak g").default_open(true).show(ui, |ui| {
+                egui::Grid::new("stage_twr").num_columns(3).striped(true).show(ui, |ui| {
+                    ui.label(egui::RichText::new("stage").color(DIM));
+                    ui.label(egui::RichText::new("ignition").color(DIM));
+                    ui.label(egui::RichText::new("burnout (peak g)").color(DIM));
+                    ui.end_row();
+                    let ns = veh.stages.len();
+                    for i in 0..ns {
+                        let st = &veh.stages[i];
+                        let above = veh.mass_above(i); // everything stacked above this stage
+                        let m0 = (st.dry + st.prop + above).max(1.0); // ignition (full)
+                        let mb = (st.dry + above).max(1.0); // burnout (tank empty)
+                        let ti = st.thrust / (m0 * g);
+                        let tb = st.thrust / (mb * g);
+                        let cb = if tb > 4.0 { AMBER } else { GOOD };
+                        ui.label(format!("S{}", i + 1));
+                        ui.label(format!("{ti:.2}"));
+                        ui.label(egui::RichText::new(format!("{tb:.1} g")).color(cb));
+                        ui.end_row();
+                    }
+                });
+                ui.label(egui::RichText::new("upper stages fire in vacuum (TWR < 1 is fine)").color(DIM));
+            });
+
+            ui.separator();
+            // ---- parts palette: draggable chips ----
+            // Lay the chips out in explicit rows, manually wrapped to a width
+            // budget. egui's `horizontal_wrapped` wraps at the available width,
+            // which is unbounded inside an auto-sizing window, so it would put
+            // every chip on one line and stretch the panel across the screen
+            // (covering the time widget). Fixed `horizontal` rows keep it narrow.
+            ui.label(egui::RichText::new("ENGINES").color(DIM).small());
+            chip_palette(ui, build::ENGINES.len(), |k| build::ENGINES[k].name, |ui, k| {
+                drag_chip(ui, egui::Id::new(("eng", k)), Drag::Engine(k), build::ENGINES[k].name, GOOD);
+            });
+            ui.label(egui::RichText::new("TANKS").color(DIM).small());
+            let tank_col = egui::Color32::from_rgb(150, 200, 255);
+            chip_palette(ui, build::TANKS.len(), |k| build::TANKS[k].name, |ui, k| {
+                drag_chip(ui, egui::Id::new(("tank", k)), Drag::Tank(k), build::TANKS[k].name, tank_col);
+            });
+            ui.label(egui::RichText::new("PAYLOADS").color(DIM).small());
+            chip_palette(ui, build::PAYLOADS.len(), |k| build::PAYLOADS[k].name, |ui, k| {
+                drag_chip(ui, egui::Id::new(("pl", k)), Drag::Payload(k), build::PAYLOADS[k].name, AMBER);
+            });
+
 
             ui.separator();
             let btn = egui::Button::new(
@@ -222,7 +470,7 @@ fn vehicle_panel(ctx: &egui::Context, world: &mut World) {
             }
         }
         Some(Act::Add) => {
-            vab.stages.push(build::StageCfg { engine: 3, tank: 0 });
+            vab.stages.push(build::StageCfg::new(3, 0));
             changed = true;
         }
         None => {}
@@ -246,6 +494,8 @@ fn pad_panel(ctx: &egui::Context, world: &mut World) {
     let rolling = world.rolling_out;
     let mut launch = false;
     let mut back = false;
+    let mut drive = false;
+    let mut walk = false;
 
     egui::Window::new("LAUNCH PAD")
         .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 12.0))
@@ -273,9 +523,17 @@ fn pad_panel(ctx: &egui::Context, world: &mut World) {
                     launch = true;
                 }
                 ui.label(egui::RichText::new("Space ignite  Shift/Ctrl throttle  W/S pitch").color(DIM));
-                if ui.button("Back to VAB").clicked() {
-                    back = true;
-                }
+                ui.horizontal(|ui| {
+                    if ui.button("Back to VAB").clicked() {
+                        back = true;
+                    }
+                    if ui.button("Walk around").on_hover_text("Get out and explore on foot").clicked() {
+                        walk = true;
+                    }
+                    if ui.button("Drive car").on_hover_text("Hop in the car and drive out to the city").clicked() {
+                        drive = true;
+                    }
+                });
             }
         });
 
@@ -284,6 +542,135 @@ fn pad_panel(ctx: &egui::Context, world: &mut World) {
     }
     if back {
         world.back_to_vab();
+    }
+    if drive {
+        world.enter_drive();
+    }
+    if walk {
+        world.enter_walk();
+    }
+}
+
+/// Shown while driving the car (rocket view): a speed readout, the controls, and
+/// buttons to get out on foot or park back at the complex.
+fn drive_panel(ctx: &egui::Context, world: &mut World) {
+    let speed_kph = world.car_speed.abs() * 3.6;
+    let mut get_out = false;
+    let mut park = false;
+    egui::Window::new("DRIVING")
+        .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 12.0))
+        .default_width(220.0)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.label(egui::RichText::new("CAR").heading().color(AMBER));
+            egui::Grid::new("car_stats").num_columns(2).show(ui, |ui| {
+                kv(ui, "Speed", &format!("{speed_kph:.0} km/h"));
+                let gear = if world.car_speed < -0.3 { "R" } else { "D" };
+                kv(ui, "Gear", gear);
+            });
+            ui.separator();
+            ui.label(egui::RichText::new("W/S drive  A/D steer  -  drag to look").color(DIM));
+            ui.horizontal(|ui| {
+                let btn = egui::Button::new(egui::RichText::new("GET OUT").strong())
+                    .min_size(egui::vec2(96.0, 24.0));
+                if ui.add(btn).clicked() {
+                    get_out = true;
+                }
+                if ui.button("Park / exit").clicked() {
+                    park = true;
+                }
+            });
+        });
+    if get_out {
+        world.get_out_car();
+    }
+    if park {
+        world.exit_drive();
+    }
+}
+
+/// Shown while on foot (rocket view): the controls, a "get in car" action when
+/// standing by the car, and a button to return to the launch complex.
+fn walk_panel(ctx: &egui::Context, world: &mut World) {
+    let near = world.near_car();
+    let mut get_in = false;
+    let mut leave = false;
+    egui::Window::new("ON FOOT")
+        .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 12.0))
+        .default_width(220.0)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.label(egui::RichText::new("ON FOOT").heading().color(AMBER));
+            ui.label(egui::RichText::new("W/S walk  A/D turn  -  drag to look").color(DIM));
+            ui.separator();
+            let btn = egui::Button::new(egui::RichText::new("GET IN CAR").strong())
+                .min_size(egui::vec2(140.0, 24.0));
+            if ui.add_enabled(near, btn).clicked() {
+                get_in = true;
+            }
+            if !near {
+                ui.label(egui::RichText::new("walk up to the car to get in").color(DIM).small());
+            }
+            if ui.button("Back to complex").clicked() {
+                leave = true;
+            }
+        });
+    if get_in {
+        world.get_in_car();
+    }
+    if leave {
+        world.exit_walk();
+    }
+}
+
+/// Shown while the crawler is hauling the stack out of the assembly building to
+/// the pad: roll-out progress plus a speed control so the player can fast-forward
+/// the slow transport instead of watching it creep.
+fn rollout_panel(ctx: &egui::Context, world: &mut World) {
+    let rollout = world.rollout;
+    let speed = world.rollout_speed;
+    // Some(true) = crank crawler faster, Some(false) = slower (handled below).
+    let mut bump: Option<bool> = None;
+    let mut skip = false;
+
+    egui::Window::new("ROLL OUT")
+        .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 12.0))
+        .default_width(240.0)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.label(egui::RichText::new("ROLLING OUT TO PAD").heading().color(AMBER));
+            let pct = (rollout * 100.0).round() as i32;
+            ui.label(egui::RichText::new(format!("{pct}%  -  crawler on the way")).color(DIM));
+            ui.add(egui::ProgressBar::new(rollout).fill(AMBER).desired_height(10.0));
+            ui.separator();
+            // Speed stepper, mirroring the radial-booster control in the VAB.
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Crawler speed").color(DIM));
+                if ui.small_button("-").clicked() {
+                    bump = Some(false);
+                }
+                ui.label(egui::RichText::new(format!("{speed:.0}x")).color(GOOD).monospace());
+                if ui.small_button("+").clicked() {
+                    bump = Some(true);
+                }
+            });
+            ui.label(egui::RichText::new("Keys , and . also adjust  ([ ] = time warp)").color(DIM).small());
+            ui.separator();
+            let btn = egui::Button::new(
+                egui::RichText::new("SKIP TO PAD").strong().color(egui::Color32::BLACK),
+            )
+            .fill(AMBER)
+            .min_size(egui::vec2(150.0, 24.0));
+            if ui.add(btn).clicked() {
+                skip = true;
+            }
+        });
+
+    if let Some(faster) = bump {
+        world.bump_rollout_speed(faster);
+    }
+    if skip {
+        world.skip_rollout();
     }
 }
 
@@ -349,6 +736,41 @@ fn moonbase_panel(ctx: &egui::Context, _world: &mut World) {
 }
 
 /// A draggable part chip for the VAB palette.
+/// Lay out part chips in explicit rows, greedily wrapped to a width budget so
+/// the panel stays narrow. `name(k)` supplies the label (used to estimate width)
+/// and `emit(ui, k)` draws chip `k`. Used instead of `horizontal_wrapped`, which
+/// does not wrap inside an auto-sizing window (its available width is unbounded).
+fn chip_palette<N, E>(ui: &mut egui::Ui, count: usize, name: N, mut emit: E)
+where
+    N: Fn(usize) -> &'static str,
+    E: FnMut(&mut egui::Ui, usize),
+{
+    const BUDGET: usize = 38; // approx chars per row (~300 px at this font)
+    let mut row: Vec<usize> = Vec::new();
+    let mut used = 0usize;
+    for k in 0..count {
+        let w = name(k).len() + 4; // chip text + padding, in char-widths
+        if used + w > BUDGET && !row.is_empty() {
+            let items = std::mem::take(&mut row);
+            ui.horizontal(|ui| {
+                for j in items {
+                    emit(ui, j);
+                }
+            });
+            used = 0;
+        }
+        used += w;
+        row.push(k);
+    }
+    if !row.is_empty() {
+        ui.horizontal(|ui| {
+            for j in row {
+                emit(ui, j);
+            }
+        });
+    }
+}
+
 fn drag_chip<P: std::any::Any + Send + Sync + Clone>(
     ui: &mut egui::Ui,
     id: egui::Id,
@@ -363,7 +785,13 @@ fn drag_chip<P: std::any::Any + Send + Sync + Clone>(
                 .inner_margin(egui::Margin::symmetric(6, 3))
                 .corner_radius(4);
             frame.show(ui, |ui| {
-                ui.label(egui::RichText::new(label).color(col));
+                // Extend (don't wrap) so a long name keeps the chip its natural
+                // width and `horizontal_wrapped` moves it to the next row, instead
+                // of squeezing the text into a vertical one-letter-per-line column.
+                ui.add(
+                    egui::Label::new(egui::RichText::new(label).color(col))
+                        .wrap_mode(egui::TextWrapMode::Extend),
+                );
             });
         })
         .response;
@@ -395,6 +823,7 @@ fn launch_panel(ctx: &egui::Context, world: &mut World) {
     let twr_col = if tel.twr < 1.0 && tel.phase == "POWERED" { WARN } else { GOOD };
     let complete = world.mission_complete();
     let n_orbit = world.orbits.len();
+    let reentry_test = world.reentry_test;
 
     enum Act {
         Throttle(f64),
@@ -419,6 +848,11 @@ fn launch_panel(ctx: &egui::Context, world: &mut World) {
                 kv(ui, "Vert speed", &format!("{:.0} m/s", tel.vspeed));
                 ui.label(egui::RichText::new("TWR").color(DIM));
                 ui.label(egui::RichText::new(format!("{:.2}", tel.twr)).color(twr_col));
+                ui.end_row();
+                // Crew acceleration; amber as it nears the g-limit (auto-capped).
+                let g_col = if tel.g_force >= 3.8 { AMBER } else { GOOD };
+                ui.label(egui::RichText::new("G-force").color(DIM));
+                ui.label(egui::RichText::new(format!("{:.2} g", tel.g_force)).color(g_col));
                 ui.end_row();
                 kv(ui, "Apoapsis", &fmt_alt(tel.apo_km));
                 kv(ui, "Periapsis", &fmt_alt(tel.peri_km));
@@ -447,6 +881,37 @@ fn launch_panel(ctx: &egui::Context, world: &mut World) {
                         .fill(egui::Color32::from_rgb(90, 150, 90)),
                 );
             });
+            // structural integrity: drains under aerodynamic heating
+            let hp = (tel.health / 100.0).clamp(0.0, 1.0);
+            let hp_col = if hp > 0.5 {
+                egui::Color32::from_rgb(90, 170, 90)
+            } else if hp > 0.2 {
+                WARN
+            } else {
+                egui::Color32::from_rgb(220, 70, 60)
+            };
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Integrity").color(DIM));
+                ui.add(
+                    egui::ProgressBar::new(hp)
+                        .desired_width(110.0)
+                        .fill(hp_col)
+                        .text(format!("{:.0}%", tel.health)),
+                );
+            });
+            // heating gauge, shown when the air starts to bite
+            if tel.heat > 0.1 {
+                let hcol = egui::Color32::from_rgb(255, (200.0 - 150.0 * tel.heat).clamp(40.0, 200.0) as u8, 40);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Heating").color(DIM));
+                    ui.add(
+                        egui::ProgressBar::new(tel.heat.min(1.0))
+                            .desired_width(110.0)
+                            .fill(hcol)
+                            .text(if tel.heat > 0.85 { "PLASMA" } else { "" }),
+                    );
+                });
+            }
             ui.separator();
             if complete {
                 ui.label(
@@ -477,9 +942,12 @@ fn launch_panel(ctx: &egui::Context, world: &mut World) {
                         act = Some(Act::Reset);
                     }
                 });
-                ui.label(
-                    egui::RichText::new("Shift/Ctrl throttle  W/S pitch  Space stage").color(DIM),
-                );
+                let hint = if reentry_test {
+                    "TEST: W/S pitch  A/D yaw  Q/E roll  -  drag to orbit"
+                } else {
+                    "Shift/Ctrl throttle  W/S pitch  Space stage"
+                };
+                ui.label(egui::RichText::new(hint).color(DIM));
             }
         });
 
@@ -494,6 +962,51 @@ fn launch_panel(ctx: &egui::Context, world: &mut World) {
         Some(Act::NewMission) => world.back_to_vab(),
         None => {}
     }
+}
+
+/// LOD-debug overlay (rocket view, planet only, toggled with `L`): the terrain
+/// is recoloured by quadtree depth and this panel reports the live LOD stats and
+/// a colour legend so the split rings can be read and tuned.
+fn lod_debug_panel(ctx: &egui::Context, world: &World) {
+    let (lod, alt, cell) = world.lod_debug_stats();
+    let tris = lod.triangle_count(crate::rocket::PLANET_PATCH_N);
+    egui::Window::new("LOD DEBUG")
+        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 12.0))
+        .default_width(220.0)
+        .resizable(false)
+        .show(ctx, |ui| {
+            egui::Grid::new("loddbg").num_columns(2).show(ui, |ui| {
+                kv(ui, "Altitude", &fmt_dist(alt));
+                kv(ui, "Rebuild cell", &fmt_dist(cell));
+                kv(ui, "Patches", &format!("{}", lod.patches.len()));
+                kv(ui, "Max depth", &format!("{}", lod.max_depth_reached));
+                kv(ui, "Triangles", &format!("{}", tris));
+            });
+            if alt > 50_000.0 {
+                ui.label(egui::RichText::new("STABLE GLOBE (>50 km)").color(GOOD));
+            }
+            ui.separator();
+            ui.label(egui::RichText::new("Depth -> colour").color(DIM));
+            // one swatch row per depth that currently has patches
+            for (d, &count) in lod.per_depth.iter().enumerate() {
+                if count == 0 {
+                    continue;
+                }
+                let c = crate::rocket::lod_color(d as u32);
+                let col = egui::Color32::from_rgb(
+                    (c[0] * 255.0) as u8,
+                    (c[1] * 255.0) as u8,
+                    (c[2] * 255.0) as u8,
+                );
+                ui.horizontal(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                    ui.painter().rect_filled(rect, 2.0, col);
+                    ui.label(egui::RichText::new(format!("depth {d}  ({count})")).color(DIM));
+                });
+            }
+            ui.separator();
+            ui.label(egui::RichText::new("L toggles  -  colours track LOD").color(DIM));
+        });
 }
 
 /// The maneuver-node planner (map view, with a craft in flight): place a burn
@@ -576,6 +1089,15 @@ fn fmt_alt(km: f32) -> String {
         format!("{km:.0} km")
     } else {
         "--".to_string()
+    }
+}
+
+/// Metres rendered as km above 1 km, else metres. For the LOD-debug readouts.
+fn fmt_dist(m: f64) -> String {
+    if m >= 1000.0 {
+        format!("{:.1} km", m / 1000.0)
+    } else {
+        format!("{m:.0} m")
     }
 }
 
